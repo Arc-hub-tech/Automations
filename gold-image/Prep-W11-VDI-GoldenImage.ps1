@@ -88,15 +88,16 @@ if (-not $cur) {
 # ---------------------------------------------------------------
 # 1. VMware platform check - detected via BIOS/SMBIOS-reported
 #    manufacturer (the same data the hypervisor presents to the guest
-#    that Win32_ComputerSystem/Win32_BIOS read). If this is a VMware
-#    VM and VMware Tools is already installed, trigger its built-in
-#    self-service upgrade (pulls newer tools from host-mounted media
-#    if the host has them - the in-guest equivalent of "Upgrade
-#    VMware Tools" from vCenter/ESXi). If VMware Tools isn't installed
-#    at all, fetch the current installer directly from VMware's public
-#    package feed and install it silently (the feed's filename is
-#    versioned, e.g. VMware-tools-13.1.0-25218885-x64.exe, so it's
-#    discovered from the directory listing rather than hardcoded).
+#    that Win32_ComputerSystem/Win32_BIOS read). Always fetches the
+#    current installer directly from VMware's public package feed and
+#    runs it (installs fresh, or upgrades in place if already present)
+#    rather than relying on the in-guest "self-service upgrade" command
+#    - that only works if the ESXi/vCenter host already has newer tools
+#    mounted as virtual media, which isn't guaranteed (e.g. Workstation/
+#    Fusion, or standalone ESXi) and silently no-ops otherwise. The
+#    feed's filename is versioned (e.g. VMware-tools-13.1.0-25218885-
+#    x64.exe), so it's discovered from the directory listing, not
+#    hardcoded.
 # ---------------------------------------------------------------
 Write-Host "== Checking VMware platform / tools ==" -ForegroundColor Cyan
 
@@ -105,27 +106,27 @@ if ($biosMfr -match 'VMware') {
     Write-Host "  VMware platform detected (BIOS manufacturer: $biosMfr)."
     $toolboxCmd = "$env:ProgramFiles\VMware\VMware Tools\VMwareToolboxCmd.exe"
     if (Test-Path $toolboxCmd) {
-        $toolsVer = & $toolboxCmd -v
-        Write-Host "  VMware Tools installed (version $toolsVer) - triggering self-service upgrade check..."
-        & $toolboxCmd upgrade start
-        Write-Host "  upgrade triggered - if the host has newer tools mounted, they'll install now; otherwise this is a no-op."
+        $toolsVer = (& $toolboxCmd -v 2>&1) -join ' '
+        Write-Host "  VMware Tools currently installed: $toolsVer"
     } else {
-        Write-Host "  VMware Tools not installed - fetching latest installer from packages.vmware.com..."
-        $toolsIndexUrl = "https://packages.vmware.com/tools/releases/latest/windows/x64/"
-        try {
-            $html    = (Invoke-WebRequest -Uri $toolsIndexUrl -UseBasicParsing).Content
-            $exeName = [regex]::Match($html, 'href="([^"/]+\.exe)"').Groups[1].Value
-        } catch { $exeName = $null }
+        Write-Host "  VMware Tools not currently installed."
+    }
 
-        if (-not $exeName) {
-            Write-Warning "Could not find a VMware Tools installer at $toolsIndexUrl - install manually from vCenter/ESXi (Guest > Install VMware Tools)."
-        } else {
-            $toolsExe = "$Work\$exeName"
-            Invoke-WebRequest -Uri "$toolsIndexUrl$exeName" -OutFile $toolsExe
-            Write-Host "  installing $exeName silently (reboot before sysprep once this completes)..."
-            Start-Process $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Wait -NoNewWindow
-            Write-Host "  VMware Tools installed." -ForegroundColor Green
-        }
+    Write-Host "  fetching latest VMware Tools installer from packages.vmware.com..."
+    $toolsIndexUrl = "https://packages.vmware.com/tools/releases/latest/windows/x64/"
+    try {
+        $html    = (Invoke-WebRequest -Uri $toolsIndexUrl -UseBasicParsing).Content
+        $exeName = [regex]::Match($html, 'href="([^"/]+\.exe)"').Groups[1].Value
+    } catch { $exeName = $null }
+
+    if (-not $exeName) {
+        Write-Warning "Could not find a VMware Tools installer at $toolsIndexUrl - install/upgrade manually from vCenter/ESXi (Guest > Install VMware Tools)."
+    } else {
+        $toolsExe = "$Work\$exeName"
+        Invoke-WebRequest -Uri "$toolsIndexUrl$exeName" -OutFile $toolsExe
+        Write-Host "  installing $exeName silently (upgrades in place if already installed; reboot before sysprep once this completes)..."
+        Start-Process $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Wait -NoNewWindow -WorkingDirectory $Work
+        Write-Host "  VMware Tools install/upgrade complete." -ForegroundColor Green
     }
 } else {
     Write-Host "  not running on VMware (BIOS manufacturer: $biosMfr) - skipping."
@@ -161,7 +162,7 @@ Invoke-WebRequest -Uri "https://officecdn.microsoft.com/pr/wsus/setup.exe" -OutF
 # ODT's setup.exe doesn't reliably exit on all builds, so don't wait on the process
 # at all. Launch it, then poll Click-to-Run's registry: VersionToReport is written
 # when the install actually completes.
-Start-Process $odt -ArgumentList "/configure `"$Work\office.xml`"" -NoNewWindow
+Start-Process $odt -ArgumentList "/configure `"$Work\office.xml`"" -NoNewWindow -WorkingDirectory $Work
 $cfg      = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
 $deadline = (Get-Date).AddMinutes(40)
 do {
@@ -189,14 +190,14 @@ Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Teams" -Name "IsWVDEnvironment"
 
 $boot = "$Work\teamsbootstrapper.exe"
 Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2243204" -OutFile $boot
-Start-Process $boot -ArgumentList "-p" -Wait -NoNewWindow   # -p provisions for all users
+Start-Process $boot -ArgumentList "-p" -Wait -NoNewWindow -WorkingDirectory $Work   # -p provisions for all users
 
 # Remote Desktop WebRTC Redirector Service - enables Teams media optimisation
 # for sessions connected via AVD/W365. Harmless but inert on plain RDS; remove
 # this block if these hosts will never be AVD session hosts.
 $rtc = "$Work\webrtc.msi"
 Invoke-WebRequest -Uri "https://aka.ms/msrdcwebrtcsvc/msi" -OutFile $rtc
-Start-Process msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Wait -NoNewWindow
+Start-Process msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Wait -NoNewWindow -WorkingDirectory $Work
 
 # ---------------------------------------------------------------
 # 4. Common third-party apps via winget - no hardcoded download URLs
@@ -234,7 +235,7 @@ Invoke-WebRequest -Uri "https://aka.ms/fslogix_download" -OutFile $fsl
 Expand-Archive $fsl -DestinationPath "$Work\fslogix" -Force
 $fslSetup = Get-ChildItem "$Work\fslogix" -Recurse -Filter "FSLogixAppsSetup.exe" |
     Where-Object FullName -like "*x64*" | Select-Object -First 1
-Start-Process $fslSetup.FullName -ArgumentList "/install /quiet /norestart" -Wait -NoNewWindow
+Start-Process $fslSetup.FullName -ArgumentList "/install /quiet /norestart" -Wait -NoNewWindow -WorkingDirectory $Work
 
 # --- To ACTIVATE profile containers later (per environment, not in the image) ---
 # $fslKey = "HKLM:\SOFTWARE\FSLogix\Profiles"

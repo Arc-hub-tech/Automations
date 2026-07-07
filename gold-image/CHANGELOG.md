@@ -8,6 +8,7 @@ All notable changes to `Prep-W11-VDI-GoldenImage.ps1`, `Prep-WS2025-RDSH-Templat
 - `DisablePrivacyExperience` registry policy in all three scripts, suppressing the "Choose privacy settings" screen for every future new user on a cloned machine - not just the image's own first boot (unlike unattend.xml).
 - The RDSH template now writes a sysprep `unattend.xml` (step 13) - it never did before, so RDSH clones were hitting the full OOBE (region, keyboard, EULA, account creation, privacy screens) instead of a suppressed one.
 - Expanded the unattend.xml `OOBE` block in all three scripts with `NetworkLocation`, `SkipUserOOBE`/`SkipMachineOOBE`, and `EnableFirstLogonAnimation=false` to cut down first-boot noise after generalizing.
+- `unattend.xml` now declares the standing admin account (when step 0 set one up) with a freshly-generated, one-time random password - `HideLocalAccountScreen` alone doesn't reliably suppress the "Who's going to use this device?" account-creation screen on Windows 11/Server, since OOBE's CloudExperienceHost still wants a concretely provisioned account. A `FirstLogonCommand` deletes the answer file immediately after specialize completes, so the placeholder password only exists on disk for seconds before LAPS takes over.
 
 ### Fixed
 - The RDSH template's final instructions told you to run `sysprep /oobe /generalize /shutdown` with no path and no `/unattend` flag - `sysprep.exe` isn't on PATH, so this failed with "term not recognized". All three scripts now print the full explicit path and flag it clearly as required.

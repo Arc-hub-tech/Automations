@@ -98,6 +98,7 @@ Write-Host "== Configuring standard local admin account ==" -ForegroundColor Cya
 $AdminUser = $env:USERNAME
 $cur     = Get-LocalUser -Name $AdminUser -ErrorAction SilentlyContinue
 $builtin = Get-LocalUser | Where-Object { $_.SID.Value -like "S-1-5-*-500" }
+$StandingAdminReady = $false
 
 if (-not $cur) {
     Write-Warning "'$AdminUser' is not a LOCAL account (domain/Entra?). Log in as the local admin the image should keep and rerun. Continuing without account changes."
@@ -116,6 +117,7 @@ if (-not $cur) {
     } else {
         Write-Host "  built-in Administrator already disabled."
     }
+    $StandingAdminReady = $true
 }
 
 # ---------------------------------------------------------------
@@ -515,12 +517,67 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 #     NOTE: if the image was built from a US ISO, change UILanguage
 #     to en-US (display language can't be set to a pack that isn't
 #     installed); everything else stays en-GB.
+#
+#     HideLocalAccountScreen alone is NOT reliable on Windows Server - OOBE's
+#     CloudExperienceHost still prompts to create an account unless one is
+#     explicitly declared in the answer file. So when a standing admin was
+#     set up in step 0, this declares that SAME account with a freshly
+#     generated, one-time random password (generated fresh per run, never
+#     logged, never committed) purely so OOBE has an account to present at
+#     the sign-in screen instead of the creation wizard. A FirstLogonCommand
+#     then deletes this file immediately after specialize completes, so the
+#     placeholder password only exists on disk for the few seconds of the
+#     automated first-boot sequence before LAPS takes over and rotates the
+#     account's real password.
 # ---------------------------------------------------------------
 Write-Host "== Writing sysprep unattend.xml ==" -ForegroundColor Cyan
 
+$userAccountsXml = ""
+$firstLogonXml   = ""
+if ($StandingAdminReady) {
+    function New-TempPassword {
+        $upper  = 65..90  | Get-Random -Count 4 | ForEach-Object { [char]$_ }
+        $lower  = 97..122 | Get-Random -Count 4 | ForEach-Object { [char]$_ }
+        $digit  = 48..57  | Get-Random -Count 4 | ForEach-Object { [char]$_ }
+        $symbol = '!','@','#','%','^','*' | Get-Random -Count 2
+        -join (($upper + $lower + $digit + $symbol) | Get-Random -Count 14)
+    }
+    $TempPassword = New-TempPassword
+
+    $userAccountsXml = @"
+
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Password>
+              <Value>$TempPassword</Value>
+              <PlainText>true</PlainText>
+            </Password>
+            <Group>Administrators</Group>
+            <DisplayName>$AdminUser</DisplayName>
+            <Name>$AdminUser</Name>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+"@
+    $firstLogonXml = @"
+
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>cmd /c del /f /q C:\Windows\Panther\unattend.xml</CommandLine>
+          <Description>Remove sysprep answer file (one-time placeholder password) immediately after first boot</Description>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+"@
+    $TempPassword = $null
+} else {
+    Write-Host "  no standing admin was set up in step 0 - skipping account declaration (the account-creation screen may still appear on first boot)." -ForegroundColor Yellow
+}
+
 @"
 <?xml version="1.0" encoding="utf-8"?>
-<unattend xmlns="urn:schemas-microsoft-com:unattend">
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="oobeSystem">
     <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <InputLocale>0809:00000809</InputLocale>
@@ -541,7 +598,7 @@ Write-Host "== Writing sysprep unattend.xml ==" -ForegroundColor Cyan
         <SkipMachineOOBE>true</SkipMachineOOBE>
       </OOBE>
       <EnableFirstLogonAnimation>false</EnableFirstLogonAnimation>
-      <TimeZone>GMT Standard Time</TimeZone>
+      <TimeZone>GMT Standard Time</TimeZone>$userAccountsXml$firstLogonXml
     </component>
   </settings>
 </unattend>

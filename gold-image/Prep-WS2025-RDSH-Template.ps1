@@ -24,7 +24,7 @@
     Windows Server 2025 multi-session (RD Session Host) template prep.
     Run once as Administrator, reboot, verify, then sysprep/clone.
     1. Installs the RD Session Host role
-    2. Detects VMware platform (via BIOS/SMBIOS) and triggers a VMware Tools upgrade if present
+    2. Detects VMware platform (via BIOS/SMBIOS) and installs/upgrades VMware Tools
     3. Removes Windows Defender (Sentinel EDR is the AV/EDR on these hosts)
     4. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing - mandatory on RDSH)
     5. Installs new Teams machine-wide (VDI-optimised)
@@ -116,9 +116,10 @@ if ((Get-WindowsFeature RDS-RD-Server).Installed) {
 #    self-service upgrade (pulls newer tools from host-mounted media
 #    if the host has them - the in-guest equivalent of "Upgrade
 #    VMware Tools" from vCenter/ESXi). If VMware Tools isn't installed
-#    at all, this script can't fetch the installer itself (no
-#    host-mounted media, no stable public download URL) - it just
-#    flags it for manual/vCenter install.
+#    at all, fetch the current installer directly from VMware's public
+#    package feed and install it silently (the feed's filename is
+#    versioned, e.g. VMware-tools-13.1.0-25218885-x64.exe, so it's
+#    discovered from the directory listing rather than hardcoded).
 # ---------------------------------------------------------------
 Write-Host "== Checking VMware platform / tools ==" -ForegroundColor Cyan
 
@@ -132,7 +133,22 @@ if ($biosMfr -match 'VMware') {
         & $toolboxCmd upgrade start
         Write-Host "  upgrade triggered - if the host has newer tools mounted, they'll install now; otherwise this is a no-op."
     } else {
-        Write-Warning "VMware Tools not installed - install/upgrade from vCenter/ESXi (Guest > Install VMware Tools) before sysprepping; this script cannot fetch the installer from inside the guest."
+        Write-Host "  VMware Tools not installed - fetching latest installer from packages.vmware.com..."
+        $toolsIndexUrl = "https://packages.vmware.com/tools/releases/latest/windows/x64/"
+        try {
+            $html    = (Invoke-WebRequest -Uri $toolsIndexUrl -UseBasicParsing).Content
+            $exeName = [regex]::Match($html, 'href="([^"/]+\.exe)"').Groups[1].Value
+        } catch { $exeName = $null }
+
+        if (-not $exeName) {
+            Write-Warning "Could not find a VMware Tools installer at $toolsIndexUrl - install manually from vCenter/ESXi (Guest > Install VMware Tools)."
+        } else {
+            $toolsExe = "$Work\$exeName"
+            Invoke-WebRequest -Uri "$toolsIndexUrl$exeName" -OutFile $toolsExe
+            Write-Host "  installing $exeName silently (reboot before sysprep once this completes)..."
+            Start-Process $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Wait -NoNewWindow
+            Write-Host "  VMware Tools installed." -ForegroundColor Green
+        }
     }
 } else {
     Write-Host "  not running on VMware (BIOS manufacturer: $biosMfr) - skipping."

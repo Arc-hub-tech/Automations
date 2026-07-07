@@ -408,7 +408,12 @@ Write-Host "== Applying CE+/ISO 27001 baseline hardening ==" -ForegroundColor Cy
 # actual try/catch.
 Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
 if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
-    Remove-WindowsFeature FS-SMB1 -ErrorAction SilentlyContinue | Out-Null
+    if ((Get-WindowsFeature FS-SMB1).Installed) {
+        Remove-WindowsFeature FS-SMB1 -ErrorAction SilentlyContinue | Out-Null
+        Write-Host "  removed: FS-SMB1"
+    } else {
+        Write-Host "  FS-SMB1 already absent."
+    }
 } else {
     foreach ($feat in "SMB1Protocol", "MicrosoftWindowsPowerShellV2Root", "MicrosoftWindowsPowerShellV2") {
         try {

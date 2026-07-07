@@ -24,13 +24,15 @@
     Windows Server 2025 multi-session (RD Session Host) template prep.
     Run once as Administrator, reboot, verify, then sysprep/clone.
     1. Installs the RD Session Host role
-    2. Removes Windows Defender (Sentinel EDR is the AV/EDR on these hosts)
-    3. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing - mandatory on RDSH)
-    4. Installs new Teams machine-wide (VDI-optimised)
-    5. Installs FSLogix agent (profile container config left as placeholders)
-    6. Sweeps unprovisioned appx packages (sysprep blockers)
-    7. Ensures BitLocker is off and stays off on clones
-    8. Session-host QoL: no Server Manager at logon, temp/WU cache cleared
+    2. Detects VMware platform (via BIOS/SMBIOS) and triggers a VMware Tools upgrade if present
+    3. Removes Windows Defender (Sentinel EDR is the AV/EDR on these hosts)
+    4. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing - mandatory on RDSH)
+    5. Installs new Teams machine-wide (VDI-optimised)
+    6. Installs common apps (7-Zip, Adobe Acrobat Reader DC) via winget
+    7. Installs FSLogix agent (profile container config left as placeholders)
+    8. Sweeps unprovisioned appx packages (sysprep blockers)
+    9. Ensures BitLocker is off and stays off on clones
+    10. Session-host QoL: no Server Manager at logon, temp/WU cache cleared
 
 .NOTES
     Run elevated:  Set-ExecutionPolicy Bypass -Scope Process -Force; .\Prep-WS2025-RDSH-Template.ps1
@@ -38,6 +40,9 @@
     Windows Defender is fully removed, not just disabled - there is NO AV on the box until
     Sentinel is installed and enrolled. Deploy/enrol Sentinel immediately after sysprep/clone,
     before the host goes into service.
+    Full run is logged to C:\ArcLogs\GoldImagePrep\ (transcript, timestamped per run).
+    App installs use winget so they always pull the current published version - no
+    hardcoded download URLs to go stale.
     RDS licensing mode/server is intentionally NOT set here - do it via GPO on the clones,
     or uncomment the registry block at the bottom.
 #>
@@ -47,6 +52,18 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 $Work = "$env:TEMP\RDSHPrep"
 New-Item -ItemType Directory -Path $Work -Force | Out-Null
+
+# ---------------------------------------------------------------
+# Transcript logging - full run output captured for troubleshooting
+# failed image builds. trap ensures the transcript is closed even if
+# a later step throws (ErrorActionPreference is 'Stop' above).
+# ---------------------------------------------------------------
+$LogDir  = "$env:SystemDrive\ArcLogs\GoldImagePrep"
+New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+$LogFile = Join-Path $LogDir ("Prep-WS2025-RDSH-Template_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+Start-Transcript -Path $LogFile -Append | Out-Null
+trap { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null }
+Write-Host "Logging this run to $LogFile" -ForegroundColor DarkGray
 
 # ---------------------------------------------------------------
 # 0. Standard local admin account - ADOPTS the currently logged-in
@@ -92,7 +109,37 @@ if ((Get-WindowsFeature RDS-RD-Server).Installed) {
 }
 
 # ---------------------------------------------------------------
-# 2. Remove Windows Defender - Sentinel is the AV/EDR for these hosts,
+# 2. VMware platform check - detected via BIOS/SMBIOS-reported
+#    manufacturer (the same data the hypervisor presents to the guest
+#    that Win32_ComputerSystem/Win32_BIOS read). If this is a VMware
+#    VM and VMware Tools is already installed, trigger its built-in
+#    self-service upgrade (pulls newer tools from host-mounted media
+#    if the host has them - the in-guest equivalent of "Upgrade
+#    VMware Tools" from vCenter/ESXi). If VMware Tools isn't installed
+#    at all, this script can't fetch the installer itself (no
+#    host-mounted media, no stable public download URL) - it just
+#    flags it for manual/vCenter install.
+# ---------------------------------------------------------------
+Write-Host "== Checking VMware platform / tools ==" -ForegroundColor Cyan
+
+$biosMfr = (Get-CimInstance Win32_ComputerSystem).Manufacturer
+if ($biosMfr -match 'VMware') {
+    Write-Host "  VMware platform detected (BIOS manufacturer: $biosMfr)."
+    $toolboxCmd = "$env:ProgramFiles\VMware\VMware Tools\VMwareToolboxCmd.exe"
+    if (Test-Path $toolboxCmd) {
+        $toolsVer = & $toolboxCmd -v
+        Write-Host "  VMware Tools installed (version $toolsVer) - triggering self-service upgrade check..."
+        & $toolboxCmd upgrade start
+        Write-Host "  upgrade triggered - if the host has newer tools mounted, they'll install now; otherwise this is a no-op."
+    } else {
+        Write-Warning "VMware Tools not installed - install/upgrade from vCenter/ESXi (Guest > Install VMware Tools) before sysprepping; this script cannot fetch the installer from inside the guest."
+    }
+} else {
+    Write-Host "  not running on VMware (BIOS manufacturer: $biosMfr) - skipping."
+}
+
+# ---------------------------------------------------------------
+# 3. Remove Windows Defender - Sentinel is the AV/EDR for these hosts,
 #    and running both simultaneously causes conflicts. Uninstalling the
 #    feature (rather than just disabling it) leaves NO AV on the box
 #    until Sentinel is deployed - enrol Sentinel immediately after
@@ -108,7 +155,7 @@ if ((Get-WindowsFeature Windows-Defender).Installed) {
 }
 
 # ---------------------------------------------------------------
-# 3. Microsoft 365 Apps via ODT (Shared Computer Licensing = required on RDSH)
+# 4. Microsoft 365 Apps via ODT (Shared Computer Licensing = required on RDSH)
 # ---------------------------------------------------------------
 Write-Host "== Installing Microsoft 365 Apps ==" -ForegroundColor Cyan
 
@@ -149,7 +196,7 @@ Get-Process -Name odt, setup -ErrorAction SilentlyContinue |
     Stop-Process -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------
-# 4. New Teams (machine-wide, VDI optimised)
+# 5. New Teams (machine-wide, VDI optimised)
 # ---------------------------------------------------------------
 Write-Host "== Installing Teams (new) ==" -ForegroundColor Cyan
 
@@ -168,7 +215,30 @@ Invoke-WebRequest -Uri "https://aka.ms/msrdcwebrtcsvc/msi" -OutFile $rtc
 Start-Process msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Wait -NoNewWindow
 
 # ---------------------------------------------------------------
-# 5. FSLogix agent (profile containers for non-persistent multi-session)
+# 6. Common third-party apps via winget - no hardcoded download URLs
+#    to go stale, winget always resolves the current published
+#    version. Requires winget (App Installer) on the image; if it's
+#    missing this just warns and skips rather than guessing a URL.
+# ---------------------------------------------------------------
+Write-Host "== Installing common apps (7-Zip, Adobe Acrobat Reader DC) ==" -ForegroundColor Cyan
+
+function Install-WingetApp {
+    param([string]$Id, [string]$Name)
+    Write-Host "  installing $Name ($Id)..."
+    winget install --id $Id -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Host "  $Name installed." -ForegroundColor Green }
+    else { Write-Warning "$Name install via winget exited with code $LASTEXITCODE - verify manually." }
+}
+
+if (Get-Command winget -ErrorAction SilentlyContinue) {
+    Install-WingetApp -Id "7zip.7zip" -Name "7-Zip"
+    Install-WingetApp -Id "Adobe.Acrobat.Reader.64-bit" -Name "Adobe Acrobat Reader DC"
+} else {
+    Write-Warning "winget not found on this image - skipping 7-Zip/Adobe Acrobat Reader install. Install manually or add winget (App Installer) to the base image first."
+}
+
+# ---------------------------------------------------------------
+# 7. FSLogix agent (profile containers for non-persistent multi-session)
 #    Agent installs here; POINT IT AT YOUR PROFILE SHARE before go-live
 #    (uncomment and set VHDLocations below, or push via GPO/ADMX).
 # ---------------------------------------------------------------
@@ -193,7 +263,7 @@ Start-Process $fslSetup.FullName -ArgumentList "/install /quiet /norestart" -Wai
 # Set-ItemProperty $fslKey -Name "FlipFlopProfileDirectoryName"         -Value 1 -Type DWord
 
 # ---------------------------------------------------------------
-# 6. Sysprep-readiness sweep: remove appx installed for a user but
+# 8. Sysprep-readiness sweep: remove appx installed for a user but
 #    not provisioned for all users (classic sysprep validation failure)
 # ---------------------------------------------------------------
 Write-Host "== Sweeping unprovisioned appx packages ==" -ForegroundColor Cyan
@@ -209,7 +279,7 @@ Get-AppxPackage -AllUsers | Where-Object {
 }
 
 # ---------------------------------------------------------------
-# 7. BitLocker: ensure decrypted, prevent device encryption on clones
+# 9. BitLocker: ensure decrypted, prevent device encryption on clones
 # ---------------------------------------------------------------
 Write-Host "== Checking BitLocker ==" -ForegroundColor Cyan
 
@@ -237,8 +307,8 @@ if (-not (Test-Path $blKey)) { New-Item -Path $blKey | Out-Null }
 Set-ItemProperty $blKey -Name "PreventDeviceEncryption" -Value 1 -Type DWord
 
 # ---------------------------------------------------------------
-# 8. UK regional and time settings (applied to system, welcome screen,
-#    and the default profile so every clone/new user inherits them)
+# 10. UK regional and time settings (applied to system, welcome screen,
+#     and the default profile so every clone/new user inherits them)
 # ---------------------------------------------------------------
 Write-Host "== Setting UK regional/time settings ==" -ForegroundColor Cyan
 
@@ -252,11 +322,11 @@ Set-WinUserLanguageList en-GB -Force
 Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true
 
 # ---------------------------------------------------------------
-# 9. CE+ / ISO 27001 baseline hardening - image-safe defaults.
-#    Domain GPO will override any of these on joined machines,
-#    which is fine; these are the floor, not the ceiling.
-#    NOTE: TLS 1.0/1.1 disable is the only item with app-compat risk
-#    (ancient LOB apps) - remove that block for a legacy-app image.
+# 11. CE+ / ISO 27001 baseline hardening - image-safe defaults.
+#     Domain GPO will override any of these on joined machines,
+#     which is fine; these are the floor, not the ceiling.
+#     NOTE: TLS 1.0/1.1 disable is the only item with app-compat risk
+#     (ancient LOB apps) - remove that block for a legacy-app image.
 # ---------------------------------------------------------------
 Write-Host "== Applying CE+/ISO 27001 baseline hardening ==" -ForegroundColor Cyan
 
@@ -321,7 +391,7 @@ net accounts /lockoutthreshold:10 /lockoutduration:15 /lockoutwindow:15 | Out-Nu
 net user Guest /active:no 2>$null | Out-Null
 
 # ---------------------------------------------------------------
-# 10. Session-host QoL + cleanup
+# 12. Session-host QoL + cleanup
 # ---------------------------------------------------------------
 Write-Host "== Session host tweaks and cleanup ==" -ForegroundColor Cyan
 
@@ -346,3 +416,4 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "`nDone. REBOOT NOW (RDSH role + Defender removal). After reboot: install/enrol Sentinel BEFORE this host serves users," -ForegroundColor Green
 Write-Host "then verify Office/Teams launch, then: sysprep /oobe /generalize /shutdown" -ForegroundColor Green
+Stop-Transcript | Out-Null

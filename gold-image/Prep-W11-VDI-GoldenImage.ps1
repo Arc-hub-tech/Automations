@@ -22,19 +22,36 @@
 
 .SYNOPSIS
     Windows 11 VDI golden image prep - run once as Administrator, then sysprep/clone.
-    1. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing for VDI)
-    2. Installs new Teams machine-wide (with VDI/AVD optimisation reg key)
-    3. Removes provisioned + installed bloatware appx packages
-    4. Disables consumer content / suggested apps so clones stay clean
+    1. Detects VMware platform (via BIOS/SMBIOS) and triggers a VMware Tools upgrade if present
+    2. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing for VDI)
+    3. Installs new Teams machine-wide (with VDI/AVD optimisation reg key)
+    4. Installs common apps (7-Zip, Adobe Acrobat Reader DC) via winget
+    5. Removes provisioned + installed bloatware appx packages
+    6. Disables consumer content / suggested apps so clones stay clean
 
 .NOTES
     Run in an elevated PowerShell session:  Set-ExecutionPolicy Bypass -Scope Process -Force; .\Prep-W11-VDI-GoldenImage.ps1
+    Full run is logged to C:\ArcLogs\GoldImagePrep\ (transcript, timestamped per run).
+    App installs use winget so they always pull the current published version - no
+    hardcoded download URLs to go stale.
 #>
 
 #Requires -RunAsAdministrator
 $ErrorActionPreference = 'Stop'
 $Work = "$env:TEMP\VDIPrep"
 New-Item -ItemType Directory -Path $Work -Force | Out-Null
+
+# ---------------------------------------------------------------
+# Transcript logging - full run output captured for troubleshooting
+# failed image builds. trap ensures the transcript is closed even if
+# a later step throws (ErrorActionPreference is 'Stop' above).
+# ---------------------------------------------------------------
+$LogDir  = "$env:SystemDrive\ArcLogs\GoldImagePrep"
+New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+$LogFile = Join-Path $LogDir ("Prep-W11-VDI-GoldenImage_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+Start-Transcript -Path $LogFile -Append | Out-Null
+trap { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null }
+Write-Host "Logging this run to $LogFile" -ForegroundColor DarkGray
 
 # ---------------------------------------------------------------
 # 0. Standard local admin account - ADOPTS the currently logged-in
@@ -69,7 +86,37 @@ if (-not $cur) {
 }
 
 # ---------------------------------------------------------------
-# 1. Microsoft 365 Apps via Office Deployment Tool
+# 1. VMware platform check - detected via BIOS/SMBIOS-reported
+#    manufacturer (the same data the hypervisor presents to the guest
+#    that Win32_ComputerSystem/Win32_BIOS read). If this is a VMware
+#    VM and VMware Tools is already installed, trigger its built-in
+#    self-service upgrade (pulls newer tools from host-mounted media
+#    if the host has them - the in-guest equivalent of "Upgrade
+#    VMware Tools" from vCenter/ESXi). If VMware Tools isn't installed
+#    at all, this script can't fetch the installer itself (no
+#    host-mounted media, no stable public download URL) - it just
+#    flags it for manual/vCenter install.
+# ---------------------------------------------------------------
+Write-Host "== Checking VMware platform / tools ==" -ForegroundColor Cyan
+
+$biosMfr = (Get-CimInstance Win32_ComputerSystem).Manufacturer
+if ($biosMfr -match 'VMware') {
+    Write-Host "  VMware platform detected (BIOS manufacturer: $biosMfr)."
+    $toolboxCmd = "$env:ProgramFiles\VMware\VMware Tools\VMwareToolboxCmd.exe"
+    if (Test-Path $toolboxCmd) {
+        $toolsVer = & $toolboxCmd -v
+        Write-Host "  VMware Tools installed (version $toolsVer) - triggering self-service upgrade check..."
+        & $toolboxCmd upgrade start
+        Write-Host "  upgrade triggered - if the host has newer tools mounted, they'll install now; otherwise this is a no-op."
+    } else {
+        Write-Warning "VMware Tools not installed - install/upgrade from vCenter/ESXi (Guest > Install VMware Tools) before sysprepping; this script cannot fetch the installer from inside the guest."
+    }
+} else {
+    Write-Host "  not running on VMware (BIOS manufacturer: $biosMfr) - skipping."
+}
+
+# ---------------------------------------------------------------
+# 2. Microsoft 365 Apps via Office Deployment Tool
 # ---------------------------------------------------------------
 Write-Host "== Installing Microsoft 365 Apps ==" -ForegroundColor Cyan
 
@@ -116,7 +163,7 @@ Get-Process -Name odt, setup -ErrorAction SilentlyContinue |
     Stop-Process -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------
-# 2. New Teams (machine-wide provisioning, VDI optimised)
+# 3. New Teams (machine-wide provisioning, VDI optimised)
 # ---------------------------------------------------------------
 Write-Host "== Installing Teams (new) ==" -ForegroundColor Cyan
 
@@ -136,7 +183,30 @@ Invoke-WebRequest -Uri "https://aka.ms/msrdcwebrtcsvc/msi" -OutFile $rtc
 Start-Process msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Wait -NoNewWindow
 
 # ---------------------------------------------------------------
-# 3. FSLogix agent - DORMANT install. Completely inert without the
+# 4. Common third-party apps via winget - no hardcoded download URLs
+#    to go stale, winget always resolves the current published
+#    version. Requires winget (App Installer) on the image; if it's
+#    missing this just warns and skips rather than guessing a URL.
+# ---------------------------------------------------------------
+Write-Host "== Installing common apps (7-Zip, Adobe Acrobat Reader DC) ==" -ForegroundColor Cyan
+
+function Install-WingetApp {
+    param([string]$Id, [string]$Name)
+    Write-Host "  installing $Name ($Id)..."
+    winget install --id $Id -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Host "  $Name installed." -ForegroundColor Green }
+    else { Write-Warning "$Name install via winget exited with code $LASTEXITCODE - verify manually." }
+}
+
+if (Get-Command winget -ErrorAction SilentlyContinue) {
+    Install-WingetApp -Id "7zip.7zip" -Name "7-Zip"
+    Install-WingetApp -Id "Adobe.Acrobat.Reader.64-bit" -Name "Adobe Acrobat Reader DC"
+} else {
+    Write-Warning "winget not found on this image - skipping 7-Zip/Adobe Acrobat Reader install. Install manually or add winget (App Installer) to the base image first."
+}
+
+# ---------------------------------------------------------------
+# 5. FSLogix agent - DORMANT install. Completely inert without the
 #    Enabled=1 config key, so persistent Discrete PCs behave exactly
 #    as before (local profiles + OneDrive KFM). Enabling later for
 #    pooled/non-persistent use is just GPO or the reg keys below.
@@ -162,7 +232,7 @@ Start-Process $fslSetup.FullName -ArgumentList "/install /quiet /norestart" -Wai
 # Set-ItemProperty $fslKey -Name "FlipFlopProfileDirectoryName"         -Value 1 -Type DWord
 
 # ---------------------------------------------------------------
-# 4. Remove bloatware (provisioned = future users, installed = current)
+# 6. Remove bloatware (provisioned = future users, installed = current)
 # ---------------------------------------------------------------
 Write-Host "== Removing bloatware ==" -ForegroundColor Cyan
 
@@ -210,7 +280,7 @@ foreach ($app in $Bloat) {
 }
 
 # ---------------------------------------------------------------
-# 5. Stop Windows re-adding junk on new profiles
+# 7. Stop Windows re-adding junk on new profiles
 # ---------------------------------------------------------------
 Write-Host "== Disabling consumer features/suggestions ==" -ForegroundColor Cyan
 
@@ -223,7 +293,7 @@ New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Force | Out-Null
 Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Name "AllowNewsAndInterests" -Value 0 -Type DWord
 
 # ---------------------------------------------------------------
-# 6. Sysprep-readiness sweep: remove appx packages that are installed
+# 8. Sysprep-readiness sweep: remove appx packages that are installed
 #    for a user but NOT provisioned for all users. These are the classic
 #    "Sysprep was not able to validate your Windows installation" cause
 #    (Store auto-updates and per-user installs create them silently).
@@ -241,7 +311,7 @@ Get-AppxPackage -AllUsers | Where-Object {
 }
 
 # ---------------------------------------------------------------
-# 7. BitLocker: decrypt OS volume (sysprep refuses encrypted volumes)
+# 9. BitLocker: decrypt OS volume (sysprep refuses encrypted volumes)
 #    and stop clones from silently self-encrypting on first sign-in
 # ---------------------------------------------------------------
 Write-Host "== Disabling BitLocker/device encryption ==" -ForegroundColor Cyan
@@ -267,8 +337,8 @@ if (-not (Test-Path $blKey)) { New-Item -Path $blKey | Out-Null }
 Set-ItemProperty $blKey -Name "PreventDeviceEncryption" -Value 1 -Type DWord
 
 # ---------------------------------------------------------------
-# 8. UK regional and time settings (applied to system, welcome screen,
-#    and the default profile so every clone/new user inherits them)
+# 10. UK regional and time settings (applied to system, welcome screen,
+#     and the default profile so every clone/new user inherits them)
 # ---------------------------------------------------------------
 Write-Host "== Setting UK regional/time settings ==" -ForegroundColor Cyan
 
@@ -282,11 +352,11 @@ Set-WinUserLanguageList en-GB -Force
 Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true
 
 # ---------------------------------------------------------------
-# 9. CE+ / ISO 27001 baseline hardening - image-safe defaults.
-#    Domain/Intune policy will override any of these on managed
-#    machines, which is fine; these are the floor, not the ceiling.
-#    NOTE: TLS 1.0/1.1 disable is the only item with app-compat risk
-#    (ancient LOB apps) - remove that block for a legacy-app image.
+# 11. CE+ / ISO 27001 baseline hardening - image-safe defaults.
+#     Domain/Intune policy will override any of these on managed
+#     machines, which is fine; these are the floor, not the ceiling.
+#     NOTE: TLS 1.0/1.1 disable is the only item with app-compat risk
+#     (ancient LOB apps) - remove that block for a legacy-app image.
 # ---------------------------------------------------------------
 Write-Host "== Applying CE+/ISO 27001 baseline hardening ==" -ForegroundColor Cyan
 
@@ -354,7 +424,7 @@ net accounts /lockoutthreshold:10 /lockoutduration:15 /lockoutwindow:15 | Out-Nu
 net user Guest /active:no 2>$null | Out-Null
 
 # ---------------------------------------------------------------
-# 10. Clear temp + Windows Update download cache to slim the clone source
+# 12. Clear temp + Windows Update download cache to slim the clone source
 # ---------------------------------------------------------------
 Write-Host "== Clearing temp and WU cache ==" -ForegroundColor Cyan
 
@@ -364,7 +434,7 @@ Get-ChildItem $env:TEMP, "C:\Windows\Temp", "C:\Windows\SoftwareDistribution\Dow
 Start-Service wuauserv -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------
-# 11. Sysprep answer file - skips the entire OOBE (region, keyboard,
+# 13. Sysprep answer file - skips the entire OOBE (region, keyboard,
 #     EULA, account creation, privacy screens). Clones boot straight
 #     to the sign-in screen with the accounts baked into the image.
 #     NOTE: if the image was built from a US ISO, change UILanguage
@@ -403,3 +473,4 @@ Write-Host "  written to C:\Windows\Panther\unattend.xml"
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "`nDone. Verify Office/Teams launch, then generalise with:" -ForegroundColor Green
 Write-Host "  C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green
+Stop-Transcript | Out-Null

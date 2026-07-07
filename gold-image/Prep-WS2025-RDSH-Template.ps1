@@ -18,6 +18,10 @@
     (no clone needed; review the script on GitHub first if unsure):
 
        irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-WS2025-RDSH-Template.ps1 | iex
+
+ 3. Early on, the script will prompt you to set a password for the
+    standing admin account - note it down, you'll need it for console
+    access until LAPS rotates it away post-deploy.
 ================================================================
 
 .SYNOPSIS
@@ -105,7 +109,19 @@ if (-not $cur) {
 } elseif ($builtin.Name -eq $AdminUser) {
     Write-Warning "You are logged in as the BUILT-IN Administrator. Log in as a named admin (e.g. ArcAdmin) instead - the built-in account should end up disabled, not be the standing admin. Skipping account step."
 } else {
-    Set-LocalUser -Name $AdminUser -PasswordNeverExpires $true -AccountNeverExpires `
+    Write-Host "  set a password for '$AdminUser' - it becomes the account's real password now," -ForegroundColor Cyan
+    Write-Host "  and the same value is declared in unattend.xml later so OOBE skips account creation." -ForegroundColor Cyan
+    Write-Host "  Note it down: LAPS rotates it away after first deploy, but you'll need it for console access before then." -ForegroundColor Cyan
+    do {
+        $AdminPasswordSecure  = Read-Host -AsSecureString "  Password for $AdminUser"
+        $AdminPasswordConfirm = Read-Host -AsSecureString "  Confirm password"
+        $p1 = [System.Net.NetworkCredential]::new('', $AdminPasswordSecure).Password
+        $p2 = [System.Net.NetworkCredential]::new('', $AdminPasswordConfirm).Password
+        if ($p1 -ne $p2) { Write-Warning "Passwords didn't match - try again." }
+    } while ($p1 -ne $p2)
+    $p1 = $null; $p2 = $null; $AdminPasswordConfirm = $null
+
+    Set-LocalUser -Name $AdminUser -Password $AdminPasswordSecure -PasswordNeverExpires $true -AccountNeverExpires `
         -Description "Arc standing local admin - LAPS managed"
     if (-not (Get-LocalGroupMember -Group "Administrators" -Member $AdminUser -ErrorAction SilentlyContinue)) {
         Add-LocalGroupMember -Group "Administrators" -Member $AdminUser
@@ -525,28 +541,20 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 #     deliberately trimmed to the Server-valid subset. Account creation is
 #     instead bypassed via SkipMachineOOBE/SkipUserOOBE plus explicitly
 #     declaring the standing admin account. So when a standing admin was
-#     set up in step 0, this declares that SAME account with a freshly
-#     generated, one-time random password (generated fresh per run, never
-#     logged, never committed) purely so OOBE has an account to present at
-#     the sign-in screen instead of the creation wizard. A FirstLogonCommand
-#     then deletes this file immediately after specialize completes, so the
-#     placeholder password only exists on disk for the few seconds of the
-#     automated first-boot sequence before LAPS takes over and rotates the
-#     account's real password.
+#     set up in step 0, this declares that SAME account using the password
+#     you set there (never a randomly generated one - a random password
+#     nobody knows caused a real lockout the first time this was tried).
+#     A FirstLogonCommand deletes this file immediately after specialize
+#     completes, so the password doesn't linger on disk in plaintext -
+#     but since you already know it from step 0, that's just cleanup, not
+#     your only copy.
 # ---------------------------------------------------------------
 Write-Host "== Writing sysprep unattend.xml ==" -ForegroundColor Cyan
 
 $userAccountsXml = ""
 $firstLogonXml   = ""
 if ($StandingAdminReady) {
-    function New-TempPassword {
-        $upper  = 65..90  | Get-Random -Count 4 | ForEach-Object { [char]$_ }
-        $lower  = 97..122 | Get-Random -Count 4 | ForEach-Object { [char]$_ }
-        $digit  = 48..57  | Get-Random -Count 4 | ForEach-Object { [char]$_ }
-        $symbol = '!','@','#','%','^','*' | Get-Random -Count 2
-        -join (($upper + $lower + $digit + $symbol) | Get-Random -Count 14)
-    }
-    $TempPassword = New-TempPassword
+    $AdminPasswordPlain = [System.Net.NetworkCredential]::new('', $AdminPasswordSecure).Password
 
     $userAccountsXml = @"
 
@@ -554,7 +562,7 @@ if ($StandingAdminReady) {
         <LocalAccounts>
           <LocalAccount wcm:action="add">
             <Password>
-              <Value>$TempPassword</Value>
+              <Value>$AdminPasswordPlain</Value>
               <PlainText>true</PlainText>
             </Password>
             <Group>Administrators</Group>
@@ -570,11 +578,11 @@ if ($StandingAdminReady) {
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
           <CommandLine>cmd /c del /f /q C:\Windows\Panther\unattend.xml</CommandLine>
-          <Description>Remove sysprep answer file (one-time placeholder password) immediately after first boot</Description>
+          <Description>Remove sysprep answer file (contains the admin password) immediately after first boot</Description>
         </SynchronousCommand>
       </FirstLogonCommands>
 "@
-    $TempPassword = $null
+    $AdminPasswordPlain = $null
 } else {
     Write-Host "  no standing admin was set up in step 0 - skipping account declaration (the account-creation screen may still appear on first boot)." -ForegroundColor Yellow
 }

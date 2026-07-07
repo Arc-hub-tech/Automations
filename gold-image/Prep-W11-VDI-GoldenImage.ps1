@@ -25,7 +25,7 @@
     1. Detects VMware platform (via BIOS/SMBIOS) and installs/upgrades VMware Tools
     2. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing for VDI)
     3. Installs new Teams machine-wide (with VDI/AVD optimisation reg key)
-    4. Installs common apps (7-Zip, Adobe Acrobat Reader DC) via winget
+    4. Installs common apps (7-Zip, Foxit PDF Reader) via winget
     5. Removes provisioned + installed bloatware appx packages
     6. Disables consumer content / suggested apps so clones stay clean
 
@@ -213,7 +213,7 @@ Start-Process msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Wait -NoNewWin
 #    version. Requires winget (App Installer) on the image; if it's
 #    missing this just warns and skips rather than guessing a URL.
 # ---------------------------------------------------------------
-Write-Host "== Installing common apps (7-Zip, Adobe Acrobat Reader DC) ==" -ForegroundColor Cyan
+Write-Host "== Installing common apps (7-Zip, Foxit PDF Reader) ==" -ForegroundColor Cyan
 
 function Install-WingetApp {
     param([string]$Id, [string]$Name)
@@ -225,9 +225,9 @@ function Install-WingetApp {
 
 if (Get-Command winget -ErrorAction SilentlyContinue) {
     Install-WingetApp -Id "7zip.7zip" -Name "7-Zip"
-    Install-WingetApp -Id "Adobe.Acrobat.Reader.64-bit" -Name "Adobe Acrobat Reader DC"
+    Install-WingetApp -Id "Foxit.FoxitReader" -Name "Foxit PDF Reader"
 } else {
-    Write-Warning "winget not found on this image - skipping 7-Zip/Adobe Acrobat Reader install. Install manually or add winget (App Installer) to the base image first."
+    Write-Warning "winget not found on this image - skipping 7-Zip/Foxit PDF Reader install. Install manually or add winget (App Installer) to the base image first."
 }
 
 # ---------------------------------------------------------------

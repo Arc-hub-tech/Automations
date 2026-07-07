@@ -2,7 +2,7 @@
 
 All notable changes to `Prep-W11-VDI-GoldenImage.ps1`, `Prep-WS2025-RDSH-Template.ps1`, and `Prep-WS2025-Server-Template.ps1`.
 
-## [Unreleased]
+## [v1.2] - 2026-07-07
 
 ### Added
 - `Prep-WS2025-Server-Template.ps1` - general-purpose Windows Server 2025 template prep for member/app/file servers that do NOT run the RD Session Host role. Reuses the RDSH template's VMware Tools handling, Defender-for-Sentinel removal, appx/BitLocker/regional/hardening/cleanup/sysprep steps, but deliberately leaves out anything RDSH/VDI-specific (no M365 Apps, Teams, WebRTC redirector, FSLogix, or winget common apps) to keep it minimal.

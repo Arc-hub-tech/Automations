@@ -3,16 +3,20 @@
     Windows Server 2025 multi-session (RD Session Host) template prep.
     Run once as Administrator, reboot, verify, then sysprep/clone.
     1. Installs the RD Session Host role
-    2. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing - mandatory on RDSH)
-    3. Installs new Teams machine-wide (VDI-optimised)
-    4. Installs FSLogix agent (profile container config left as placeholders)
-    5. Sweeps unprovisioned appx packages (sysprep blockers)
-    6. Ensures BitLocker is off and stays off on clones
-    7. Session-host QoL: no Server Manager at logon, temp/WU cache cleared
+    2. Removes Windows Defender (Sentinel EDR is the AV/EDR on these hosts)
+    3. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing - mandatory on RDSH)
+    4. Installs new Teams machine-wide (VDI-optimised)
+    5. Installs FSLogix agent (profile container config left as placeholders)
+    6. Sweeps unprovisioned appx packages (sysprep blockers)
+    7. Ensures BitLocker is off and stays off on clones
+    8. Session-host QoL: no Server Manager at logon, temp/WU cache cleared
 
 .NOTES
     Run elevated:  Set-ExecutionPolicy Bypass -Scope Process -Force; .\Prep-WS2025-RDSH-Template.ps1
-    A REBOOT IS REQUIRED after this script (RDSH role) before validating and sysprepping.
+    A REBOOT IS REQUIRED after this script (RDSH role + Defender removal) before validating and sysprepping.
+    Windows Defender is fully removed, not just disabled - there is NO AV on the box until
+    Sentinel is installed and enrolled. Deploy/enrol Sentinel immediately after sysprep/clone,
+    before the host goes into service.
     RDS licensing mode/server is intentionally NOT set here - do it via GPO on the clones,
     or uncomment the registry block at the bottom.
 #>
@@ -67,7 +71,23 @@ if ((Get-WindowsFeature RDS-RD-Server).Installed) {
 }
 
 # ---------------------------------------------------------------
-# 2. Microsoft 365 Apps via ODT (Shared Computer Licensing = required on RDSH)
+# 2. Remove Windows Defender - Sentinel is the AV/EDR for these hosts,
+#    and running both simultaneously causes conflicts. Uninstalling the
+#    feature (rather than just disabling it) leaves NO AV on the box
+#    until Sentinel is deployed - enrol Sentinel immediately after
+#    sysprep/clone, before the host goes into service.
+# ---------------------------------------------------------------
+Write-Host "== Removing Windows Defender (Sentinel EDR will replace it) ==" -ForegroundColor Cyan
+
+if ((Get-WindowsFeature Windows-Defender).Installed) {
+    $defFeat = Uninstall-WindowsFeature Windows-Defender
+    Write-Host "  Windows Defender removed. Restart needed: $($defFeat.RestartNeeded)"
+} else {
+    Write-Host "  Windows Defender feature already absent."
+}
+
+# ---------------------------------------------------------------
+# 3. Microsoft 365 Apps via ODT (Shared Computer Licensing = required on RDSH)
 # ---------------------------------------------------------------
 Write-Host "== Installing Microsoft 365 Apps ==" -ForegroundColor Cyan
 
@@ -108,7 +128,7 @@ Get-Process -Name odt, setup -ErrorAction SilentlyContinue |
     Stop-Process -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------
-# 3. New Teams (machine-wide, VDI optimised)
+# 4. New Teams (machine-wide, VDI optimised)
 # ---------------------------------------------------------------
 Write-Host "== Installing Teams (new) ==" -ForegroundColor Cyan
 
@@ -127,7 +147,7 @@ Invoke-WebRequest -Uri "https://aka.ms/msrdcwebrtcsvc/msi" -OutFile $rtc
 Start-Process msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Wait -NoNewWindow
 
 # ---------------------------------------------------------------
-# 4. FSLogix agent (profile containers for non-persistent multi-session)
+# 5. FSLogix agent (profile containers for non-persistent multi-session)
 #    Agent installs here; POINT IT AT YOUR PROFILE SHARE before go-live
 #    (uncomment and set VHDLocations below, or push via GPO/ADMX).
 # ---------------------------------------------------------------
@@ -152,7 +172,7 @@ Start-Process $fslSetup.FullName -ArgumentList "/install /quiet /norestart" -Wai
 # Set-ItemProperty $fslKey -Name "FlipFlopProfileDirectoryName"         -Value 1 -Type DWord
 
 # ---------------------------------------------------------------
-# 5. Sysprep-readiness sweep: remove appx installed for a user but
+# 6. Sysprep-readiness sweep: remove appx installed for a user but
 #    not provisioned for all users (classic sysprep validation failure)
 # ---------------------------------------------------------------
 Write-Host "== Sweeping unprovisioned appx packages ==" -ForegroundColor Cyan
@@ -168,7 +188,7 @@ Get-AppxPackage -AllUsers | Where-Object {
 }
 
 # ---------------------------------------------------------------
-# 6. BitLocker: ensure decrypted, prevent device encryption on clones
+# 7. BitLocker: ensure decrypted, prevent device encryption on clones
 # ---------------------------------------------------------------
 Write-Host "== Checking BitLocker ==" -ForegroundColor Cyan
 
@@ -196,7 +216,7 @@ if (-not (Test-Path $blKey)) { New-Item -Path $blKey | Out-Null }
 Set-ItemProperty $blKey -Name "PreventDeviceEncryption" -Value 1 -Type DWord
 
 # ---------------------------------------------------------------
-# 7. UK regional and time settings (applied to system, welcome screen,
+# 8. UK regional and time settings (applied to system, welcome screen,
 #    and the default profile so every clone/new user inherits them)
 # ---------------------------------------------------------------
 Write-Host "== Setting UK regional/time settings ==" -ForegroundColor Cyan
@@ -211,7 +231,7 @@ Set-WinUserLanguageList en-GB -Force
 Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true
 
 # ---------------------------------------------------------------
-# 8. CE+ / ISO 27001 baseline hardening - image-safe defaults.
+# 9. CE+ / ISO 27001 baseline hardening - image-safe defaults.
 #    Domain GPO will override any of these on joined machines,
 #    which is fine; these are the floor, not the ceiling.
 #    NOTE: TLS 1.0/1.1 disable is the only item with app-compat risk
@@ -234,9 +254,6 @@ Set-SmbClientConfiguration -RequireSecuritySignature $true -Force
 
 # Firewall on for all profiles
 Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True
-
-# Defender: PUA blocking + cloud protection
-Set-MpPreference -PUAProtection Enabled -MAPSReporting Advanced -SubmitSamplesConsent SendSafeSamples -ErrorAction SilentlyContinue
 
 # Disable TLS 1.0/1.1 and SSL 3.0 (server and client roles)
 foreach ($proto in "SSL 3.0", "TLS 1.0", "TLS 1.1") {
@@ -283,7 +300,7 @@ net accounts /lockoutthreshold:10 /lockoutduration:15 /lockoutwindow:15 | Out-Nu
 net user Guest /active:no 2>$null | Out-Null
 
 # ---------------------------------------------------------------
-# 9. Session-host QoL + cleanup
+# 10. Session-host QoL + cleanup
 # ---------------------------------------------------------------
 Write-Host "== Session host tweaks and cleanup ==" -ForegroundColor Cyan
 
@@ -306,4 +323,5 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
-Write-Host "`nDone. REBOOT NOW (RDSH role), verify Office/Teams launch, then: sysprep /oobe /generalize /shutdown" -ForegroundColor Green
+Write-Host "`nDone. REBOOT NOW (RDSH role + Defender removal). After reboot: install/enrol Sentinel BEFORE this host serves users," -ForegroundColor Green
+Write-Host "then verify Office/Teams launch, then: sysprep /oobe /generalize /shutdown" -ForegroundColor Green

@@ -49,6 +49,17 @@ New-Item -ItemType Directory -Path $Work -Force | Out-Null
 Set-Location -Path $Work
 [Environment]::CurrentDirectory = $Work
 
+# Shared helper - checks the Uninstall registry (both native and WOW6432Node
+# views) for a product already installed, so install steps below can skip
+# work that's already done instead of always re-downloading/re-running.
+function Test-InstalledProduct {
+    param([string]$NameLike)
+    $paths = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+             'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    return [bool](Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -like $NameLike } | Select-Object -First 1)
+}
+
 # ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
 # failed image builds. trap ensures the transcript is closed even if
@@ -155,9 +166,14 @@ if ($biosMfr -match 'VMware') {
 # ---------------------------------------------------------------
 Write-Host "== Installing Microsoft 365 Apps ==" -ForegroundColor Cyan
 
-# ODT config: shared computer licensing ON (required for non-persistent/multi-user VDI),
-# OneDrive Groove/legacy Skype excluded. Change Channel to "Current" if preferred.
-@"
+$cfg      = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+$existing = Get-ItemProperty -Path $cfg -ErrorAction SilentlyContinue
+if ($existing -and $existing.ProductReleaseIds -match 'O365ProPlusRetail') {
+    Write-Host "  Microsoft 365 Apps already installed (version $($existing.VersionToReport)) - skipping (Click-to-Run keeps itself updated)." -ForegroundColor Green
+} else {
+    # ODT config: shared computer licensing ON (required for non-persistent/multi-user VDI),
+    # OneDrive Groove/legacy Skype excluded. Change Channel to "Current" if preferred.
+    @"
 <Configuration>
   <Add OfficeClientEdition="64" Channel="MonthlyEnterprise">
     <Product ID="O365ProPlusRetail">
@@ -174,28 +190,28 @@ Write-Host "== Installing Microsoft 365 Apps ==" -ForegroundColor Cyan
 </Configuration>
 "@ | Set-Content "$Work\office.xml" -Encoding UTF8
 
-# Evergreen ODT link (redirects to latest setup.exe)
-$odt = "$Work\odt.exe"
-Invoke-WebRequest -Uri "https://officecdn.microsoft.com/pr/wsus/setup.exe" -OutFile $odt
-# ODT's setup.exe doesn't reliably exit on all builds, so don't wait on the process
-# at all. Launch it, then poll Click-to-Run's registry: VersionToReport is written
-# when the install actually completes.
-Start-Process $odt -ArgumentList "/configure `"$Work\office.xml`"" -NoNewWindow -WorkingDirectory $Work
-$cfg      = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
-$deadline = (Get-Date).AddMinutes(40)
-do {
-    Start-Sleep -Seconds 20
-    $ver = (Get-ItemProperty -Path $cfg -Name VersionToReport -ErrorAction SilentlyContinue).VersionToReport
-    Write-Host "  waiting for Office install to complete..."
-} until ($ver -or (Get-Date) -gt $deadline)
+    # Evergreen ODT link (redirects to latest setup.exe)
+    $odt = "$Work\odt.exe"
+    Invoke-WebRequest -Uri "https://officecdn.microsoft.com/pr/wsus/setup.exe" -OutFile $odt
+    # ODT's setup.exe doesn't reliably exit on all builds, so don't wait on the process
+    # at all. Launch it, then poll Click-to-Run's registry: VersionToReport is written
+    # when the install actually completes.
+    Start-Process $odt -ArgumentList "/configure `"$Work\office.xml`"" -NoNewWindow -WorkingDirectory $Work
+    $deadline = (Get-Date).AddMinutes(40)
+    do {
+        Start-Sleep -Seconds 20
+        $ver = (Get-ItemProperty -Path $cfg -Name VersionToReport -ErrorAction SilentlyContinue).VersionToReport
+        Write-Host "  waiting for Office install to complete..."
+    } until ($ver -or (Get-Date) -gt $deadline)
 
-if ($ver) { Write-Host "  Office $ver installed." -ForegroundColor Green }
-else      { Write-Warning "Timed out after 40 min waiting for Office - verify manually; continuing anyway." }
+    if ($ver) { Write-Host "  Office $ver installed." -ForegroundColor Green }
+    else      { Write-Warning "Timed out after 40 min waiting for Office - verify manually; continuing anyway." }
 
-# Kill any lingering ODT process so it can't hold things up or interfere with sysprep
-Get-Process -Name odt, setup -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -like "$Work*" } |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+    # Kill any lingering ODT process so it can't hold things up or interfere with sysprep
+    Get-Process -Name odt, setup -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -like "$Work*" } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+}
 
 # ---------------------------------------------------------------
 # 3. New Teams (machine-wide provisioning, VDI optimised)
@@ -206,16 +222,24 @@ Write-Host "== Installing Teams (new) ==" -ForegroundColor Cyan
 New-Item -Path "HKLM:\SOFTWARE\Microsoft\Teams" -Force | Out-Null
 Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Teams" -Name "IsWVDEnvironment" -Value 1 -Type DWord
 
-$boot = "$Work\teamsbootstrapper.exe"
-Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2243204" -OutFile $boot
-Start-Process $boot -ArgumentList "-p" -Wait -NoNewWindow -WorkingDirectory $Work   # -p provisions for all users
+if (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq 'MSTeams') {
+    Write-Host "  Teams (new) already provisioned - skipping." -ForegroundColor Green
+} else {
+    $boot = "$Work\teamsbootstrapper.exe"
+    Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2243204" -OutFile $boot
+    Start-Process $boot -ArgumentList "-p" -Wait -NoNewWindow -WorkingDirectory $Work   # -p provisions for all users
+}
 
 # Remote Desktop WebRTC Redirector Service - enables Teams media optimisation
 # for sessions connected via AVD/W365. Harmless but inert on plain RDS; remove
 # this block if these hosts will never be AVD session hosts.
-$rtc = "$Work\webrtc.msi"
-Invoke-WebRequest -Uri "https://aka.ms/msrdcwebrtcsvc/msi" -OutFile $rtc
-Start-Process msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Wait -NoNewWindow -WorkingDirectory $Work
+if (Test-InstalledProduct -NameLike "Remote Desktop WebRTC Redirector Service*") {
+    Write-Host "  WebRTC Redirector Service already installed - skipping." -ForegroundColor Green
+} else {
+    $rtc = "$Work\webrtc.msi"
+    Invoke-WebRequest -Uri "https://aka.ms/msrdcwebrtcsvc/msi" -OutFile $rtc
+    Start-Process msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Wait -NoNewWindow -WorkingDirectory $Work
+}
 
 # ---------------------------------------------------------------
 # 4. Common third-party apps via winget - no hardcoded download URLs
@@ -225,8 +249,18 @@ Start-Process msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Wait -NoNewWin
 # ---------------------------------------------------------------
 Write-Host "== Installing common apps (7-Zip, Foxit PDF Reader) ==" -ForegroundColor Cyan
 
+function Test-WingetInstalled {
+    param([string]$Id)
+    $result = winget list --id $Id -e --accept-source-agreements 2>$null
+    return ($LASTEXITCODE -eq 0) -and ($result -match [regex]::Escape($Id))
+}
+
 function Install-WingetApp {
     param([string]$Id, [string]$Name)
+    if (Test-WingetInstalled -Id $Id) {
+        Write-Host "  $Name already installed - skipping." -ForegroundColor Green
+        return
+    }
     Write-Host "  installing $Name ($Id)..."
     winget install --id $Id -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Null
     if ($LASTEXITCODE -eq 0) { Write-Host "  $Name installed." -ForegroundColor Green }
@@ -248,12 +282,16 @@ if (Get-Command winget -ErrorAction SilentlyContinue) {
 # ---------------------------------------------------------------
 Write-Host "== Installing FSLogix agent (dormant) ==" -ForegroundColor Cyan
 
-$fsl = "$Work\fslogix.zip"
-Invoke-WebRequest -Uri "https://aka.ms/fslogix_download" -OutFile $fsl
-Expand-Archive $fsl -DestinationPath "$Work\fslogix" -Force
-$fslSetup = Get-ChildItem "$Work\fslogix" -Recurse -Filter "FSLogixAppsSetup.exe" |
-    Where-Object FullName -like "*x64*" | Select-Object -First 1
-Start-Process $fslSetup.FullName -ArgumentList "/install /quiet /norestart" -Wait -NoNewWindow -WorkingDirectory $Work
+if (Test-InstalledProduct -NameLike "Microsoft FSLogix Apps*") {
+    Write-Host "  FSLogix already installed - skipping." -ForegroundColor Green
+} else {
+    $fsl = "$Work\fslogix.zip"
+    Invoke-WebRequest -Uri "https://aka.ms/fslogix_download" -OutFile $fsl
+    Expand-Archive $fsl -DestinationPath "$Work\fslogix" -Force
+    $fslSetup = Get-ChildItem "$Work\fslogix" -Recurse -Filter "FSLogixAppsSetup.exe" |
+        Where-Object FullName -like "*x64*" | Select-Object -First 1
+    Start-Process $fslSetup.FullName -ArgumentList "/install /quiet /norestart" -Wait -NoNewWindow -WorkingDirectory $Work
+}
 
 # --- To ACTIVATE profile containers later (per environment, not in the image) ---
 # $fslKey = "HKLM:\SOFTWARE\FSLogix\Profiles"

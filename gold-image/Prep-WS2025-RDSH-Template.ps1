@@ -1,4 +1,25 @@
 <#
+================================================================
+ BEFORE YOU RUN THIS SCRIPT
+================================================================
+ 1. Log in to this image as the persistent/standing local admin
+    account you want the image to keep (e.g. ArcAdmin) - NOT the
+    built-in Administrator. This is the account the script adopts
+    as the standing admin and bakes into the image.
+ 2. Open an elevated PowerShell prompt (Run as Administrator) on
+    the image, then either:
+
+    Option A - run this local copy of the script:
+
+       Set-ExecutionPolicy Bypass -Scope Process -Force
+       .\Prep-WS2025-RDSH-Template.ps1
+
+    Option B - pull and run the current main-branch version directly
+    (no clone needed; review the script on GitHub first if unsure):
+
+       irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-WS2025-RDSH-Template.ps1 | iex
+================================================================
+
 .SYNOPSIS
     Windows Server 2025 multi-session (RD Session Host) template prep.
     Run once as Administrator, reboot, verify, then sysprep/clone.

@@ -385,13 +385,22 @@ Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true
 # ---------------------------------------------------------------
 Write-Host "== Applying CE+/ISO 27001 baseline hardening ==" -ForegroundColor Cyan
 
-# Remove legacy attack surface: SMBv1 and PowerShell v2
+# Remove legacy attack surface: SMBv1 and PowerShell v2. Disable-WindowsOptionalFeature
+# throws a hard COMException for a feature name that doesn't exist on this build/edition
+# (e.g. PowerShell v2 has been trimmed from newer Windows 11 images) - -ErrorAction
+# SilentlyContinue does NOT suppress that, so each feature needs an actual try/catch.
 Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force
 if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
     Remove-WindowsFeature FS-SMB1 -ErrorAction SilentlyContinue | Out-Null
 } else {
-    Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction SilentlyContinue | Out-Null
-    Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root -NoRestart -ErrorAction SilentlyContinue | Out-Null
+    foreach ($feat in "SMB1Protocol", "MicrosoftWindowsPowerShellV2Root", "MicrosoftWindowsPowerShellV2") {
+        try {
+            Disable-WindowsOptionalFeature -Online -FeatureName $feat -NoRestart -ErrorAction Stop | Out-Null
+            Write-Host "  disabled: $feat"
+        } catch {
+            Write-Host "  '$feat' not present on this image/edition - skipping."
+        }
+    }
 }
 
 # SMB signing required both directions (default on newest builds; enforce anyway)

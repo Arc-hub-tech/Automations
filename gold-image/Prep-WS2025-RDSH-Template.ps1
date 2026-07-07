@@ -32,7 +32,10 @@
     7. Installs FSLogix agent (profile container config left as placeholders)
     8. Sweeps unprovisioned appx packages (sysprep blockers)
     9. Ensures BitLocker is off and stays off on clones
-    10. Session-host QoL: no Server Manager at logon, temp/WU cache cleared
+    10. Sets UK regional/time settings
+    11. Applies CE+/ISO 27001 baseline hardening
+    12. Session-host QoL: no Server Manager at logon, temp/WU cache cleared
+    13. Writes the sysprep unattend.xml
 
 .NOTES
     Run elevated:  Set-ExecutionPolicy Bypass -Scope Process -Force; .\Prep-WS2025-RDSH-Template.ps1
@@ -393,6 +396,13 @@ Set-WinUserLanguageList en-GB -Force
 # accounts, and the default user profile (new users inherit UK settings)
 Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true
 
+# Skip the "Choose privacy settings" screen on every future new user's first
+# sign-in - a machine-wide policy, so unlike the sysprep unattend.xml (which
+# only covers this image's own first boot) this keeps working for every user
+# who ever logs into a session host cloned from this image.
+New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" -Force | Out-Null
+Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" -Name "DisablePrivacyExperience" -Value 1 -Type DWord
+
 # ---------------------------------------------------------------
 # 11. CE+ / ISO 27001 baseline hardening - image-safe defaults.
 #     Domain GPO will override any of these on joined machines,
@@ -499,8 +509,50 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 # Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\TermService\Parameters\LicenseServers" -Name "SpecifiedLicenseServers" -Value "LICSERVER.domain.local" -Type MultiString
 
 # ---------------------------------------------------------------
+# 13. Sysprep answer file - skips the entire OOBE (region, keyboard,
+#     EULA, account creation, privacy screens). Clones boot straight
+#     to the sign-in screen with the accounts baked into the image.
+#     NOTE: if the image was built from a US ISO, change UILanguage
+#     to en-US (display language can't be set to a pack that isn't
+#     installed); everything else stays en-GB.
+# ---------------------------------------------------------------
+Write-Host "== Writing sysprep unattend.xml ==" -ForegroundColor Cyan
+
+@"
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>0809:00000809</InputLocale>
+      <SystemLocale>en-GB</SystemLocale>
+      <UILanguage>en-GB</UILanguage>
+      <UserLocale>en-GB</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipUserOOBE>true</SkipUserOOBE>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+      </OOBE>
+      <EnableFirstLogonAnimation>false</EnableFirstLogonAnimation>
+      <TimeZone>GMT Standard Time</TimeZone>
+    </component>
+  </settings>
+</unattend>
+"@ | Set-Content "C:\Windows\Panther\unattend.xml" -Encoding UTF8
+Write-Host "  written to C:\Windows\Panther\unattend.xml"
+
+# ---------------------------------------------------------------
 Set-Location -Path $env:SystemDrive\
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "`nDone. REBOOT NOW (RDSH role + Defender removal). After reboot: install/enrol Sentinel BEFORE this host serves users," -ForegroundColor Green
-Write-Host "then verify Office/Teams launch, then: sysprep /oobe /generalize /shutdown" -ForegroundColor Green
+Write-Host "then verify Office/Teams launch, then generalise with the EXACT command below" -ForegroundColor Green
+Write-Host "(sysprep.exe is NOT on PATH - the full path is required):" -ForegroundColor Green
+Write-Host "  C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green
 Stop-Transcript | Out-Null

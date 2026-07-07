@@ -233,6 +233,13 @@ Set-WinUserLanguageList en-GB -Force
 # accounts, and the default user profile (new users inherit UK settings)
 Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true
 
+# Skip the "Choose privacy settings" screen on every future new user's first
+# sign-in - a machine-wide policy, so unlike the sysprep unattend.xml (which
+# only covers this image's own first boot) this keeps working for every user
+# who ever logs into a clone made from this image.
+New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" -Force | Out-Null
+Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" -Name "DisablePrivacyExperience" -Value 1 -Type DWord
+
 # ---------------------------------------------------------------
 # 6. CE+ / ISO 27001 baseline hardening - image-safe defaults.
 #    Domain GPO will override any of these on joined machines,
@@ -359,8 +366,12 @@ Write-Host "== Writing sysprep unattend.xml ==" -ForegroundColor Cyan
         <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
         <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
         <ProtectYourPC>3</ProtectYourPC>
+        <SkipUserOOBE>true</SkipUserOOBE>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
       </OOBE>
+      <EnableFirstLogonAnimation>false</EnableFirstLogonAnimation>
       <TimeZone>GMT Standard Time</TimeZone>
     </component>
   </settings>
@@ -372,5 +383,6 @@ Write-Host "  written to C:\Windows\Panther\unattend.xml"
 Set-Location -Path $env:SystemDrive\
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "`nDone. REBOOT NOW (Defender removal). After reboot: install/enrol Sentinel BEFORE this host serves production traffic," -ForegroundColor Green
-Write-Host "then generalise with: sysprep /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green
+Write-Host "then generalise with the EXACT command below (sysprep.exe is NOT on PATH - the full path is required):" -ForegroundColor Green
+Write-Host "  C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green
 Stop-Transcript | Out-Null

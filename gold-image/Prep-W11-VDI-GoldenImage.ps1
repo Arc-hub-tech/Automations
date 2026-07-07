@@ -365,6 +365,13 @@ Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name 
 New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Force | Out-Null
 Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Name "AllowNewsAndInterests" -Value 0 -Type DWord
 
+# Skip the "Choose privacy settings" screen on every future new user's first
+# sign-in - a machine-wide policy, so unlike the sysprep unattend.xml (which
+# only covers this image's own first boot) this keeps working for every user
+# who ever logs into a clone made from this image.
+New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" -Force | Out-Null
+Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" -Name "DisablePrivacyExperience" -Value 1 -Type DWord
+
 # ---------------------------------------------------------------
 # 8. Sysprep-readiness sweep: remove appx packages that are installed
 #    for a user but NOT provisioned for all users. These are the classic
@@ -542,8 +549,12 @@ Write-Host "== Writing sysprep unattend.xml ==" -ForegroundColor Cyan
         <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
         <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
         <ProtectYourPC>3</ProtectYourPC>
+        <SkipUserOOBE>true</SkipUserOOBE>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
       </OOBE>
+      <EnableFirstLogonAnimation>false</EnableFirstLogonAnimation>
       <TimeZone>GMT Standard Time</TimeZone>
     </component>
   </settings>
@@ -554,6 +565,7 @@ Write-Host "  written to C:\Windows\Panther\unattend.xml"
 # ---------------------------------------------------------------
 Set-Location -Path $env:SystemDrive\
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
-Write-Host "`nDone. Verify Office/Teams launch, then generalise with:" -ForegroundColor Green
+Write-Host "`nDone. Verify Office/Teams launch, then generalise with the EXACT command below" -ForegroundColor Green
+Write-Host "(sysprep.exe is NOT on PATH - the full path is required):" -ForegroundColor Green
 Write-Host "  C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green
 Stop-Transcript | Out-Null

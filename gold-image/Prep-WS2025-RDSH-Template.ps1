@@ -53,6 +53,13 @@ $ProgressPreference    = 'SilentlyContinue'
 $Work = "$env:TEMP\RDSHPrep"
 New-Item -ItemType Directory -Path $Work -Force | Out-Null
 
+# Pin the process's actual working directory to $Work. Running via `irm | iex`
+# (piped, no backing script file) can leave the inherited working directory
+# invalid, which breaks any native exe launch (Start-Process, or a bare
+# call like `winget install ...`) with "the directory name is invalid".
+Set-Location -Path $Work
+[Environment]::CurrentDirectory = $Work
+
 # ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
 # failed image builds. trap ensures the transcript is closed even if
@@ -430,6 +437,7 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 # Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\TermService\Parameters\LicenseServers" -Name "SpecifiedLicenseServers" -Value "LICSERVER.domain.local" -Type MultiString
 
 # ---------------------------------------------------------------
+Set-Location -Path $env:SystemDrive\
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "`nDone. REBOOT NOW (RDSH role + Defender removal). After reboot: install/enrol Sentinel BEFORE this host serves users," -ForegroundColor Green
 Write-Host "then verify Office/Teams launch, then: sysprep /oobe /generalize /shutdown" -ForegroundColor Green

@@ -38,8 +38,16 @@
 
 #Requires -RunAsAdministrator
 $ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'   # Invoke-WebRequest is dramatically faster with the progress UI off
 $Work = "$env:TEMP\VDIPrep"
 New-Item -ItemType Directory -Path $Work -Force | Out-Null
+
+# Pin the process's actual working directory to $Work. Running via `irm | iex`
+# (piped, no backing script file) can leave the inherited working directory
+# invalid, which breaks any native exe launch (Start-Process, or a bare
+# call like `winget install ...`) with "the directory name is invalid".
+Set-Location -Path $Work
+[Environment]::CurrentDirectory = $Work
 
 # ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
@@ -487,6 +495,7 @@ Write-Host "== Writing sysprep unattend.xml ==" -ForegroundColor Cyan
 Write-Host "  written to C:\Windows\Panther\unattend.xml"
 
 # ---------------------------------------------------------------
+Set-Location -Path $env:SystemDrive\
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "`nDone. Verify Office/Teams launch, then generalise with:" -ForegroundColor Green
 Write-Host "  C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green

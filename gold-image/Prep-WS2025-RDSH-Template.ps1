@@ -24,7 +24,7 @@
     Windows Server 2025 multi-session (RD Session Host) template prep.
     Run once as Administrator, reboot, verify, then sysprep/clone.
     1. Installs the RD Session Host role
-    2. Detects VMware platform (via BIOS/SMBIOS) and installs/upgrades VMware Tools
+    2. Detects VMware platform (via BIOS/SMBIOS) and installs/upgrades VMware Tools if out of date
     3. Removes Windows Defender (Sentinel EDR is the AV/EDR on these hosts)
     4. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing - mandatory on RDSH)
     5. Installs new Teams machine-wide (VDI-optimised)
@@ -118,45 +118,55 @@ if ((Get-WindowsFeature RDS-RD-Server).Installed) {
 # ---------------------------------------------------------------
 # 2. VMware platform check - detected via BIOS/SMBIOS-reported
 #    manufacturer (the same data the hypervisor presents to the guest
-#    that Win32_ComputerSystem/Win32_BIOS read). Always fetches the
-#    current installer directly from VMware's public package feed and
-#    runs it (installs fresh, or upgrades in place if already present)
-#    rather than relying on the in-guest "self-service upgrade" command
-#    - that only works if the ESXi/vCenter host already has newer tools
-#    mounted as virtual media, which isn't guaranteed (e.g. Workstation/
-#    Fusion, or standalone ESXi) and silently no-ops otherwise. The
-#    feed's filename is versioned (e.g. VMware-tools-13.1.0-25218885-
-#    x64.exe), so it's discovered from the directory listing, not
-#    hardcoded.
+#    that Win32_ComputerSystem/Win32_BIOS read). Compares the installed
+#    version against the current version on VMware's public package feed
+#    and only downloads/installs if they differ - rather than relying on
+#    the in-guest "self-service upgrade" command, which only works if the
+#    ESXi/vCenter host already has newer tools mounted as virtual media
+#    (not guaranteed - e.g. Workstation/Fusion, or standalone ESXi) and
+#    silently no-ops otherwise. The feed's filename is versioned (e.g.
+#    VMware-tools-13.1.0-25218885-x64.exe), so both the filename and its
+#    version are discovered from the directory listing, not hardcoded.
 # ---------------------------------------------------------------
 Write-Host "== Checking VMware platform / tools ==" -ForegroundColor Cyan
 
 $biosMfr = (Get-CimInstance Win32_ComputerSystem).Manufacturer
 if ($biosMfr -match 'VMware') {
     Write-Host "  VMware platform detected (BIOS manufacturer: $biosMfr)."
-    $toolboxCmd = "$env:ProgramFiles\VMware\VMware Tools\VMwareToolboxCmd.exe"
+    $toolboxCmd   = "$env:ProgramFiles\VMware\VMware Tools\VMwareToolboxCmd.exe"
+    $installedVer = $null
     if (Test-Path $toolboxCmd) {
         $toolsVer = (& $toolboxCmd -v 2>&1) -join ' '
         Write-Host "  VMware Tools currently installed: $toolsVer"
+        if ($toolsVer -match '(\d+\.\d+\.\d+)') { $installedVer = [version]$Matches[1] }
     } else {
         Write-Host "  VMware Tools not currently installed."
     }
 
-    Write-Host "  fetching latest VMware Tools installer from packages.vmware.com..."
+    Write-Host "  checking latest VMware Tools version at packages.vmware.com..."
     $toolsIndexUrl = "https://packages.vmware.com/tools/releases/latest/windows/x64/"
+    $exeName = $null
     try {
         $html    = (Invoke-WebRequest -Uri $toolsIndexUrl -UseBasicParsing).Content
         $exeName = [regex]::Match($html, 'href="([^"/]+\.exe)"').Groups[1].Value
-    } catch { $exeName = $null }
+    } catch { }
 
     if (-not $exeName) {
-        Write-Warning "Could not find a VMware Tools installer at $toolsIndexUrl - install/upgrade manually from vCenter/ESXi (Guest > Install VMware Tools)."
+        Write-Warning "Could not reach $toolsIndexUrl to check for updates - install/upgrade manually from vCenter/ESXi if needed (Guest > Install VMware Tools)."
     } else {
-        $toolsExe = "$Work\$exeName"
-        Invoke-WebRequest -Uri "$toolsIndexUrl$exeName" -OutFile $toolsExe
-        Write-Host "  installing $exeName silently (upgrades in place if already installed; reboot before sysprep once this completes)..."
-        Start-Process $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Wait -NoNewWindow -WorkingDirectory $Work
-        Write-Host "  VMware Tools install/upgrade complete." -ForegroundColor Green
+        $latestVer = $null
+        if ($exeName -match '-(\d+\.\d+\.\d+)-') { $latestVer = [version]$Matches[1] }
+        Write-Host "  latest available: $exeName$(if ($latestVer) { " (version $latestVer)" })"
+
+        if ($installedVer -and $latestVer -and $installedVer -ge $latestVer) {
+            Write-Host "  already up to date - skipping download/install." -ForegroundColor Green
+        } else {
+            $toolsExe = "$Work\$exeName"
+            Invoke-WebRequest -Uri "$toolsIndexUrl$exeName" -OutFile $toolsExe
+            Write-Host "  installing $exeName silently (upgrades in place if already installed; reboot before sysprep once this completes)..."
+            Start-Process $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Wait -NoNewWindow -WorkingDirectory $Work
+            Write-Host "  VMware Tools install/upgrade complete." -ForegroundColor Green
+        }
     }
 } else {
     Write-Host "  not running on VMware (BIOS manufacturer: $biosMfr) - skipping."

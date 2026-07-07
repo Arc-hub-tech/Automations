@@ -12,6 +12,7 @@ All notable changes to `Prep-W11-VDI-GoldenImage.ps1`, `Prep-WS2025-RDSH-Templat
 
 ### Fixed
 - The RDSH template's final instructions told you to run `sysprep /oobe /generalize /shutdown` with no path and no `/unattend` flag - `sysprep.exe` isn't on PATH, so this failed with "term not recognized". All three scripts now print the full explicit path and flag it clearly as required.
+- The RDSH and Server Template scripts' `unattend.xml` included client-only OOBE elements (`HideLocalAccountScreen`, `HideOnlineAccountScreens`, `HideWirelessSetupInOOBE`, `EnableFirstLogonAnimation`) that don't exist in Windows Server's unattend catalog, causing a hard "Windows could not parse or process unattend answer file... a component or setting specified in the answer file does not exist" error on first boot after sysprep. Trimmed both scripts' `OOBE` block to the Server-valid subset (`HideEULAPage`, `NetworkLocation`, `ProtectYourPC`, `SkipMachineOOBE`, `SkipUserOOBE`); the W11 script's fuller client-oriented block is unaffected since it parses correctly there.
 
 ## [v1.2] - 2026-07-07
 

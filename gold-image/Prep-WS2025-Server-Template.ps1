@@ -349,9 +349,13 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 #    to en-US (display language can't be set to a pack that isn't
 #    installed); everything else stays en-GB.
 #
-#    HideLocalAccountScreen alone is NOT reliable on Windows Server - OOBE's
-#    CloudExperienceHost still prompts to create an account unless one is
-#    explicitly declared in the answer file. So when a standing admin was
+#    Windows Server's OOBE catalog doesn't have client-only elements like
+#    HideLocalAccountScreen/HideOnlineAccountScreens/HideWirelessSetupInOOBE/
+#    EnableFirstLogonAnimation - including them causes a hard "component or
+#    setting does not exist" parse error at boot, so the OOBE block below is
+#    deliberately trimmed to the Server-valid subset. Account creation is
+#    instead bypassed via SkipMachineOOBE/SkipUserOOBE plus explicitly
+#    declaring the standing admin account. So when a standing admin was
 #    set up in step 0, this declares that SAME account with a freshly
 #    generated, one-time random password (generated fresh per run, never
 #    logged, never committed) purely so OOBE has an account to present at
@@ -419,16 +423,11 @@ if ($StandingAdminReady) {
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <OOBE>
         <HideEULAPage>true</HideEULAPage>
-        <HideLocalAccountScreen>true</HideLocalAccountScreen>
-        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
-        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
-        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
         <NetworkLocation>Work</NetworkLocation>
-        <ProtectYourPC>3</ProtectYourPC>
-        <SkipUserOOBE>true</SkipUserOOBE>
+        <ProtectYourPC>1</ProtectYourPC>
         <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
       </OOBE>
-      <EnableFirstLogonAnimation>false</EnableFirstLogonAnimation>
       <TimeZone>GMT Standard Time</TimeZone>$userAccountsXml$firstLogonXml
     </component>
   </settings>

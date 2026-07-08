@@ -64,6 +64,23 @@ function Test-InstalledProduct {
         Where-Object { $_.DisplayName -like $NameLike } | Select-Object -First 1)
 }
 
+# Shared helper - some HKLM keys (especially under \Policies) can have ACLs
+# tightened past what -ErrorAction SilentlyContinue on Set-ItemProperty catches
+# (it throws a terminating UnauthorizedAccessException), e.g. AllowNewsAndInterests
+# under Policies\Microsoft\Dsh, which Microsoft has locked to SYSTEM/TrustedInstaller
+# on some builds even for an elevated Administrator token. With $ErrorActionPreference
+# = 'Stop' above, one denied write here would otherwise abort the whole run. These are
+# best-effort baseline settings (see section 11 below), so warn and move on instead.
+function Set-RegistryValue {
+    param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
+    try {
+        if (-not (Test-Path $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -ErrorAction Stop
+    } catch {
+        Write-Warning "Could not set '$Name' under '$Path' - $($_.Exception.Message). Skipping; verify manually if this setting matters."
+    }
+}
+
 # ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
 # failed image builds. trap ensures the transcript is closed even if
@@ -237,8 +254,7 @@ if ($existing -and $existing.ProductReleaseIds -match 'O365ProPlusRetail') {
 Write-Host "== Installing Teams (new) ==" -ForegroundColor Cyan
 
 # Tell Teams it's running in a VDI/AVD environment (enables media optimisation path)
-New-Item -Path "HKLM:\SOFTWARE\Microsoft\Teams" -Force | Out-Null
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Teams" -Name "IsWVDEnvironment" -Value 1 -Type DWord
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Teams" -Name "IsWVDEnvironment" -Value 1
 
 if (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq 'MSTeams') {
     Write-Host "  Teams (new) already provisioned - skipping." -ForegroundColor Green
@@ -274,15 +290,30 @@ function Test-WingetInstalled {
 }
 
 function Install-WingetApp {
-    param([string]$Id, [string]$Name)
+    param([string]$Id, [string]$Name, [int]$TimeoutSec = 300)
     if (Test-WingetInstalled -Id $Id) {
         Write-Host "  $Name already installed - skipping." -ForegroundColor Green
         return
     }
     Write-Host "  installing $Name ($Id)..."
-    winget install --id $Id -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Null
-    if ($LASTEXITCODE -eq 0) { Write-Host "  $Name installed." -ForegroundColor Green }
-    else { Write-Warning "$Name install via winget exited with code $LASTEXITCODE - verify manually." }
+    $proc = Start-Process winget -ArgumentList @(
+        "install", "--id", $Id, "-e", "--silent",
+        "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"
+    ) -PassThru -WindowStyle Hidden -WorkingDirectory $Work
+
+    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+        # Some winget packages (Foxit.FoxitReader in particular - see
+        # microsoft/winget-pkgs #10072 and #364274) hang indefinitely mid-install
+        # with no CPU or network activity, stuck behind a hidden installer dialog
+        # that never surfaces under --disable-interactivity. Kill the whole process
+        # tree and move on rather than blocking the rest of image prep forever.
+        Write-Warning "$Name install via winget did not finish within $TimeoutSec s - likely hung (known issue with some winget packages, e.g. Foxit.FoxitReader). Killed it and continuing; install manually if needed."
+        Start-Process taskkill -ArgumentList "/PID", $proc.Id, "/T", "/F" -Wait -NoNewWindow -WorkingDirectory $Work | Out-Null
+        return
+    }
+
+    if ($proc.ExitCode -eq 0) { Write-Host "  $Name installed." -ForegroundColor Green }
+    else { Write-Warning "$Name install via winget exited with code $($proc.ExitCode) - verify manually." }
 }
 
 if (Get-Command winget -ErrorAction SilentlyContinue) {
@@ -375,20 +406,17 @@ foreach ($app in $Bloat) {
 # ---------------------------------------------------------------
 Write-Host "== Disabling consumer features/suggestions ==" -ForegroundColor Cyan
 
-New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Force | Out-Null
-Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name "DisableWindowsConsumerFeatures" -Value 1 -Type DWord
-Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name "DisableConsumerAccountStateContent" -Value 1 -Type DWord
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name "DisableWindowsConsumerFeatures" -Value 1
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" -Name "DisableConsumerAccountStateContent" -Value 1
 
 # Kill "Chat"/widgets taskbar promos for all new users via default profile policy keys
-New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Force | Out-Null
-Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Name "AllowNewsAndInterests" -Value 0 -Type DWord
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" -Name "AllowNewsAndInterests" -Value 0
 
 # Skip the "Choose privacy settings" screen on every future new user's first
 # sign-in - a machine-wide policy, so unlike the sysprep unattend.xml (which
 # only covers this image's own first boot) this keeps working for every user
 # who ever logs into a clone made from this image.
-New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" -Force | Out-Null
-Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" -Name "DisablePrivacyExperience" -Value 1 -Type DWord
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" -Name "DisablePrivacyExperience" -Value 1
 
 # ---------------------------------------------------------------
 # 8. Sysprep-readiness sweep: remove appx packages that are installed
@@ -429,10 +457,7 @@ if ($blv -and $blv.VolumeStatus -ne 'FullyDecrypted') {
     Write-Host "  C: already fully decrypted."
 }
 
-# Key exists by default on Win11 - do not New-Item -Force it (throws on protected keys)
-$blKey = "HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker"
-if (-not (Test-Path $blKey)) { New-Item -Path $blKey | Out-Null }
-Set-ItemProperty $blKey -Name "PreventDeviceEncryption" -Value 1 -Type DWord
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker" -Name "PreventDeviceEncryption" -Value 1
 
 # ---------------------------------------------------------------
 # 10. UK regional and time settings (applied to system, welcome screen,
@@ -490,39 +515,34 @@ Set-MpPreference -PUAProtection Enabled -MAPSReporting Advanced -SubmitSamplesCo
 foreach ($proto in "SSL 3.0", "TLS 1.0", "TLS 1.1") {
     foreach ($role in "Server", "Client") {
         $k = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$proto\$role"
-        New-Item -Path $k -Force | Out-Null
-        Set-ItemProperty $k -Name "Enabled" -Value 0 -Type DWord
-        Set-ItemProperty $k -Name "DisabledByDefault" -Value 1 -Type DWord
+        Set-RegistryValue -Path $k -Name "Enabled" -Value 0
+        Set-RegistryValue -Path $k -Name "DisabledByDefault" -Value 1
     }
 }
 
 # NTLMv2 only, refuse LM/NTLMv1; WDigest plaintext creds off
-Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LmCompatibilityLevel" -Value 5 -Type DWord
-$wd = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest"
-if (-not (Test-Path $wd)) { New-Item -Path $wd | Out-Null }
-Set-ItemProperty $wd -Name "UseLogonCredential" -Value 0 -Type DWord
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LmCompatibilityLevel" -Value 5
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest" -Name "UseLogonCredential" -Value 0
 
 # LLMNR off (name-resolution poisoning mitigation)
-New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" -Force | Out-Null
-Set-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" -Name "EnableMulticast" -Value 0 -Type DWord
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" -Name "EnableMulticast" -Value 0
 
 # AutoRun/AutoPlay off for all drive types
-New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Force | Out-Null
-Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name "NoDriveTypeAutoRun" -Value 255 -Type DWord
-Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name "NoAutorun" -Value 1 -Type DWord
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name "NoDriveTypeAutoRun" -Value 255
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name "NoAutorun" -Value 1
 
 # UAC fully on with secure desktop; 15-minute machine inactivity lock
 $sys = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
-Set-ItemProperty $sys -Name "EnableLUA" -Value 1 -Type DWord
-Set-ItemProperty $sys -Name "ConsentPromptBehaviorAdmin" -Value 5 -Type DWord
-Set-ItemProperty $sys -Name "PromptOnSecureDesktop" -Value 1 -Type DWord
-Set-ItemProperty $sys -Name "InactivityTimeoutSecs" -Value 900 -Type DWord
+Set-RegistryValue -Path $sys -Name "EnableLUA" -Value 1
+Set-RegistryValue -Path $sys -Name "ConsentPromptBehaviorAdmin" -Value 5
+Set-RegistryValue -Path $sys -Name "PromptOnSecureDesktop" -Value 1
+Set-RegistryValue -Path $sys -Name "InactivityTimeoutSecs" -Value 900
 
 # RDP: require NLA, TLS security layer, high encryption
 $rdp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
-Set-ItemProperty $rdp -Name "UserAuthentication" -Value 1 -Type DWord
-Set-ItemProperty $rdp -Name "SecurityLayer" -Value 2 -Type DWord
-Set-ItemProperty $rdp -Name "MinEncryptionLevel" -Value 3 -Type DWord
+Set-RegistryValue -Path $rdp -Name "UserAuthentication" -Value 1
+Set-RegistryValue -Path $rdp -Name "SecurityLayer" -Value 2
+Set-RegistryValue -Path $rdp -Name "MinEncryptionLevel" -Value 3
 
 # Local account lockout policy (matters on standalone/Entra-only; GPO overrides on domain)
 net accounts /lockoutthreshold:10 /lockoutduration:15 /lockoutwindow:15 | Out-Null

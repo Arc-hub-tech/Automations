@@ -78,6 +78,21 @@ function Set-RegistryValue {
     }
 }
 
+# Shared helper - Start-Process -Wait blocks silently until the child exits, which
+# looks identical to a hang during a multi-minute silent install (e.g. VMware Tools).
+# Poll with a heartbeat instead so a slow but healthy install doesn't get mistaken
+# for a stuck one.
+function Start-ProcessWithHeartbeat {
+    param([string]$FilePath, $ArgumentList, [string]$Label, [int]$HeartbeatSec = 30)
+    $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -NoNewWindow -WorkingDirectory $Work
+    $elapsed = 0
+    while (-not $proc.WaitForExit($HeartbeatSec * 1000)) {
+        $elapsed += $HeartbeatSec
+        Write-Host "  still running $Label... (${elapsed}s elapsed)"
+    }
+    return $proc.ExitCode
+}
+
 # ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
 # failed image builds. trap ensures the transcript is closed even if
@@ -185,7 +200,7 @@ if ($biosMfr -match 'VMware') {
             $toolsExe = "$Work\$exeName"
             Invoke-WebRequest -Uri "$toolsIndexUrl$exeName" -OutFile $toolsExe
             Write-Host "  installing $exeName silently (upgrades in place if already installed; reboot before sysprep once this completes)..."
-            Start-Process $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Wait -NoNewWindow -WorkingDirectory $Work
+            Start-ProcessWithHeartbeat -FilePath $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Label "VMware Tools install" | Out-Null
             Write-Host "  VMware Tools install/upgrade complete." -ForegroundColor Green
         }
     }

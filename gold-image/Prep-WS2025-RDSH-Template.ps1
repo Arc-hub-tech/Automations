@@ -95,6 +95,21 @@ function Set-RegistryValue {
     }
 }
 
+# Shared helper - Start-Process -Wait blocks silently until the child exits, which
+# looks identical to a hang during multi-minute silent installs (VMware Tools, Teams
+# bootstrapper, WebRTC redirector, FSLogix). Poll with a heartbeat instead so a slow
+# but healthy install doesn't get mistaken for a stuck one.
+function Start-ProcessWithHeartbeat {
+    param([string]$FilePath, $ArgumentList, [string]$Label, [int]$HeartbeatSec = 30)
+    $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -NoNewWindow -WorkingDirectory $Work
+    $elapsed = 0
+    while (-not $proc.WaitForExit($HeartbeatSec * 1000)) {
+        $elapsed += $HeartbeatSec
+        Write-Host "  still running $Label... (${elapsed}s elapsed)"
+    }
+    return $proc.ExitCode
+}
+
 # ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
 # failed image builds. trap ensures the transcript is closed even if
@@ -213,7 +228,7 @@ if ($biosMfr -match 'VMware') {
             $toolsExe = "$Work\$exeName"
             Invoke-WebRequest -Uri "$toolsIndexUrl$exeName" -OutFile $toolsExe
             Write-Host "  installing $exeName silently (upgrades in place if already installed; reboot before sysprep once this completes)..."
-            Start-Process $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Wait -NoNewWindow -WorkingDirectory $Work
+            Start-ProcessWithHeartbeat -FilePath $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Label "VMware Tools install" | Out-Null
             Write-Host "  VMware Tools install/upgrade complete." -ForegroundColor Green
         }
     }
@@ -295,7 +310,7 @@ if (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq 'MSTeams')
 } else {
     $boot = "$Work\teamsbootstrapper.exe"
     Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2243204" -OutFile $boot
-    Start-Process $boot -ArgumentList "-p" -Wait -NoNewWindow -WorkingDirectory $Work
+    Start-ProcessWithHeartbeat -FilePath $boot -ArgumentList "-p" -Label "Teams bootstrapper" | Out-Null
 }
 
 # Remote Desktop WebRTC Redirector Service - enables Teams media optimisation
@@ -306,7 +321,7 @@ if (Test-InstalledProduct -NameLike "Remote Desktop WebRTC Redirector Service*")
 } else {
     $rtc = "$Work\webrtc.msi"
     Invoke-WebRequest -Uri "https://aka.ms/msrdcwebrtcsvc/msi" -OutFile $rtc
-    Start-Process msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Wait -NoNewWindow -WorkingDirectory $Work
+    Start-ProcessWithHeartbeat -FilePath msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Label "WebRTC Redirector install" | Out-Null
 }
 
 # ---------------------------------------------------------------
@@ -324,7 +339,7 @@ function Test-WingetInstalled {
 }
 
 function Install-WingetApp {
-    param([string]$Id, [string]$Name, [int]$TimeoutSec = 300)
+    param([string]$Id, [string]$Name, [int]$TimeoutSec = 300, [int]$HeartbeatSec = 30)
     if (Test-WingetInstalled -Id $Id) {
         Write-Host "  $Name already installed - skipping." -ForegroundColor Green
         return
@@ -335,7 +350,14 @@ function Install-WingetApp {
         "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"
     ) -PassThru -WindowStyle Hidden -WorkingDirectory $Work
 
-    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+    $elapsed = 0
+    while (-not $proc.HasExited -and $elapsed -lt $TimeoutSec) {
+        if ($proc.WaitForExit($HeartbeatSec * 1000)) { break }
+        $elapsed += $HeartbeatSec
+        if ($elapsed -lt $TimeoutSec) { Write-Host "  still installing $Name... (${elapsed}s elapsed)" }
+    }
+
+    if (-not $proc.HasExited) {
         # Some winget packages (Foxit.FoxitReader in particular - see
         # microsoft/winget-pkgs #10072 and #364274) hang indefinitely mid-install
         # with no CPU or network activity, stuck behind a hidden installer dialog
@@ -372,7 +394,7 @@ if (Test-InstalledProduct -NameLike "Microsoft FSLogix Apps*") {
     Expand-Archive $fsl -DestinationPath "$Work\fslogix" -Force
     $fslSetup = Get-ChildItem "$Work\fslogix" -Recurse -Filter "FSLogixAppsSetup.exe" |
         Where-Object FullName -like "*x64*" | Select-Object -First 1
-    Start-Process $fslSetup.FullName -ArgumentList "/install /quiet /norestart" -Wait -NoNewWindow -WorkingDirectory $Work
+    Start-ProcessWithHeartbeat -FilePath $fslSetup.FullName -ArgumentList "/install /quiet /norestart" -Label "FSLogix agent install" | Out-Null
 }
 
 # --- FSLogix profile container config (EDIT ME, then uncomment) ---

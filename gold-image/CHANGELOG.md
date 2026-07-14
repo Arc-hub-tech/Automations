@@ -4,6 +4,8 @@ All notable changes to `Prep-W11-VDI-GoldenImage.ps1`, `Prep-WS2025-RDSH-Templat
 
 ## [Unreleased]
 
+## [v1.3] - 2026-07-14
+
 ### Added
 - `DisablePrivacyExperience` registry policy in all three scripts, suppressing the "Choose privacy settings" screen for every future new user on a cloned machine - not just the image's own first boot (unlike unattend.xml).
 - The RDSH template now writes a sysprep `unattend.xml` (step 13) - it never did before, so RDSH clones were hitting the full OOBE (region, keyboard, EULA, account creation, privacy screens) instead of a suppressed one.

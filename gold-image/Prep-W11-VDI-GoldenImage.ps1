@@ -29,7 +29,7 @@
     1. Detects VMware platform (via BIOS/SMBIOS) and installs/upgrades VMware Tools if out of date
     2. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing for VDI)
     3. Installs new Teams machine-wide (with VDI/AVD optimisation reg key)
-    4. Installs common apps (7-Zip, Foxit PDF Reader) via winget
+    4. Installs common apps (7-Zip, SumatraPDF) via winget
     5. Removes provisioned + installed bloatware appx packages
     6. Disables consumer content / suggested apps so clones stay clean
 
@@ -296,7 +296,7 @@ if (Test-InstalledProduct -NameLike "Remote Desktop WebRTC Redirector Service*")
 #    version. Requires winget (App Installer) on the image; if it's
 #    missing this just warns and skips rather than guessing a URL.
 # ---------------------------------------------------------------
-Write-Host "== Installing common apps (7-Zip, Foxit PDF Reader) ==" -ForegroundColor Cyan
+Write-Host "== Installing common apps (7-Zip, SumatraPDF) ==" -ForegroundColor Cyan
 
 function Test-WingetInstalled {
     param([string]$Id)
@@ -340,9 +340,9 @@ function Install-WingetApp {
 
 if (Get-Command winget -ErrorAction SilentlyContinue) {
     Install-WingetApp -Id "7zip.7zip" -Name "7-Zip"
-    Install-WingetApp -Id "Foxit.FoxitReader" -Name "Foxit PDF Reader"
+    Install-WingetApp -Id "SumatraPDF.SumatraPDF" -Name "SumatraPDF"
 } else {
-    Write-Warning "winget not found on this image - skipping 7-Zip/Foxit PDF Reader install. Install manually or add winget (App Installer) to the base image first."
+    Write-Warning "winget not found on this image - skipping 7-Zip/SumatraPDF install. Install manually or add winget (App Installer) to the base image first."
 }
 
 # ---------------------------------------------------------------

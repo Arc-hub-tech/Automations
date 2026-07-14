@@ -32,7 +32,7 @@
     3. Removes Windows Defender (Sentinel EDR is the AV/EDR on these hosts)
     4. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing - mandatory on RDSH)
     5. Installs new Teams machine-wide (VDI-optimised)
-    6. Installs common apps (7-Zip, Foxit PDF Reader) via winget
+    6. Installs common apps (7-Zip, SumatraPDF) via winget
     7. Installs FSLogix agent (profile container config left as placeholders)
     8. Sweeps unprovisioned appx packages (sysprep blockers)
     9. Ensures BitLocker is off and stays off on clones
@@ -330,7 +330,7 @@ if (Test-InstalledProduct -NameLike "Remote Desktop WebRTC Redirector Service*")
 #    version. Requires winget (App Installer) on the image; if it's
 #    missing this just warns and skips rather than guessing a URL.
 # ---------------------------------------------------------------
-Write-Host "== Installing common apps (7-Zip, Foxit PDF Reader) ==" -ForegroundColor Cyan
+Write-Host "== Installing common apps (7-Zip, SumatraPDF) ==" -ForegroundColor Cyan
 
 function Test-WingetInstalled {
     param([string]$Id)
@@ -374,9 +374,9 @@ function Install-WingetApp {
 
 if (Get-Command winget -ErrorAction SilentlyContinue) {
     Install-WingetApp -Id "7zip.7zip" -Name "7-Zip"
-    Install-WingetApp -Id "Foxit.FoxitReader" -Name "Foxit PDF Reader"
+    Install-WingetApp -Id "SumatraPDF.SumatraPDF" -Name "SumatraPDF"
 } else {
-    Write-Warning "winget not found on this image - skipping 7-Zip/Foxit PDF Reader install. Install manually or add winget (App Installer) to the base image first."
+    Write-Warning "winget not found on this image - skipping 7-Zip/SumatraPDF install. Install manually or add winget (App Installer) to the base image first."
 }
 
 # ---------------------------------------------------------------

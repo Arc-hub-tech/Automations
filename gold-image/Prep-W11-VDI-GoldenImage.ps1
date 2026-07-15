@@ -656,13 +656,17 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 #     nobody knows caused a real lockout the first time this was tried).
 #
 #     If step 1 collected domain-join details and/or a naming prefix, a
-#     second FirstLogonCommand runs a base64-encoded PowerShell script (built
-#     fresh per clone via -EncodedCommand, since it computes its own random
-#     suffix at THAT clone's first boot - a static value here would collide
-#     across every clone made from this one generalized image) that renames
-#     the machine and/or joins the domain using Add-Computer's -NewName
-#     parameter, which does both in a single reboot. Results are logged to
-#     C:\Windows\Temp\ArcDomainJoin.log on the clone for troubleshooting.
+#     helper script is written to C:\Windows\Setup\Scripts\ArcDomainJoin.ps1
+#     (survives generalize/sysprep fine, same location Microsoft documents
+#     for SetupComplete.cmd) that computes its own random suffix at THAT
+#     clone's first boot - a static value here would collide across every
+#     clone made from this one generalized image - then renames the machine
+#     and/or joins the domain using Add-Computer's -NewName parameter, which
+#     does both in a single reboot. A second FirstLogonCommand just invokes
+#     it with "-File <path>" rather than embedding the script inline as a
+#     base64 blob, keeping the CommandLine short and the script itself
+#     readable on the clone for troubleshooting. It deletes itself when done;
+#     results are logged to C:\Windows\Temp\ArcDomainJoin.log on the clone.
 #
 #     Whichever commands are present, Order 1 always deletes this answer
 #     file immediately after first boot, so no plaintext credential in it
@@ -710,6 +714,14 @@ if ($StandingAdminReady -or $JoinDomain -or $NamePrefix) {
     $order++
 
     if ($JoinDomain -or $NamePrefix) {
+        # Write the actual rename/join logic to a real .ps1 file (the same
+        # C:\Windows\Setup\Scripts location Microsoft documents for
+        # SetupComplete.cmd - it survives generalize/sysprep fine) instead of
+        # cramming a base64-encoded blob into a single unattend CommandLine
+        # value. A short "-File <path>" CommandLine is far less likely to
+        # trip whatever the unattend answer-file validator objects to with a
+        # very long/complex CommandLine, and the script is readable on the
+        # clone afterwards if something needs debugging.
         $scriptLines = [System.Collections.Generic.List[string]]::new()
         $scriptLines.Add('try {')
         $scriptLines.Add('    $suffix  = -join ((48..57) + (65..90) | Get-Random -Count 6 | ForEach-Object { [char]$_ })')
@@ -730,13 +742,19 @@ if ($StandingAdminReady -or $JoinDomain -or $NamePrefix) {
         $scriptLines.Add('    "$(Get-Date -Format o) OK: $newName" | Out-File C:\Windows\Temp\ArcDomainJoin.log -Append')
         $scriptLines.Add('} catch {')
         $scriptLines.Add('    "$(Get-Date -Format o) FAILED: $($_.Exception.Message)" | Out-File C:\Windows\Temp\ArcDomainJoin.log -Append')
+        $scriptLines.Add('} finally {')
+        $scriptLines.Add('    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue')
         $scriptLines.Add('}')
-        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptLines -join "`n"))
+
+        $joinScriptDir  = "C:\Windows\Setup\Scripts"
+        $joinScriptPath = Join-Path $joinScriptDir "ArcDomainJoin.ps1"
+        New-Item -ItemType Directory -Path $joinScriptDir -Force | Out-Null
+        Set-Content -Path $joinScriptPath -Value ($scriptLines -join "`r`n") -Encoding UTF8
 
         $commands.Add(@"
         <SynchronousCommand wcm:action="add">
           <Order>$order</Order>
-          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCommand</CommandLine>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $joinScriptPath</CommandLine>
           <Description>Rename computer$(if ($JoinDomain) { ' and join domain' }) with a value computed fresh on this clone; logs to C:\Windows\Temp\ArcDomainJoin.log</Description>
         </SynchronousCommand>
 "@)

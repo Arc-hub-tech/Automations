@@ -35,6 +35,9 @@
     3. Disables Start menu/lock screen ads, suggested apps, and other
        consumer content-delivery features (machine-wide policy plus the
        current user's profile for immediate effect)
+    4. Cleans up disk space: temp files, Windows Update download cache,
+       Recycle Bin, Delivery Optimization cache, a leftover Windows.old
+       from a feature upgrade (if present), and the WinSxS component store
 
 .NOTES
     Run in an elevated PowerShell session:  Set-ExecutionPolicy Bypass -Scope Process -Force; .\Debloat-Windows.ps1
@@ -62,16 +65,23 @@ function Set-RegistryValue {
     }
 }
 
-# Shared helper - runs a native command with a timeout instead of a bare
-# -Wait. OEM uninstallers are wildly inconsistent about honouring silent
-# switches - some pop an interactive wizard regardless, which would
-# otherwise hang this script indefinitely waiting for input nobody's
-# watching for (the exact failure mode this whole approach is designed to
-# avoid).
+# Shared helper - runs a native command with a timeout and periodic
+# heartbeat instead of a bare -Wait. OEM uninstallers are wildly
+# inconsistent about honouring silent switches - some pop an interactive
+# wizard regardless, which would otherwise hang this script indefinitely
+# waiting for input nobody's watching for. Long-running commands (e.g. DISM
+# component cleanup) also go silent for minutes at a time, which is
+# otherwise indistinguishable from a genuine hang.
 function Invoke-WithTimeout {
-    param([string]$FilePath, [string]$ArgumentList, [int]$TimeoutSec = 120)
+    param([string]$FilePath, [string]$ArgumentList, [string]$Label = $FilePath, [int]$TimeoutSec = 120, [int]$HeartbeatSec = 30)
     $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -NoNewWindow
-    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+    $elapsed = 0
+    while (-not $proc.HasExited -and $elapsed -lt $TimeoutSec) {
+        if ($proc.WaitForExit($HeartbeatSec * 1000)) { break }
+        $elapsed += $HeartbeatSec
+        if ($elapsed -lt $TimeoutSec) { Write-Host "  still running $Label... (${elapsed}s elapsed)" }
+    }
+    if (-not $proc.HasExited) {
         Start-Process taskkill -ArgumentList "/PID", $proc.Id, "/T", "/F" -Wait -NoNewWindow | Out-Null
         return $null
     }
@@ -198,9 +208,9 @@ if (-not $found) {
         }
         try {
             if ($product.UninstallString -match '^msiexec' -and $product.UninstallString -match '(\{[0-9A-Fa-f\-]+\})') {
-                $exit = Invoke-WithTimeout -FilePath "msiexec.exe" -ArgumentList "/x $($Matches[1]) /qn /norestart"
+                $exit = Invoke-WithTimeout -FilePath "msiexec.exe" -ArgumentList "/x $($Matches[1]) /qn /norestart" -Label $product.DisplayName
             } else {
-                $exit = Invoke-WithTimeout -FilePath "cmd.exe" -ArgumentList "/c `"$($product.UninstallString)`" /S /verysilent /norestart"
+                $exit = Invoke-WithTimeout -FilePath "cmd.exe" -ArgumentList "/c `"$($product.UninstallString)`" /S /verysilent /norestart" -Label $product.DisplayName
             }
             if ($null -eq $exit) {
                 Write-Warning "  '$($product.DisplayName)' uninstaller did not finish within the timeout - likely hung on an interactive prompt it ignored the silent switches for. Killed it; remove manually."
@@ -243,6 +253,57 @@ foreach ($name in @(
     "SubscribedContent-338389Enabled", "SubscribedContent-353698Enabled"
 )) {
     Set-RegistryValue -Path $cdm -Name $name -Value 0
+}
+
+# ---------------------------------------------------------------
+# 4. Disk cleanup - temp files, Windows Update download cache, Recycle
+#    Bin, Delivery Optimization cache, a leftover Windows.old from a
+#    feature upgrade (if present), and the WinSxS component store.
+#    Everything here is reclaiming space, not changing behaviour, so
+#    it's safe to re-run and safe on a machine that's been in service
+#    for a while (unlike the gold-image version of this step, which
+#    only ever runs once on a fresh VM right before sysprep).
+# ---------------------------------------------------------------
+Write-Host "== Cleaning up temp files, WU cache, and disk space ==" -ForegroundColor Cyan
+
+Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
+Get-ChildItem $env:TEMP, "C:\Windows\Temp", "C:\Windows\SoftwareDistribution\Download" -Recurse -Force -ErrorAction SilentlyContinue |
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+Start-Service wuauserv -ErrorAction SilentlyContinue
+Write-Host "  cleared temp files and Windows Update download cache."
+
+try {
+    Clear-RecycleBin -Force -ErrorAction Stop
+    Write-Host "  Recycle Bin emptied."
+} catch {
+    Write-Host "  Recycle Bin already empty or nothing to clear."
+}
+
+try {
+    Delete-DeliveryOptimizationCache -Force -ErrorAction Stop
+    Write-Host "  Delivery Optimization cache cleared."
+} catch {
+    Write-Warning "  Could not clear Delivery Optimization cache - $($_.Exception.Message). Skipping."
+}
+
+if (Test-Path "C:\Windows.old") {
+    Write-Host "  found C:\Windows.old (leftover from a feature upgrade) - attempting removal..."
+    Remove-Item "C:\Windows.old" -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path "C:\Windows.old") {
+        Write-Warning "  C:\Windows.old could not be fully removed (some files are permission-locked) - use Disk Cleanup's 'Previous Windows installations' option instead."
+    } else {
+        Write-Host "  C:\Windows.old removed." -ForegroundColor Green
+    }
+}
+
+Write-Host "  running DISM component store cleanup (this can take several minutes)..."
+$exit = Invoke-WithTimeout -FilePath "Dism.exe" -ArgumentList "/Online /Cleanup-Image /StartComponentCleanup /Quiet /NoRestart" -Label "DISM component cleanup" -TimeoutSec 1200
+if ($null -eq $exit) {
+    Write-Warning "  DISM component cleanup did not finish within the timeout - killed it; safe to re-run manually later (Dism.exe /Online /Cleanup-Image /StartComponentCleanup)."
+} elseif ($exit -eq 0) {
+    Write-Host "  component store cleanup complete." -ForegroundColor Green
+} else {
+    Write-Warning "  DISM component cleanup exited with code $exit - verify manually."
 }
 
 Write-Host "`nDone. Some suggested-content/Start menu changes take full effect after the next sign-in." -ForegroundColor Green

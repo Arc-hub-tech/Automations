@@ -4,6 +4,9 @@ All notable changes to `Prep-W11-VDI-GoldenImage.ps1`, `Prep-WS2025-RDSH-Templat
 
 ## [Unreleased]
 
+### Added
+- Domain join + computer naming, prompted interactively (domain FQDN, target OU, join account/password, hostname prefix) in all three scripts, all optional and independent of each other. Rather than a static value baked into the shared generalized image (which would collide across every clone), a base64-encoded PowerShell script is embedded as a second `FirstLogonCommand` and computes its own random suffix fresh on each clone's own first boot, then calls `Add-Computer -NewName` (rename + domain join in a single reboot) or `Rename-Computer` if no domain join was requested. Results are logged to `C:\Windows\Temp\ArcDomainJoin.log` on the clone. Credentials never touch disk outside the same `unattend.xml` that's already deleted by the existing Order-1 `FirstLogonCommand` immediately after first boot - no new credential-handling risk introduced. Added a shared `ConvertTo-PSStringLiteral` helper to safely embed arbitrary values (including passwords containing quotes) into the generated script without any injection/escaping risk.
+
 ## [v1.3] - 2026-07-14
 
 ### Added

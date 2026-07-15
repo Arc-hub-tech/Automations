@@ -27,19 +27,21 @@
 .SYNOPSIS
     Windows Server 2025 multi-session (RD Session Host) template prep.
     Run once as Administrator, reboot, verify, then sysprep/clone.
-    1. Installs the RD Session Host role
-    2. Detects VMware platform (via BIOS/SMBIOS) and installs/upgrades VMware Tools if out of date
-    3. Removes Windows Defender (Sentinel EDR is the AV/EDR on these hosts)
-    4. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing - mandatory on RDSH)
-    5. Installs new Teams machine-wide (VDI-optimised)
-    6. Installs common apps (7-Zip, SumatraPDF) via winget
-    7. Installs FSLogix agent (profile container config left as placeholders)
-    8. Sweeps unprovisioned appx packages (sysprep blockers)
-    9. Ensures BitLocker is off and stays off on clones
-    10. Sets UK regional/time settings
-    11. Applies CE+/ISO 27001 baseline hardening
-    12. Session-host QoL: no Server Manager at logon, temp/WU cache cleared
-    13. Writes the sysprep unattend.xml
+    1. Prompts for (optional) domain join details and a computer-name prefix, applied
+       on each clone's own first boot rather than baked as one static value
+    2. Installs the RD Session Host role
+    3. Detects VMware platform (via BIOS/SMBIOS) and installs/upgrades VMware Tools if out of date
+    4. Removes Windows Defender (Sentinel EDR is the AV/EDR on these hosts)
+    5. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing - mandatory on RDSH)
+    6. Installs new Teams machine-wide (VDI-optimised)
+    7. Installs common apps (7-Zip, SumatraPDF) via winget
+    8. Installs FSLogix agent (profile container config left as placeholders)
+    9. Sweeps unprovisioned appx packages (sysprep blockers)
+    10. Ensures BitLocker is off and stays off on clones
+    11. Sets UK regional/time settings
+    12. Applies CE+/ISO 27001 baseline hardening
+    13. Session-host QoL: no Server Manager at logon, temp/WU cache cleared
+    14. Writes the sysprep unattend.xml
 
 .NOTES
     Run elevated:  Set-ExecutionPolicy Bypass -Scope Process -Force; .\Prep-WS2025-RDSH-Template.ps1
@@ -110,6 +112,15 @@ function Start-ProcessWithHeartbeat {
     return $proc.ExitCode
 }
 
+# Shared helper - safely embeds an arbitrary string (domain name, OU, username,
+# password) as a single-quoted PowerShell string literal inside a larger script
+# built by this outer script, so nothing in the value (quotes, $, backticks) can
+# break out of its literal context or get interpolated at the wrong time.
+function ConvertTo-PSStringLiteral {
+    param([string]$Value)
+    "'" + $Value.Replace("'", "''") + "'"
+}
+
 # ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
 # failed image builds. trap ensures the transcript is closed even if
@@ -169,7 +180,54 @@ if (-not $cur) {
 }
 
 # ---------------------------------------------------------------
-# 1. RD Session Host role
+# 1. Domain join + computer naming - gathered interactively now,
+#    applied on EACH CLONE's own first logon (not baked as a single
+#    static value, which would collide across every clone from this
+#    one generalized image). unattend.xml's native ComputerName field
+#    only supports a literal "*" for a fully random name, not a prefix
+#    pattern, so a custom prefix needs a first-logon script instead of
+#    the declarative Microsoft-Windows-UnattendedJoin component - which
+#    conveniently also means Add-Computer's -NewName parameter can do
+#    the rename AND domain join together in a single reboot, rather
+#    than the classic rename-then-join-separately double reboot.
+#    Both domain join and the naming prefix are optional/independent.
+# ---------------------------------------------------------------
+Write-Host "== Domain join / computer naming (applied at first boot on each clone) ==" -ForegroundColor Cyan
+
+$JoinDomain = (Read-Host "  Join a domain on first boot? (y/N)") -match '^[Yy]'
+$DomainName = $null; $DomainOU = $null; $DomainJoinUser = $null; $DomainJoinPasswordPlain = $null
+if ($JoinDomain) {
+    $DomainName     = Read-Host "  Domain FQDN (e.g. corp.arcsystems.co.uk)"
+    $DomainOU       = Read-Host "  Target OU distinguished name (blank = default Computers container)"
+    $DomainJoinUser = Read-Host "  Domain join account username (e.g. svc-join)"
+    do {
+        $joinPwSecure  = Read-Host -AsSecureString "  Password for $DomainJoinUser"
+        $joinPwConfirm = Read-Host -AsSecureString "  Confirm password"
+        $p1 = [System.Net.NetworkCredential]::new('', $joinPwSecure).Password
+        $p2 = [System.Net.NetworkCredential]::new('', $joinPwConfirm).Password
+        if ($p1 -ne $p2) { Write-Warning "Passwords didn't match - try again." }
+    } while ($p1 -ne $p2)
+    $DomainJoinPasswordPlain = $p1
+    $p1 = $null; $p2 = $null; $joinPwSecure = $null; $joinPwConfirm = $null
+    Write-Host "  will join '$DomainName'$(if ($DomainOU) { " (OU: $DomainOU)" }) on each clone's first boot." -ForegroundColor Green
+} else {
+    Write-Host "  skipping domain join - clones stay in a workgroup unless joined manually." -ForegroundColor Yellow
+}
+
+$NamePrefix = (Read-Host "  Computer name prefix, e.g. ARC-RDS (blank = fully random Windows-generated name)").Trim()
+if ($NamePrefix) {
+    $maxPrefixLen = 15 - 1 - 6   # 15-char NetBIOS limit, minus "-" separator and a 6-char random suffix
+    if ($NamePrefix.Length -gt $maxPrefixLen) {
+        Write-Warning "Prefix '$NamePrefix' too long to fit a 15-char computer name with a random suffix - truncating to '$($NamePrefix.Substring(0, $maxPrefixLen))'."
+        $NamePrefix = $NamePrefix.Substring(0, $maxPrefixLen)
+    }
+    Write-Host "  each clone will get its own random suffix, e.g. $NamePrefix-A1B2C3 (computed fresh at that clone's first boot, not this run)." -ForegroundColor Green
+} else {
+    Write-Host "  no prefix given - clones keep Windows' own randomly-generated name$(if ($JoinDomain) { ' when joining the domain' })." -ForegroundColor Yellow
+}
+
+# ---------------------------------------------------------------
+# 2. RD Session Host role
 # ---------------------------------------------------------------
 Write-Host "== Installing RD Session Host role ==" -ForegroundColor Cyan
 if ((Get-WindowsFeature RDS-RD-Server).Installed) {
@@ -180,7 +238,7 @@ if ((Get-WindowsFeature RDS-RD-Server).Installed) {
 }
 
 # ---------------------------------------------------------------
-# 2. VMware platform check - detected via BIOS/SMBIOS-reported
+# 3. VMware platform check - detected via BIOS/SMBIOS-reported
 #    manufacturer (the same data the hypervisor presents to the guest
 #    that Win32_ComputerSystem/Win32_BIOS read). Compares the installed
 #    version against the current version on VMware's public package feed
@@ -237,7 +295,7 @@ if ($biosMfr -match 'VMware') {
 }
 
 # ---------------------------------------------------------------
-# 3. Remove Windows Defender - Sentinel is the AV/EDR for these hosts,
+# 4. Remove Windows Defender - Sentinel is the AV/EDR for these hosts,
 #    and running both simultaneously causes conflicts. Uninstalling the
 #    feature (rather than just disabling it) leaves NO AV on the box
 #    until Sentinel is deployed - enrol Sentinel immediately after
@@ -253,7 +311,7 @@ if ((Get-WindowsFeature Windows-Defender).Installed) {
 }
 
 # ---------------------------------------------------------------
-# 4. Microsoft 365 Apps via ODT (Shared Computer Licensing = required on RDSH)
+# 5. Microsoft 365 Apps via ODT (Shared Computer Licensing = required on RDSH)
 # ---------------------------------------------------------------
 Write-Host "== Installing Microsoft 365 Apps ==" -ForegroundColor Cyan
 
@@ -299,7 +357,7 @@ if ($existing -and $existing.ProductReleaseIds -match 'O365ProPlusRetail') {
 }
 
 # ---------------------------------------------------------------
-# 5. New Teams (machine-wide, VDI optimised)
+# 6. New Teams (machine-wide, VDI optimised)
 # ---------------------------------------------------------------
 Write-Host "== Installing Teams (new) ==" -ForegroundColor Cyan
 
@@ -325,7 +383,7 @@ if (Test-InstalledProduct -NameLike "Remote Desktop WebRTC Redirector Service*")
 }
 
 # ---------------------------------------------------------------
-# 6. Common third-party apps via winget - no hardcoded download URLs
+# 7. Common third-party apps via winget - no hardcoded download URLs
 #    to go stale, winget always resolves the current published
 #    version. Requires winget (App Installer) on the image; if it's
 #    missing this just warns and skips rather than guessing a URL.
@@ -380,7 +438,7 @@ if (Get-Command winget -ErrorAction SilentlyContinue) {
 }
 
 # ---------------------------------------------------------------
-# 7. FSLogix agent (profile containers for non-persistent multi-session)
+# 8. FSLogix agent (profile containers for non-persistent multi-session)
 #    Agent installs here; POINT IT AT YOUR PROFILE SHARE before go-live
 #    (uncomment and set VHDLocations below, or push via GPO/ADMX).
 # ---------------------------------------------------------------
@@ -409,7 +467,7 @@ if (Test-InstalledProduct -NameLike "Microsoft FSLogix Apps*") {
 # Set-ItemProperty $fslKey -Name "FlipFlopProfileDirectoryName"         -Value 1 -Type DWord
 
 # ---------------------------------------------------------------
-# 8. Sysprep-readiness sweep: remove appx installed for a user but
+# 9. Sysprep-readiness sweep: remove appx installed for a user but
 #    not provisioned for all users (classic sysprep validation failure)
 # ---------------------------------------------------------------
 Write-Host "== Sweeping unprovisioned appx packages ==" -ForegroundColor Cyan
@@ -425,7 +483,7 @@ Get-AppxPackage -AllUsers | Where-Object {
 }
 
 # ---------------------------------------------------------------
-# 9. BitLocker: ensure decrypted, prevent device encryption on clones
+# 10. BitLocker: ensure decrypted, prevent device encryption on clones
 # ---------------------------------------------------------------
 Write-Host "== Checking BitLocker ==" -ForegroundColor Cyan
 
@@ -451,7 +509,7 @@ if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
 Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker" -Name "PreventDeviceEncryption" -Value 1
 
 # ---------------------------------------------------------------
-# 10. UK regional and time settings (applied to system, welcome screen,
+# 11. UK regional and time settings (applied to system, welcome screen,
 #     and the default profile so every clone/new user inherits them)
 # ---------------------------------------------------------------
 Write-Host "== Setting UK regional/time settings ==" -ForegroundColor Cyan
@@ -472,7 +530,7 @@ Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true
 Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" -Name "DisablePrivacyExperience" -Value 1
 
 # ---------------------------------------------------------------
-# 11. CE+ / ISO 27001 baseline hardening - image-safe defaults.
+# 12. CE+ / ISO 27001 baseline hardening - image-safe defaults.
 #     Domain GPO will override any of these on joined machines,
 #     which is fine; these are the floor, not the ceiling.
 #     NOTE: TLS 1.0/1.1 disable is the only item with app-compat risk
@@ -550,7 +608,7 @@ net accounts /lockoutthreshold:10 /lockoutduration:15 /lockoutwindow:15 | Out-Nu
 net user Guest /active:no 2>$null | Out-Null
 
 # ---------------------------------------------------------------
-# 12. Session-host QoL + cleanup
+# 13. Session-host QoL + cleanup
 # ---------------------------------------------------------------
 Write-Host "== Session host tweaks and cleanup ==" -ForegroundColor Cyan
 
@@ -571,7 +629,7 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 # Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\TermService\Parameters\LicenseServers" -Name "SpecifiedLicenseServers" -Value "LICSERVER.domain.local" -Type MultiString
 
 # ---------------------------------------------------------------
-# 13. Sysprep answer file - skips the entire OOBE (region, keyboard,
+# 14. Sysprep answer file - skips the entire OOBE (region, keyboard,
 #     EULA, account creation, privacy screens). Clones boot straight
 #     to the sign-in screen with the accounts baked into the image.
 #     NOTE: if the image was built from a US ISO, change UILanguage
@@ -588,15 +646,24 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 #     set up in step 0, this declares that SAME account using the password
 #     you set there (never a randomly generated one - a random password
 #     nobody knows caused a real lockout the first time this was tried).
-#     A FirstLogonCommand deletes this file immediately after specialize
-#     completes, so the password doesn't linger on disk in plaintext -
-#     but since you already know it from step 0, that's just cleanup, not
-#     your only copy.
+#
+#     If step 1 collected domain-join details and/or a naming prefix, a
+#     second FirstLogonCommand runs a base64-encoded PowerShell script (built
+#     fresh per clone via -EncodedCommand, since it computes its own random
+#     suffix at THAT clone's first boot - a static value here would collide
+#     across every clone made from this one generalized image) that renames
+#     the machine and/or joins the domain using Add-Computer's -NewName
+#     parameter, which does both in a single reboot. Results are logged to
+#     C:\Windows\Temp\ArcDomainJoin.log on the clone for troubleshooting.
+#
+#     Whichever commands are present, Order 1 always deletes this answer
+#     file immediately after first boot, so no plaintext credential in it
+#     lingers on disk - but since you already know both passwords from when
+#     you typed them, that's just cleanup, not your only copy.
 # ---------------------------------------------------------------
 Write-Host "== Writing sysprep unattend.xml ==" -ForegroundColor Cyan
 
 $userAccountsXml = ""
-$firstLogonXml   = ""
 if ($StandingAdminReady) {
     $AdminPasswordPlain = [System.Net.NetworkCredential]::new('', $AdminPasswordSecure).Password
 
@@ -616,20 +683,60 @@ if ($StandingAdminReady) {
         </LocalAccounts>
       </UserAccounts>
 "@
-    $firstLogonXml = @"
-
-      <FirstLogonCommands>
-        <SynchronousCommand wcm:action="add">
-          <Order>1</Order>
-          <CommandLine>cmd /c del /f /q C:\Windows\Panther\unattend.xml</CommandLine>
-          <Description>Remove sysprep answer file (contains the admin password) immediately after first boot</Description>
-        </SynchronousCommand>
-      </FirstLogonCommands>
-"@
     $AdminPasswordPlain = $null
 } else {
     Write-Host "  no standing admin was set up in step 0 - skipping account declaration (the account-creation screen may still appear on first boot)." -ForegroundColor Yellow
 }
+
+$firstLogonXml = ""
+if ($StandingAdminReady -or $JoinDomain -or $NamePrefix) {
+    $commands = [System.Collections.Generic.List[string]]::new()
+    $order = 1
+    $commands.Add(@"
+        <SynchronousCommand wcm:action="add">
+          <Order>$order</Order>
+          <CommandLine>cmd /c del /f /q C:\Windows\Panther\unattend.xml</CommandLine>
+          <Description>Remove sysprep answer file (contains plaintext credentials) immediately after first boot</Description>
+        </SynchronousCommand>
+"@)
+    $order++
+
+    if ($JoinDomain -or $NamePrefix) {
+        $scriptLines = [System.Collections.Generic.List[string]]::new()
+        $scriptLines.Add('try {')
+        $scriptLines.Add('    $suffix  = -join ((48..57) + (65..90) | Get-Random -Count 6 | ForEach-Object { [char]$_ })')
+        $scriptLines.Add("    `$prefix  = $(ConvertTo-PSStringLiteral $NamePrefix)")
+        $scriptLines.Add('    $newName = if ($prefix) { "$prefix-$suffix" } else { $null }')
+        if ($JoinDomain) {
+            $scriptLines.Add("    `$sec    = ConvertTo-SecureString $(ConvertTo-PSStringLiteral $DomainJoinPasswordPlain) -AsPlainText -Force")
+            $scriptLines.Add("    `$cred   = New-Object System.Management.Automation.PSCredential($(ConvertTo-PSStringLiteral $DomainJoinUser), `$sec)")
+            $scriptLines.Add("    `$params = @{ DomainName = $(ConvertTo-PSStringLiteral $DomainName); Credential = `$cred; Restart = `$true; Force = `$true }")
+            $scriptLines.Add('    if ($newName) { $params.NewName = $newName }')
+            if ($DomainOU) {
+                $scriptLines.Add("    `$params.OUPath = $(ConvertTo-PSStringLiteral $DomainOU)")
+            }
+            $scriptLines.Add('    Add-Computer @params -ErrorAction Stop')
+        } else {
+            $scriptLines.Add('    if ($newName) { Rename-Computer -NewName $newName -Restart -Force -ErrorAction Stop }')
+        }
+        $scriptLines.Add('    "$(Get-Date -Format o) OK: $newName" | Out-File C:\Windows\Temp\ArcDomainJoin.log -Append')
+        $scriptLines.Add('} catch {')
+        $scriptLines.Add('    "$(Get-Date -Format o) FAILED: $($_.Exception.Message)" | Out-File C:\Windows\Temp\ArcDomainJoin.log -Append')
+        $scriptLines.Add('}')
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptLines -join "`n"))
+
+        $commands.Add(@"
+        <SynchronousCommand wcm:action="add">
+          <Order>$order</Order>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCommand</CommandLine>
+          <Description>Rename computer$(if ($JoinDomain) { ' and join domain' }) with a value computed fresh on this clone; logs to C:\Windows\Temp\ArcDomainJoin.log</Description>
+        </SynchronousCommand>
+"@)
+    }
+
+    $firstLogonXml = "`n      <FirstLogonCommands>`n" + ($commands -join "`n") + "`n      </FirstLogonCommands>`n"
+}
+$DomainJoinPasswordPlain = $null
 
 @"
 <?xml version="1.0" encoding="utf-8"?>

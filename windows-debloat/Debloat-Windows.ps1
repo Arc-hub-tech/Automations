@@ -3,7 +3,7 @@
  BEFORE YOU RUN THIS SCRIPT
 ================================================================
  This is NOT a golden-image prep script - it's safe to run on any live,
- in-use Windows 11 machine (a new PC, an end-user laptop, a VM) any
+ in-use Windows 10 or 11 machine (a new PC, an end-user laptop, a VM) any
  number of times. It does not touch local accounts, domain join,
  BitLocker, or sysprep - see gold-image/ for that.
 
@@ -12,21 +12,22 @@
     Option A - run this local copy of the script:
 
        Set-ExecutionPolicy Bypass -Scope Process -Force
-       .\Debloat-Win11.ps1
+       .\Debloat-Windows.ps1
 
     Option B - pull and run the current main-branch version directly
     (no clone needed; review the script on GitHub first if unsure):
 
-       irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/win11-debloat/Debloat-Win11.ps1 | iex
+       irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/windows-debloat/Debloat-Windows.ps1 | iex
 ================================================================
 
 .SYNOPSIS
-    Windows 11 cleanup/debloat - removes the usual detritus that comes with
-    new machines. Safe to re-run; only removes/disables, never touches
+    Windows 10/11 cleanup/debloat - removes the usual detritus that comes
+    with new machines. Safe to re-run; only removes/disables, never touches
     accounts, domain join, BitLocker, or security hardening.
     1. Removes bloatware appx packages - Microsoft consumer/promo apps
        (Xbox, Solitaire, Cortana, etc.) and preinstalled 3rd-party promo
-       apps (Spotify, Netflix, TikTok, Candy Crush, etc.)
+       apps (Spotify, Netflix, TikTok, Candy Crush, etc.) - a package not
+       present on the running OS version is just silently skipped
     2. Best-effort removal of common OEM trialware (McAfee, Norton,
        WildTangent, Dell/HP promo utilities) via each product's own
        uninstaller - only relevant on physical OEM hardware, harmlessly
@@ -36,8 +37,8 @@
        current user's profile for immediate effect)
 
 .NOTES
-    Run in an elevated PowerShell session:  Set-ExecutionPolicy Bypass -Scope Process -Force; .\Debloat-Win11.ps1
-    Full run is logged to C:\ArcLogs\Win11Debloat\ (transcript, timestamped per run).
+    Run in an elevated PowerShell session:  Set-ExecutionPolicy Bypass -Scope Process -Force; .\Debloat-Windows.ps1
+    Full run is logged to C:\ArcLogs\WindowsDebloat\ (transcript, timestamped per run).
 #>
 
 #Requires -RunAsAdministrator
@@ -82,9 +83,9 @@ function Invoke-WithTimeout {
 # trap ensures the transcript is closed even if a later step throws
 # (ErrorActionPreference is 'Stop' above).
 # ---------------------------------------------------------------
-$LogDir  = "$env:SystemDrive\ArcLogs\Win11Debloat"
+$LogDir  = "$env:SystemDrive\ArcLogs\WindowsDebloat"
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
-$LogFile = Join-Path $LogDir ("Debloat-Win11_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+$LogFile = Join-Path $LogDir ("Debloat-Windows_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 Start-Transcript -Path $LogFile -Append | Out-Null
 trap { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null }
 Write-Host "Logging this run to $LogFile" -ForegroundColor DarkGray

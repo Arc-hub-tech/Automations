@@ -3,7 +3,7 @@
  BEFORE YOU RUN THIS SCRIPT
 ================================================================
  1. Log in to this image as the persistent/standing local admin
-    account you want the image to keep (e.g. ArcAdmin) - NOT the
+    account you want the image to keep (e.g. XXXAdmin) - NOT the
     built-in Administrator. This is the account the script adopts
     as the standing admin and bakes into the image.
  2. Open an elevated PowerShell prompt (Run as Administrator) on
@@ -122,7 +122,7 @@ Write-Host "Logging this run to $LogFile" -ForegroundColor DarkGray
 # ---------------------------------------------------------------
 # 0. Standard local admin account - ADOPTS the currently logged-in
 #    user as the standing admin, so log in as the account the image
-#    should keep (e.g. ArcAdmin) before running. Then disables the
+#    should keep (e.g. XXXAdmin) before running. Then disables the
 #    built-in Administrator (found by SID -500, so renaming doesn't
 #    fool it) - unless that's who is running the script.
 # ---------------------------------------------------------------
@@ -136,7 +136,7 @@ $StandingAdminReady = $false
 if (-not $cur) {
     Write-Warning "'$AdminUser' is not a LOCAL account (domain/Entra?). Log in as the local admin the image should keep and rerun. Continuing without account changes."
 } elseif ($builtin.Name -eq $AdminUser) {
-    Write-Warning "You are logged in as the BUILT-IN Administrator. Log in as a named admin (e.g. ArcAdmin) instead - the built-in account should end up disabled, not be the standing admin. Skipping account step."
+    Write-Warning "You are logged in as the BUILT-IN Administrator. Log in as a named admin (e.g. XXXAdmin) instead - the built-in account should end up disabled, not be the standing admin. Skipping account step."
 } else {
     Write-Host "  set a password for '$AdminUser' - it becomes the account's real password now," -ForegroundColor Cyan
     Write-Host "  and the same value is declared in unattend.xml later so OOBE skips account creation." -ForegroundColor Cyan
@@ -200,7 +200,7 @@ if ($JoinDomain) {
     Write-Host "  skipping domain join - clones stay in a workgroup unless joined manually." -ForegroundColor Yellow
 }
 
-$NamePrefix = (Read-Host "  Computer name prefix, e.g. ARC-VDI (blank = fully random Windows-generated name)").Trim()
+$NamePrefix = (Read-Host "  Computer name prefix, e.g. XXX-VDI (blank = fully random Windows-generated name)").Trim()
 if ($NamePrefix) {
     $maxPrefixLen = 15 - 1 - 6   # 15-char NetBIOS limit, minus "-" separator and a 6-char random suffix
     if ($NamePrefix.Length -gt $maxPrefixLen) {

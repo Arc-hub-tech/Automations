@@ -784,7 +784,6 @@ $DomainJoinPasswordPlain = $null
         <NetworkLocation>Work</NetworkLocation>
         <ProtectYourPC>3</ProtectYourPC>
       </OOBE>
-      <EnableFirstLogonAnimation>false</EnableFirstLogonAnimation>
       <TimeZone>GMT Standard Time</TimeZone>$userAccountsXml$firstLogonXml
     </component>
   </settings>

@@ -6,22 +6,21 @@
     account you want the image to keep (e.g. XXXAdmin) - NOT the
     built-in Administrator. This is the account the script adopts
     as the standing admin and bakes into the image.
- 2. Open an elevated PowerShell prompt (Run as Administrator) on
-    the image and DOWNLOAD-THEN-RUN the script (do not pipe it with
-    `irm | iex`). The script is now a two-stage build: stage 1 installs
-    and configures, then REBOOTS to flush pending operations; stage 2
-    resumes automatically at your next logon, re-sweeps appx, and prompts
-    before syspreping. That reboot/resume needs a real script file on
-    disk to relaunch, which a piped `irm | iex` run does not have.
+ 2. Open an elevated PowerShell prompt (Run as Administrator) on the
+    image and DOWNLOAD-THEN-RUN the script. Paste this as a SINGLE line
+    (multi-line paste breaks in the console) - it saves the script next
+    to the logs under C:\ArcLogs\GoldImagePrep, then runs it:
 
-       $p = "$env:ProgramData\ArcGoldImage\Prep-W11-VDI-GoldenImage.ps1"
-       New-Item (Split-Path $p) -ItemType Directory -Force | Out-Null
-       irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p
-       & $p
+       $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; & $p
 
-    (A local copy works the same way: just run `.\Prep-W11-VDI-GoldenImage.ps1`.)
-    If you do pipe it with `irm | iex`, it still runs but cannot auto-reboot/
-    resume - it falls back to telling you to reboot and re-run with -Resume.
+    Why download-then-run (not `irm | iex`): this is a two-stage build -
+    stage 1 installs/configures then REBOOTS to flush pending operations;
+    stage 2 resumes automatically at your next logon, re-sweeps appx, and
+    prompts before syspreping. The reboot/resume needs a real script file
+    on disk to relaunch, which a piped `irm | iex` run does not have.
+    (A local copy works too: just run `.\Prep-W11-VDI-GoldenImage.ps1`.)
+    A piped `irm | iex` run still works but cannot auto-reboot/resume - it
+    falls back to telling you to reboot and re-run with -Resume.
 
  3. Early on, the script will prompt you to set a password for the
     standing admin account - note it down, you'll need it for console

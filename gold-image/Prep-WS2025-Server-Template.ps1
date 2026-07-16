@@ -180,7 +180,7 @@ Write-Host "== Domain join / computer naming (applied at first boot on each clon
 $JoinDomain = (Read-Host "  Join a domain on first boot? (y/N)") -match '^[Yy]'
 $DomainName = $null; $DomainOU = $null; $DomainJoinUser = $null; $DomainJoinPasswordPlain = $null
 if ($JoinDomain) {
-    $DomainName     = Read-Host "  Domain FQDN (e.g. corp.arcsystems.co.uk)"
+    $DomainName     = Read-Host "  Domain FQDN (e.g. corp.contoso.com)"
     $DomainOU       = Read-Host "  Target OU distinguished name (blank = default Computers container)"
     $DomainJoinUser = Read-Host "  Domain join account username (e.g. svc-join)"
     do {

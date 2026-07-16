@@ -7,17 +7,21 @@
     built-in Administrator. This is the account the script adopts
     as the standing admin and bakes into the image.
  2. Open an elevated PowerShell prompt (Run as Administrator) on
-    the image, then either:
+    the image and DOWNLOAD-THEN-RUN the script (do not pipe it with
+    `irm | iex`). The script is now a two-stage build: stage 1 installs
+    and configures, then REBOOTS to flush pending operations; stage 2
+    resumes automatically at your next logon, re-sweeps appx, and prompts
+    before syspreping. That reboot/resume needs a real script file on
+    disk to relaunch, which a piped `irm | iex` run does not have.
 
-    Option A - run this local copy of the script:
+       $p = "$env:ProgramData\ArcGoldImage\Prep-W11-VDI-GoldenImage.ps1"
+       New-Item (Split-Path $p) -ItemType Directory -Force | Out-Null
+       irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p
+       & $p
 
-       Set-ExecutionPolicy Bypass -Scope Process -Force
-       .\Prep-W11-VDI-GoldenImage.ps1
-
-    Option B - pull and run the current main-branch version directly
-    (no clone needed; review the script on GitHub first if unsure):
-
-       irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 | iex
+    (A local copy works the same way: just run `.\Prep-W11-VDI-GoldenImage.ps1`.)
+    If you do pipe it with `irm | iex`, it still runs but cannot auto-reboot/
+    resume - it falls back to telling you to reboot and re-run with -Resume.
 
  3. Early on, the script will prompt you to set a password for the
     standing admin account - note it down, you'll need it for console
@@ -43,6 +47,8 @@
 #>
 
 #Requires -RunAsAdministrator
+param([switch]$Resume)   # -Resume = stage 2 (post-reboot): re-sweep appx, then prompt + sysprep
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # Invoke-WebRequest is dramatically faster with the progress UI off
 $Work = "$env:TEMP\VDIPrep"
@@ -108,6 +114,54 @@ function ConvertTo-PSStringLiteral {
 }
 
 # ---------------------------------------------------------------
+# Two-stage build support. Stage 1 (default) installs/configures and
+# writes the answer file, then reboots to flush pending operations
+# (VMware Tools install, locale change). A one-time logon-triggered
+# scheduled task relaunches this same script as stage 2 (-Resume), which
+# re-sweeps appx (a reboot can let the Store re-provision packages) and
+# then prompts before syspreping. Requires the download-and-run
+# invocation (a real script file on disk) - it cannot resume an
+# `irm | iex` piped run, which has no file to relaunch.
+# ---------------------------------------------------------------
+$ResumeTaskName = "ArcGoldImageResume"
+
+function Invoke-AppxSweep {
+    # Remove appx packages installed for a user but NOT provisioned for all
+    # users - the classic "Sysprep was not able to validate" blocker (Store
+    # auto-updates and per-user installs create them silently).
+    Write-Host "== Sweeping unprovisioned appx packages (sysprep blockers) ==" -ForegroundColor Cyan
+    $provisioned = (Get-AppxProvisionedPackage -Online).DisplayName
+    Get-AppxPackage -AllUsers | Where-Object {
+        $_.Name -notin $provisioned -and -not $_.IsFramework -and -not $_.NonRemovable
+    } | ForEach-Object {
+        Write-Host "  removing unprovisioned: $($_.Name)"
+        Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue
+    }
+}
+
+function Register-GoldImageResume {
+    # Schedule this script to relaunch as stage 2 at the next logon of the
+    # current admin, elevated (RunLevel Highest) so sysprep can run without a
+    # UAC prompt. Returns $false if there's no script file to relaunch.
+    if (-not $PSCommandPath) {
+        Write-Warning "No script file on disk (looks like an 'irm | iex' run) - cannot auto-resume."
+        Write-Warning "Reboot manually, then re-run the downloaded script with -Resume to finish and sysprep."
+        return $false
+    }
+    try {
+        $action    = New-ScheduledTaskAction -Execute "powershell.exe" `
+                        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$PSCommandPath`" -Resume"
+        $trigger   = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
+        Register-ScheduledTask -TaskName $ResumeTaskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+        return $true
+    } catch {
+        Write-Warning "Could not register the stage-2 resume task: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
 # failed image builds. trap ensures the transcript is closed even if
 # a later step throws (ErrorActionPreference is 'Stop' above).
@@ -118,6 +172,40 @@ $LogFile = Join-Path $LogDir ("Prep-W11-VDI-GoldenImage_{0}.log" -f (Get-Date -F
 Start-Transcript -Path $LogFile -Append | Out-Null
 trap { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null }
 Write-Host "Logging this run to $LogFile" -ForegroundColor DarkGray
+
+# ---------------------------------------------------------------
+# STAGE 2 (-Resume): runs after the stage-1 reboot, relaunched by the
+# one-time scheduled task. Re-sweep appx (the reboot may have let the
+# Store re-provision packages the stage-1 sweep removed), verify BitLocker
+# is decrypted, then prompt before generalising. Returns before the
+# stage-1 body below, so none of the install/config steps run again.
+# ---------------------------------------------------------------
+if ($Resume) {
+    Unregister-ScheduledTask -TaskName $ResumeTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host "== Resuming (stage 2) after reboot ==" -ForegroundColor Cyan
+
+    Invoke-AppxSweep
+
+    $blv = Get-BitLockerVolume -MountPoint C: -ErrorAction SilentlyContinue
+    if ($blv -and $blv.VolumeStatus -ne 'FullyDecrypted') {
+        Write-Warning "C: is not fully decrypted ($($blv.VolumeStatus)) - sysprep will refuse it. Resolve before generalising."
+    } else {
+        Write-Host "  C: fully decrypted." -ForegroundColor Green
+    }
+
+    Write-Host "`nReady to generalise. This will run:" -ForegroundColor Green
+    Write-Host "  C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green
+    $go = Read-Host "Run sysprep /generalize /shutdown now? (y/N)"
+    if ($go -match '^[Yy]') {
+        Write-Host "  syspreping - the VM will shut down when done. Snapshot/clone the template after it powers off." -ForegroundColor Cyan
+        Stop-Transcript | Out-Null
+        & C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml
+        return
+    }
+    Write-Host "  Skipped. When ready, sysprep manually with the command above, or re-run this script with -Resume." -ForegroundColor Yellow
+    Stop-Transcript | Out-Null
+    return
+}
 
 # ---------------------------------------------------------------
 # 0. Standard local admin account - ADOPTS the currently logged-in
@@ -504,17 +592,7 @@ Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" -Name "
 #    "Sysprep was not able to validate your Windows installation" cause
 #    (Store auto-updates and per-user installs create them silently).
 # ---------------------------------------------------------------
-Write-Host "== Sweeping unprovisioned appx packages (sysprep blockers) ==" -ForegroundColor Cyan
-
-$Provisioned = (Get-AppxProvisionedPackage -Online).DisplayName
-Get-AppxPackage -AllUsers | Where-Object {
-    $_.Name -notin $Provisioned -and
-    -not $_.IsFramework -and
-    -not $_.NonRemovable
-} | ForEach-Object {
-    Write-Host "  removing unprovisioned: $($_.Name)"
-    Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue
-}
+Invoke-AppxSweep
 
 # ---------------------------------------------------------------
 # 10. BitLocker: decrypt OS volume (sysprep refuses encrypted volumes)
@@ -727,8 +805,14 @@ if ($StandingAdminReady) {
     }
 }
 
+# FirstLogonCommands are ALWAYS emitted: every clone must delete the plaintext
+# answer file, and must defensively remove the stage-2 build resume task in
+# case it survived generalize (a scheduled task under \System32\Tasks does
+# survive) - otherwise a leaked task could pop an elevated "sysprep now?"
+# prompt on a production clone. The rename/join command is added on top of
+# those two when a prefix and/or domain join was requested.
 $firstLogonXml = ""
-if ($StandingAdminReady -or $JoinDomain -or $NamePrefix) {
+if ($true) {
     $commands = [System.Collections.Generic.List[string]]::new()
     $order = 1
     $commands.Add(@"
@@ -736,6 +820,14 @@ if ($StandingAdminReady -or $JoinDomain -or $NamePrefix) {
           <Order>$order</Order>
           <CommandLine>cmd /c del /f /q C:\Windows\Panther\unattend.xml</CommandLine>
           <Description>Remove sysprep answer file (contains plaintext credentials) immediately after first boot</Description>
+        </SynchronousCommand>
+"@)
+    $order++
+    $commands.Add(@"
+        <SynchronousCommand wcm:action="add">
+          <Order>$order</Order>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Unregister-ScheduledTask -TaskName '$ResumeTaskName' -Confirm:`$false -ErrorAction SilentlyContinue"</CommandLine>
+          <Description>Defensively remove the stage-2 build resume task in case it survived generalize</Description>
         </SynchronousCommand>
 "@)
     $order++
@@ -832,7 +924,20 @@ Write-Host "  written to C:\Windows\Panther\unattend.xml"
 # ---------------------------------------------------------------
 Set-Location -Path $env:SystemDrive\
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
-Write-Host "`nDone. Verify Office/Teams launch, then generalise with the EXACT command below" -ForegroundColor Green
-Write-Host "(sysprep.exe is NOT on PATH - the full path is required):" -ForegroundColor Green
-Write-Host "  C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green
-Stop-Transcript | Out-Null
+
+Write-Host "`nStage 1 complete (installs, answer file, appx sweep, hardening)." -ForegroundColor Green
+$resumeReady = Register-GoldImageResume
+if ($resumeReady) {
+    Write-Host "A one-time scheduled task will resume this script (stage 2) automatically the next time you log in as $env:USERNAME." -ForegroundColor Green
+    Write-Host "Stage 2 re-sweeps appx, checks BitLocker, then prompts you before syspreping." -ForegroundColor Green
+    Write-Host "If it doesn't auto-start after login, run:  & '$PSCommandPath' -Resume" -ForegroundColor DarkGray
+    Write-Host "`nRebooting in 15 seconds to flush pending operations (VMware Tools/locale). Press Ctrl+C to cancel..." -ForegroundColor Yellow
+    Stop-Transcript | Out-Null
+    Start-Sleep -Seconds 15
+    Restart-Computer -Force
+} else {
+    Write-Host "Reboot this VM, then run the downloaded script again with -Resume to finish and sysprep." -ForegroundColor Yellow
+    Write-Host "Manual sysprep command if you prefer (sysprep.exe is NOT on PATH):" -ForegroundColor Green
+    Write-Host "  C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green
+    Stop-Transcript | Out-Null
+}

@@ -14,12 +14,28 @@ See `CHANGELOG.md` for version history.
 
 ## Run order
 
+> **W11 is moving to a two-stage automated flow** (see below); RDSH/Server still use the single-pass flow in steps 1–4 until the two-stage build is validated on a real clone.
+
+### W11 (two-stage, download-then-run)
+
+1. **Download then run** the prep script on the template VM (elevated) — do *not* pipe it with `irm | iex`, because the auto-reboot needs a script file on disk to resume from:
+   ```powershell
+   $p = "$env:ProgramData\ArcGoldImage\Prep-W11-VDI-GoldenImage.ps1"
+   New-Item (Split-Path $p) -ItemType Directory -Force | Out-Null
+   irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; & $p
+   ```
+   Note the standing-admin password when prompted. **Stage 1** installs/configures/writes the answer file, then reboots automatically. **Stage 2** resumes at your next logon (via a one-time scheduled task), re-sweeps appx, checks BitLocker, and **prompts yes/no before syspreping**. Logged to `C:\ArcLogs\GoldImagePrep\`.
+2. **Validate the answer file in WSIM** (below) any time before the stage-2 sysprep prompt.
+3. Answer **yes** at the stage-2 prompt to generalize + shut down, then clone.
+
+### RDSH / Server (single-pass — current)
+
 1. **Run the prep script** on the template VM (elevated):
    ```powershell
    Set-ExecutionPolicy Bypass -Scope Process -Force
-   irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 | iex
+   irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-WS2025-RDSH-Template.ps1 | iex
    ```
-   Note down the standing-admin password when prompted — you need it for console access until LAPS rotates it post-deploy. The full run is logged to `C:\ArcLogs\GoldImagePrep\`.
+   Note down the standing-admin password when prompted. The full run is logged to `C:\ArcLogs\GoldImagePrep\`.
 
 2. **Reboot once, offline.** Several installs suppress their own reboot (VMware Tools) and the locale change needs one to apply. Do it with the NIC disconnected so the Store doesn't re-provision the appx packages the script just removed.
 

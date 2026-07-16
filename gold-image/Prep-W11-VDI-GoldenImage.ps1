@@ -11,7 +11,7 @@
     (multi-line paste breaks in the console) - it saves the script next
     to the logs under C:\ArcLogs\GoldImagePrep, then runs it:
 
-       $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; & $p
+       $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p
 
     Why download-then-run (not `irm | iex`): this is a two-stage build -
     stage 1 installs/configures then REBOOTS to flush pending operations;

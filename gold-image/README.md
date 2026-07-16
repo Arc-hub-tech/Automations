@@ -20,7 +20,7 @@ See `CHANGELOG.md` for version history.
 
 1. **Download then run** the prep script on the template VM (elevated) — do *not* pipe it with `irm | iex`, because the auto-reboot needs a script file on disk to resume from. Paste this as a **single line** (multi-line paste breaks in the console); it saves the script next to the logs and runs it:
    ```powershell
-   $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; & $p
+   $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p
    ```
    Note the standing-admin password when prompted. **Stage 1** installs/configures/writes the answer file, then reboots automatically. **Stage 2** resumes at your next logon (via a one-time scheduled task), re-sweeps appx, checks BitLocker, and **prompts yes/no before syspreping**. Logged to `C:\ArcLogs\GoldImagePrep\`.
 2. **Validate the answer file in WSIM** (below) any time before the stage-2 sysprep prompt.

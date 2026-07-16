@@ -676,6 +676,7 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 Write-Host "== Writing sysprep unattend.xml ==" -ForegroundColor Cyan
 
 $userAccountsXml = ""
+$autoLogonXml    = ""
 if ($StandingAdminReady) {
     $AdminPasswordPlain = [System.Net.NetworkCredential]::new('', $AdminPasswordSecure).Password
 
@@ -695,9 +696,35 @@ if ($StandingAdminReady) {
         </LocalAccounts>
       </UserAccounts>
 "@
+
+    # One-shot AutoLogon so the first-logon rename/domain-join runs HANDS-FREE.
+    # FirstLogonCommands only fire at the first INTERACTIVE logon - without this
+    # the clone sits at the sign-in screen until someone logs in. LogonCount=1
+    # means Windows auto-logs-in as the standing admin exactly once; the join
+    # reboot then lands on the normal sign-in screen. ArcDomainJoin.ps1 scrubs
+    # the plaintext DefaultPassword + AutoAdminLogon from the registry before it
+    # reboots, so no auto-logon credential lingers. Only added when there is
+    # actual hands-free first-logon work (a rename and/or domain join) to run.
+    if ($JoinDomain -or $NamePrefix) {
+        $autoLogonXml = @"
+
+      <AutoLogon>
+        <Password>
+          <Value>$AdminPasswordPlain</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <Enabled>true</Enabled>
+        <LogonCount>1</LogonCount>
+        <Username>$AdminUser</Username>
+      </AutoLogon>
+"@
+    }
     $AdminPasswordPlain = $null
 } else {
     Write-Host "  no standing admin was set up in step 0 - skipping account declaration (the account-creation screen may still appear on first boot)." -ForegroundColor Yellow
+    if ($JoinDomain -or $NamePrefix) {
+        Write-Warning "  no standing admin means no AutoLogon - the rename/domain join will NOT run until someone logs in interactively on the clone."
+    }
 }
 
 $firstLogonXml = ""
@@ -722,7 +749,13 @@ if ($StandingAdminReady -or $JoinDomain -or $NamePrefix) {
         # trip whatever the unattend answer-file validator objects to with a
         # very long/complex CommandLine, and the script is readable on the
         # clone afterwards if something needs debugging.
+        # NOTE: no -Restart on Add-Computer/Rename-Computer. We reboot explicitly
+        # in the finally block, but only AFTER scrubbing the one-shot AutoLogon
+        # credential from the registry, so the plaintext DefaultPassword never
+        # survives the reboot. On failure we scrub and self-delete but do NOT
+        # reboot, so the operator can read the log and the box doesn't loop.
         $scriptLines = [System.Collections.Generic.List[string]]::new()
+        $scriptLines.Add('$needReboot = $false')
         $scriptLines.Add('try {')
         $scriptLines.Add('    $suffix  = -join ((48..57) + (65..90) | Get-Random -Count 6 | ForEach-Object { [char]$_ })')
         $scriptLines.Add("    `$prefix  = $(ConvertTo-PSStringLiteral $NamePrefix)")
@@ -730,20 +763,25 @@ if ($StandingAdminReady -or $JoinDomain -or $NamePrefix) {
         if ($JoinDomain) {
             $scriptLines.Add("    `$sec    = ConvertTo-SecureString $(ConvertTo-PSStringLiteral $DomainJoinPasswordPlain) -AsPlainText -Force")
             $scriptLines.Add("    `$cred   = New-Object System.Management.Automation.PSCredential($(ConvertTo-PSStringLiteral $DomainJoinUser), `$sec)")
-            $scriptLines.Add("    `$params = @{ DomainName = $(ConvertTo-PSStringLiteral $DomainName); Credential = `$cred; Restart = `$true; Force = `$true }")
+            $scriptLines.Add("    `$params = @{ DomainName = $(ConvertTo-PSStringLiteral $DomainName); Credential = `$cred; Force = `$true }")
             $scriptLines.Add('    if ($newName) { $params.NewName = $newName }')
             if ($DomainOU) {
                 $scriptLines.Add("    `$params.OUPath = $(ConvertTo-PSStringLiteral $DomainOU)")
             }
             $scriptLines.Add('    Add-Computer @params -ErrorAction Stop')
+            $scriptLines.Add('    $needReboot = $true')
         } else {
-            $scriptLines.Add('    if ($newName) { Rename-Computer -NewName $newName -Restart -Force -ErrorAction Stop }')
+            $scriptLines.Add('    if ($newName) { Rename-Computer -NewName $newName -Force -ErrorAction Stop; $needReboot = $true }')
         }
         $scriptLines.Add('    "$(Get-Date -Format o) OK: $newName" | Out-File C:\Windows\Temp\ArcDomainJoin.log -Append')
         $scriptLines.Add('} catch {')
         $scriptLines.Add('    "$(Get-Date -Format o) FAILED: $($_.Exception.Message)" | Out-File C:\Windows\Temp\ArcDomainJoin.log -Append')
         $scriptLines.Add('} finally {')
+        $scriptLines.Add('    $wl = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"')
+        $scriptLines.Add('    Remove-ItemProperty -Path $wl -Name DefaultPassword -ErrorAction SilentlyContinue')
+        $scriptLines.Add('    Set-ItemProperty    -Path $wl -Name AutoAdminLogon -Value "0" -ErrorAction SilentlyContinue')
         $scriptLines.Add('    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue')
+        $scriptLines.Add('    if ($needReboot) { Restart-Computer -Force }')
         $scriptLines.Add('}')
 
         $joinScriptDir  = "C:\Windows\Setup\Scripts"
@@ -784,7 +822,7 @@ $DomainJoinPasswordPlain = $null
         <NetworkLocation>Work</NetworkLocation>
         <ProtectYourPC>3</ProtectYourPC>
       </OOBE>
-      <TimeZone>GMT Standard Time</TimeZone>$userAccountsXml$firstLogonXml
+      <TimeZone>GMT Standard Time</TimeZone>$autoLogonXml$userAccountsXml$firstLogonXml
     </component>
   </settings>
 </unattend>

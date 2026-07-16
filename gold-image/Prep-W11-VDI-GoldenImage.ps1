@@ -783,8 +783,6 @@ $DomainJoinPasswordPlain = $null
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
         <NetworkLocation>Work</NetworkLocation>
         <ProtectYourPC>3</ProtectYourPC>
-        <SkipUserOOBE>true</SkipUserOOBE>
-        <SkipMachineOOBE>true</SkipMachineOOBE>
       </OOBE>
       <EnableFirstLogonAnimation>false</EnableFirstLogonAnimation>
       <TimeZone>GMT Standard Time</TimeZone>$userAccountsXml$firstLogonXml

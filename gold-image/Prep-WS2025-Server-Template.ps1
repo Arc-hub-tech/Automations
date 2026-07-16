@@ -450,9 +450,12 @@ Start-Service wuauserv -ErrorAction SilentlyContinue
 #    HideLocalAccountScreen/HideOnlineAccountScreens/HideWirelessSetupInOOBE/
 #    EnableFirstLogonAnimation - including them causes a hard "component or
 #    setting does not exist" parse error at boot, so the OOBE block below is
-#    deliberately trimmed to the Server-valid subset. Account creation is
-#    instead bypassed via SkipMachineOOBE/SkipUserOOBE plus explicitly
-#    declaring the standing admin account. So when a standing admin was
+#    deliberately trimmed to the Server-valid subset. NOTE: the legacy
+#    SkipMachineOOBE/SkipUserOOBE elements are ALSO invalid on modern Windows
+#    (Server 2022/2025 reject them with the same parse error) and were removed
+#    2026-07-16; OOBE is now bypassed purely by declaring the standing admin
+#    account below (a defined password auto-satisfies the Server password
+#    screen). So when a standing admin was
 #    set up in step 0, this declares that SAME account using the password
 #    you set there (never a randomly generated one - a random password
 #    nobody knows caused a real lockout the first time this was tried).
@@ -581,8 +584,6 @@ $DomainJoinPasswordPlain = $null
         <HideEULAPage>true</HideEULAPage>
         <NetworkLocation>Work</NetworkLocation>
         <ProtectYourPC>1</ProtectYourPC>
-        <SkipMachineOOBE>true</SkipMachineOOBE>
-        <SkipUserOOBE>true</SkipUserOOBE>
       </OOBE>
       <TimeZone>GMT Standard Time</TimeZone>$userAccountsXml$firstLogonXml
     </component>

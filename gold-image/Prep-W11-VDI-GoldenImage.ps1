@@ -152,12 +152,44 @@ function Register-GoldImageResume {
                         -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$PSCommandPath`" -Resume"
         $trigger   = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
         $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
-        Register-ScheduledTask -TaskName $ResumeTaskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+        # A VM can report as "on battery", which the default task settings would
+        # block; no execution time limit so it isn't killed while waiting at the
+        # sysprep prompt. No start-delay set, so it fires as promptly as the
+        # AtLogOn trigger allows.
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+        Register-ScheduledTask -TaskName $ResumeTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
         return $true
     } catch {
         Write-Warning "Could not register the stage-2 resume task: $($_.Exception.Message)"
         return $false
     }
+}
+
+$WinlogonKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+
+function Set-TemplateAutoLogon {
+    # TEMPORARY one-shot auto-logon on the TEMPLATE, so that after the stage-1
+    # reboot the box logs in by itself and the resume scheduled task fires
+    # stage 2 with nobody at the console. AutoLogonCount=1 limits it to a single
+    # automatic logon. This is DISTINCT from the clone's own one-shot AutoLogon
+    # baked into unattend.xml (that one is for the clone at OOBE). This template
+    # copy is scrubbed by Clear-TemplateAutoLogon at the very start of stage 2 -
+    # i.e. before the sysprep prompt - so it can never survive into the image.
+    param([string]$User, [string]$PlainPassword)
+    Set-ItemProperty -Path $WinlogonKey -Name AutoAdminLogon    -Value "1"
+    Set-ItemProperty -Path $WinlogonKey -Name DefaultUserName   -Value $User
+    Set-ItemProperty -Path $WinlogonKey -Name DefaultDomainName -Value $env:COMPUTERNAME
+    Set-ItemProperty -Path $WinlogonKey -Name DefaultPassword   -Value $PlainPassword
+    New-ItemProperty  -Path $WinlogonKey -Name AutoLogonCount -Value 1 -PropertyType DWord -Force | Out-Null
+}
+
+function Clear-TemplateAutoLogon {
+    # Remove the temporary template auto-logon set above. Safe to call even if it
+    # was never set. Leaves DefaultUserName/DefaultDomainName (harmless - just
+    # pre-fills the last user); only the secret + the enable flags are removed.
+    Set-ItemProperty    -Path $WinlogonKey -Name AutoAdminLogon -Value "0" -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $WinlogonKey -Name DefaultPassword -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $WinlogonKey -Name AutoLogonCount  -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------
@@ -180,7 +212,12 @@ Write-Host "Logging this run to $LogFile" -ForegroundColor DarkGray
 # stage-1 body below, so none of the install/config steps run again.
 # ---------------------------------------------------------------
 if ($Resume) {
+    # First thing: tear down the stage-1 -> stage-2 handoff so nothing survives
+    # into the image - remove the resume task and scrub the temporary template
+    # auto-logon (incl. the plaintext DefaultPassword). Both happen here, well
+    # before the sysprep prompt, so even answering "no" leaves a clean template.
     Unregister-ScheduledTask -TaskName $ResumeTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Clear-TemplateAutoLogon
     Write-Host "== Resuming (stage 2) after reboot ==" -ForegroundColor Cyan
 
     Invoke-AppxSweep
@@ -825,8 +862,8 @@ if ($true) {
     $commands.Add(@"
         <SynchronousCommand wcm:action="add">
           <Order>$order</Order>
-          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Unregister-ScheduledTask -TaskName '$ResumeTaskName' -Confirm:`$false -ErrorAction SilentlyContinue"</CommandLine>
-          <Description>Defensively remove the stage-2 build resume task in case it survived generalize</Description>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Unregister-ScheduledTask -TaskName '$ResumeTaskName' -Confirm:`$false -ErrorAction SilentlyContinue; `$w='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'; Set-ItemProperty `$w AutoAdminLogon '0' -ErrorAction SilentlyContinue; Remove-ItemProperty `$w DefaultPassword -ErrorAction SilentlyContinue; Remove-ItemProperty `$w AutoLogonCount -ErrorAction SilentlyContinue"</CommandLine>
+          <Description>Defensively remove the stage-2 build resume task and any leftover template auto-logon (in case a bypassed stage 2 let them survive generalize)</Description>
         </SynchronousCommand>
 "@)
     $order++
@@ -927,9 +964,20 @@ Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "`nStage 1 complete (installs, answer file, appx sweep, hardening)." -ForegroundColor Green
 $resumeReady = Register-GoldImageResume
 if ($resumeReady) {
-    Write-Host "A one-time scheduled task will resume this script (stage 2) automatically the next time you log in as $env:USERNAME." -ForegroundColor Green
+    # Set a temporary one-shot auto-logon so the reboot resumes fully hands-free
+    # (auto-logon -> resume task fires -> stage 2). Stage 2 scrubs it before the
+    # sysprep prompt. Needs the standing-admin password; if there's no standing
+    # admin we fall back to a manual login after the reboot to trigger stage 2.
+    if ($StandingAdminReady) {
+        $alPw = [System.Net.NetworkCredential]::new('', $AdminPasswordSecure).Password
+        Set-TemplateAutoLogon -User $AdminUser -PlainPassword $alPw
+        $alPw = $null
+        Write-Host "This VM will AUTO-LOG-IN as $AdminUser after the reboot and resume stage 2 by itself - no login needed." -ForegroundColor Green
+    } else {
+        Write-Warning "No standing admin, so no auto-logon: after the reboot, log in manually to trigger stage 2."
+    }
     Write-Host "Stage 2 re-sweeps appx, checks BitLocker, then prompts you before syspreping." -ForegroundColor Green
-    Write-Host "If it doesn't auto-start after login, run:  & '$PSCommandPath' -Resume" -ForegroundColor DarkGray
+    Write-Host "If stage 2 doesn't auto-start, run:  & '$PSCommandPath' -Resume" -ForegroundColor DarkGray
     Write-Host "`nRebooting in 15 seconds to flush pending operations (VMware Tools/locale). Press Ctrl+C to cancel..." -ForegroundColor Yellow
     Stop-Transcript | Out-Null
     Start-Sleep -Seconds 15

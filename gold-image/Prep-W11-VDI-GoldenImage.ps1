@@ -127,6 +127,17 @@ function Disable-ScheduledTaskSafe {
     }
 }
 
+function Disable-VDIServices {
+    # Overhead services to disable on a shared/non-persistent VM. Called in BOTH
+    # stage 1 and stage 2: Windows servicing/maintenance re-enables some of these
+    # (notably SysMain) across the stage-1 reboot, so re-asserting them in stage 2
+    # - the last thing before sysprep - is what guarantees they're disabled in
+    # the captured image. Guarded, so a SKU missing a service (Xbox on Server) is
+    # simply skipped. NB: deliberately NOT touching WSearch/Spooler/UsoSvc/CDPSvc.
+    'SysMain','WerSvc','MapsBroker','CscService','XblAuthManager','XblGameSave','XboxGipSvc','XboxNetApiSvc' |
+        ForEach-Object { Disable-ServiceSafe -Name $_ }
+}
+
 # Shared helper - safely embeds an arbitrary string (domain name, OU, username,
 # password) as a single-quoted PowerShell string literal inside a larger script
 # built by this outer script, so nothing in the value (quotes, $, backticks) can
@@ -245,6 +256,11 @@ if ($Resume) {
     Write-Host "== Resuming (stage 2) after reboot ==" -ForegroundColor Cyan
 
     Invoke-AppxSweep
+
+    # Re-assert the service optimisations: Windows servicing/maintenance re-enables
+    # some (notably SysMain) across the stage-1 reboot, so pinning them here - the
+    # last step before sysprep - is what the captured image actually keeps.
+    Disable-VDIServices
 
     $blv = Get-BitLockerVolume -MountPoint C: -ErrorAction SilentlyContinue
     if ($blv -and $blv.VolumeStatus -ne 'FullyDecrypted') {
@@ -794,11 +810,9 @@ fsutil 8dot3name set 1                  | Out-Null
 # Storage Sense off (unpredictable background cleanup on shared hosts).
 Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\StorageSense" -Name "AllowStorageSenseGlobal" -Value 0
 
-# Services that are pure overhead on a shared/non-persistent VM. Guarded, so
-# ones that don't exist on a given SKU (e.g. Xbox on Server) are just skipped.
-# NB: deliberately NOT touching WSearch, Spooler, UsoSvc, CDPSvc or Themes.
-'SysMain','WerSvc','MapsBroker','CscService','XblAuthManager','XblGameSave','XboxGipSvc','XboxNetApiSvc' |
-    ForEach-Object { Disable-ServiceSafe -Name $_ }
+# Services that are pure overhead on a shared/non-persistent VM. Re-asserted in
+# stage 2 too (Windows servicing re-enables SysMain across the reboot).
+Disable-VDIServices
 
 # Scheduled tasks: telemetry/CEIP, disk diagnostics, Maps, error-report queue,
 # and the scheduled defrag (harmful on thin-provisioned / SSD-backed volumes).

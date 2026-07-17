@@ -559,17 +559,16 @@ net accounts /lockoutthreshold:10 /lockoutduration:15 /lockoutwindow:15 | Out-Nu
 net user Guest /active:no 2>$null | Out-Null
 
 # ---------------------------------------------------------------
-# VDI/RDSH performance optimisations - the OS-level tuning the vendor optimisers
-# (Omnissa OSOT, Citrix Optimizer, Microsoft VDOT/WDOT) apply: trim background
-# work that wastes shared-host CPU/IO, and disable the visual effects that cost
-# the most over a remote display protocol. Deliberately conservative: Windows
-# Search, OneDrive, Print Spooler, Windows Update (UsoSvc), CDPSvc and Themes are
-# LEFT ON so the Office/Teams/FSLogix/OneDrive stack keeps working - those are the
-# classic "optimisations" that backfire. Per-user settings are written to the
-# DEFAULT profile so every clone/new user (incl. a fresh FSLogix container)
-# inherits them.
+# Server VM performance tuning - the infrastructure-level subset of what the VDI
+# optimisers (Omnissa OSOT, Citrix Optimizer, Microsoft VDOT/WDOT) apply: trim
+# background work that wastes host CPU/IO on a virtualised server. The
+# interactive-desktop visual-effects tweaks those tools also apply are NOT
+# included here - they belong on the W11 VDI and RDSH session-host scripts; a
+# general server has few interactive users and Server already runs minimal visual
+# effects by default. Deliberately conservative: Windows Search, Print Spooler,
+# Windows Update (UsoSvc), CDPSvc and Themes are LEFT ON.
 # ---------------------------------------------------------------
-Write-Host "== Applying VDI/RDSH performance optimisations ==" -ForegroundColor Cyan
+Write-Host "== Applying Server VM performance tuning ==" -ForegroundColor Cyan
 
 # Power: high performance, no hibernation - a VM has no business power-saving,
 # and hiberfil.sys just bloats the clone source.
@@ -606,47 +605,14 @@ Disable-VDIServices
 # Faster logon: skip the first-sign-in animation (machine policy, all users).
 Set-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableFirstLogonAnimation" -Value 0
 
-# NIC: stop Windows powering the adapter down (avoids session blips on VDI).
+# NIC: stop Windows powering the network adapter down on the VM.
 Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
     ForEach-Object { Disable-NetAdapterPowerManagement -Name $_.Name -ErrorAction SilentlyContinue }
 
-# Per-user UI settings written to the DEFAULT profile so every future user on a
-# clone (incl. a fresh FSLogix container, which seeds from the default profile)
-# inherits them. The PRIMARY win is transparency off - the effect that costs the
-# most bandwidth/latency over a remote display protocol, and it reliably persists.
-# The Performance-Options animation values (VisualFXSetting=3 custom to keep
-# drop-shadows, MinAnimate, TaskbarAnimations) are cheap best-effort.
-# NOTE: we deliberately do NOT try to preset the Accessibility "Animation effects"
-# master toggle. It's backed by UserPreferencesMask, which Windows RE-INITIALISES
-# at each new profile's first logon (an OS-managed/SPI-backed value, same class as
-# SysMain) - seeding it in the default profile does not hold, confirmed on a real
-# fresh FSLogix profile. The residual gain is marginal and would need a per-user
-# logon script / Active Setup to enforce - not worth it.
-$defaultHive = "$env:SystemDrive\Users\Default\NTUSER.DAT"
-$mount = "ArcDefaultUser"
-& reg.exe load "HKLM\$mount" $defaultHive | Out-Null
-if ($LASTEXITCODE -eq 0) {
-    # Write these with reg.exe (write-through) NOT the PS registry provider: the
-    # provider caches key handles, which both blocks the unload and can leave
-    # the edits unflushed to NTUSER.DAT - a silent no-op that still looks fine
-    # on the template but never reaches the clone. reg.exe flushes on exit, so
-    # the settings actually persist into the default profile and the unload is
-    # clean (no [gc]::Collect() dance needed).
-    $vfx = "HKLM\$mount\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
-    $adv = "HKLM\$mount\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-    $per = "HKLM\$mount\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-    $ser = "HKLM\$mount\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize"
-    $wmx = "HKLM\$mount\Control Panel\Desktop\WindowMetrics"
-    & reg.exe add $per /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null   # primary win - persists reliably
-    & reg.exe add $vfx /v VisualFXSetting    /t REG_DWORD /d 3 /f | Out-Null   # 3 = Custom (keeps drop-shadows/borders)
-    & reg.exe add $wmx /v MinAnimate         /t REG_SZ    /d 0 /f | Out-Null
-    & reg.exe add $adv /v TaskbarAnimations  /t REG_DWORD /d 0 /f | Out-Null
-    & reg.exe add $ser /v StartupDelayInMSec /t REG_DWORD /d 0 /f | Out-Null
-    & reg.exe unload "HKLM\$mount" | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Warning "  default user hive did not unload cleanly - it will release on reboot." }
-} else {
-    Write-Warning "  could not load the default user hive ($defaultHive) - per-user UI optimisations skipped."
-}
+# NB: the per-user interactive-desktop visual-effects block (transparency/
+# animations written to the default profile) is intentionally omitted on the
+# general server template - see the step header above. It lives in the W11 VDI
+# and RDSH scripts, which are the interactive multi-session images.
 
 # ---------------------------------------------------------------
 # 8. Server QoL + cleanup

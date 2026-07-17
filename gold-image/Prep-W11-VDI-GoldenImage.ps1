@@ -852,12 +852,18 @@ if ($LASTEXITCODE -eq 0) {
     $adv = "HKLM\$mount\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
     $per = "HKLM\$mount\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
     $ser = "HKLM\$mount\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize"
+    $dtp = "HKLM\$mount\Control Panel\Desktop"
     $wmx = "HKLM\$mount\Control Panel\Desktop\WindowMetrics"
     & reg.exe add $vfx /v VisualFXSetting    /t REG_DWORD /d 3 /f | Out-Null   # 3 = Custom (keeps drop-shadows/borders)
     & reg.exe add $wmx /v MinAnimate         /t REG_SZ    /d 0 /f | Out-Null
     & reg.exe add $adv /v TaskbarAnimations  /t REG_DWORD /d 0 /f | Out-Null
     & reg.exe add $per /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
     & reg.exe add $ser /v StartupDelayInMSec /t REG_DWORD /d 0 /f | Out-Null
+    # Accessibility "Animation effects" master toggle - backed by UserPreferencesMask
+    # (binary), which MinAnimate/TaskbarAnimations do NOT control. Value captured
+    # from a real Win11 24H2 build with the toggle set to Off (keeps non-animation
+    # effects); MinAnimate=0 above is the companion the UI also writes.
+    & reg.exe add $dtp /v UserPreferencesMask /t REG_BINARY /d 9012078010000000 /f | Out-Null
     & reg.exe unload "HKLM\$mount" | Out-Null
     if ($LASTEXITCODE -ne 0) { Write-Warning "  default user hive did not unload cleanly - it will release on reboot." }
 } else {

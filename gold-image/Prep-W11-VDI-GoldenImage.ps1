@@ -103,6 +103,30 @@ function Start-ProcessWithHeartbeat {
     return $proc.ExitCode
 }
 
+# Shared helpers for the VDI-optimisation step. Both GUARD against the target
+# not existing (Server lacks some services; task names vary by build) and
+# warn-and-continue, so an optimisation can never abort a build.
+function Disable-ServiceSafe {
+    param([string]$Name)
+    if (Get-Service -Name $Name -ErrorAction SilentlyContinue) {
+        try {
+            Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
+            Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
+            Write-Host "  service disabled: $Name"
+        } catch { Write-Warning "  could not disable service '$Name' - $($_.Exception.Message)" }
+    }
+}
+
+function Disable-ScheduledTaskSafe {
+    param([string]$TaskPath, [string]$TaskName)
+    if (Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        try {
+            Disable-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop | Out-Null
+            Write-Host "  task disabled: $TaskPath$TaskName"
+        } catch { Write-Warning "  could not disable task '$TaskPath$TaskName' - $($_.Exception.Message)" }
+    }
+}
+
 # Shared helper - safely embeds an arbitrary string (domain name, OU, username,
 # password) as a single-quoted PowerShell string literal inside a larger script
 # built by this outer script, so nothing in the value (quotes, $, backticks) can
@@ -743,6 +767,93 @@ net accounts /lockoutthreshold:10 /lockoutduration:15 /lockoutwindow:15 | Out-Nu
 
 # Guest account disabled
 net user Guest /active:no 2>$null | Out-Null
+
+# ---------------------------------------------------------------
+# 12b. VDI/RDSH performance optimisations - the OS-level tuning the vendor
+#      optimisers (Omnissa OSOT, Citrix Optimizer, Microsoft VDOT/WDOT) apply:
+#      trim background work that wastes shared-host CPU/IO, and disable the
+#      visual effects that cost the most over a remote display protocol.
+#      Deliberately conservative: Windows Search, OneDrive, Print Spooler,
+#      Windows Update (UsoSvc), CDPSvc and Themes are LEFT ON so the Office/
+#      Teams/FSLogix/OneDrive stack keeps working - those are the classic
+#      "optimisations" that backfire. Per-user settings are written to the
+#      DEFAULT profile so every clone/new user inherits them.
+# ---------------------------------------------------------------
+Write-Host "== Applying VDI/RDSH performance optimisations ==" -ForegroundColor Cyan
+
+# Power: high performance, no hibernation - a VM has no business power-saving,
+# and hiberfil.sys just bloats the clone source.
+powercfg /setactive SCHEME_MIN | Out-Null
+powercfg /hibernate off        | Out-Null
+
+# Filesystem: stop last-access timestamp writes and 8dot3 short-name creation
+# (metadata IO with no benefit on a server/VDI volume).
+fsutil behavior set disablelastaccess 1 | Out-Null
+fsutil 8dot3name set 1                  | Out-Null
+
+# Storage Sense off (unpredictable background cleanup on shared hosts).
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\StorageSense" -Name "AllowStorageSenseGlobal" -Value 0
+
+# Services that are pure overhead on a shared/non-persistent VM. Guarded, so
+# ones that don't exist on a given SKU (e.g. Xbox on Server) are just skipped.
+# NB: deliberately NOT touching WSearch, Spooler, UsoSvc, CDPSvc or Themes.
+'SysMain','WerSvc','MapsBroker','CscService','XblAuthManager','XblGameSave','XboxGipSvc','XboxNetApiSvc' |
+    ForEach-Object { Disable-ServiceSafe -Name $_ }
+
+# Scheduled tasks: telemetry/CEIP, disk diagnostics, Maps, error-report queue,
+# and the scheduled defrag (harmful on thin-provisioned / SSD-backed volumes).
+@(
+    @('\Microsoft\Windows\Defrag\','ScheduledDefrag'),
+    @('\Microsoft\Windows\Application Experience\','Microsoft Compatibility Appraiser'),
+    @('\Microsoft\Windows\Application Experience\','ProgramDataUpdater'),
+    @('\Microsoft\Windows\Customer Experience Improvement Program\','Consolidator'),
+    @('\Microsoft\Windows\Customer Experience Improvement Program\','UsbCeip'),
+    @('\Microsoft\Windows\DiskDiagnostic\','Microsoft-Windows-DiskDiagnosticDataCollector'),
+    @('\Microsoft\Windows\Maps\','MapsUpdateTask'),
+    @('\Microsoft\Windows\Maps\','MapsToastTask'),
+    @('\Microsoft\Windows\Windows Error Reporting\','QueueReporting'),
+    @('\Microsoft\Windows\Feedback\Siuf\','DmClient'),
+    @('\Microsoft\Windows\Feedback\Siuf\','DmClientOnScenarioDownload')
+) | ForEach-Object { Disable-ScheduledTaskSafe -TaskPath $_[0] -TaskName $_[1] }
+
+# Faster logon: skip the first-sign-in animation (machine policy, all users).
+Set-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableFirstLogonAnimation" -Value 0
+
+# NIC: stop Windows powering the adapter down (avoids session blips on VDI).
+Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+    ForEach-Object { Disable-NetAdapterPowerManagement -Name $_.Name -ErrorAction SilentlyContinue }
+
+# Per-user UI settings written to the DEFAULT profile so every future user on a
+# clone inherits them: no window/taskbar animations, no transparency (the
+# effects that cost the most bandwidth/latency over a remote protocol), and a
+# CUSTOM Visual Effects profile (VisualFXSetting=3) rather than "best
+# performance" (=2), so window drop-shadows/borders are preserved (disabling
+# everything is a documented cause of missing window borders).
+$defaultHive = "$env:SystemDrive\Users\Default\NTUSER.DAT"
+$mount = "ArcDefaultUser"
+& reg.exe load "HKLM\$mount" $defaultHive | Out-Null
+if ($LASTEXITCODE -eq 0) {
+    # Write these with reg.exe (write-through) NOT the PS registry provider: the
+    # provider caches key handles, which both blocks the unload and can leave
+    # the edits unflushed to NTUSER.DAT - a silent no-op that still looks fine
+    # on the template but never reaches the clone. reg.exe flushes on exit, so
+    # the settings actually persist into the default profile and the unload is
+    # clean (no [gc]::Collect() dance needed).
+    $vfx = "HKLM\$mount\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+    $adv = "HKLM\$mount\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+    $per = "HKLM\$mount\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+    $ser = "HKLM\$mount\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize"
+    $wmx = "HKLM\$mount\Control Panel\Desktop\WindowMetrics"
+    & reg.exe add $vfx /v VisualFXSetting    /t REG_DWORD /d 3 /f | Out-Null   # 3 = Custom (keeps drop-shadows/borders)
+    & reg.exe add $wmx /v MinAnimate         /t REG_SZ    /d 0 /f | Out-Null
+    & reg.exe add $adv /v TaskbarAnimations  /t REG_DWORD /d 0 /f | Out-Null
+    & reg.exe add $per /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
+    & reg.exe add $ser /v StartupDelayInMSec /t REG_DWORD /d 0 /f | Out-Null
+    & reg.exe unload "HKLM\$mount" | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Warning "  default user hive did not unload cleanly - it will release on reboot." }
+} else {
+    Write-Warning "  could not load the default user hive ($defaultHive) - per-user UI optimisations skipped."
+}
 
 # ---------------------------------------------------------------
 # 13. Clear temp + Windows Update download cache to slim the clone source

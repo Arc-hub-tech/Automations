@@ -6,18 +6,22 @@
     account you want the image to keep (e.g. XXXAdmin) - NOT the
     built-in Administrator. This is the account the script adopts
     as the standing admin and bakes into the image.
- 2. Open an elevated PowerShell prompt (Run as Administrator) on
-    the image, then either:
+ 2. Open an elevated PowerShell prompt (Run as Administrator) on the
+    image and DOWNLOAD-THEN-RUN the script. Paste this as a SINGLE line
+    (multi-line paste breaks in the console) - it saves the script next
+    to the logs under C:\ArcLogs\GoldImagePrep, then runs it:
 
-    Option A - run this local copy of the script:
+       $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-WS2025-Server-Template.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-WS2025-Server-Template.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p
 
-       Set-ExecutionPolicy Bypass -Scope Process -Force
-       .\Prep-WS2025-Server-Template.ps1
-
-    Option B - pull and run the current main-branch version directly
-    (no clone needed; review the script on GitHub first if unsure):
-
-       irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-WS2025-Server-Template.ps1 | iex
+    Why download-then-run (not `irm | iex`): this is a two-stage build -
+    stage 1 installs/configures then REBOOTS (required for the Defender
+    removal); stage 2 resumes automatically at your next logon, re-sweeps
+    appx, reminds you to enrol Sentinel, and prompts before syspreping. The
+    reboot/resume needs a real script file on disk to relaunch, which a piped
+    `irm | iex` run does not have.
+    (A local copy works too: just run `.\Prep-WS2025-Server-Template.ps1`.)
+    A piped `irm | iex` run still works but cannot auto-reboot/resume - it
+    falls back to telling you to reboot and re-run with -Resume.
 
  3. Early on, the script will prompt you to set a password for the
     standing admin account - note it down, you'll need it for console
@@ -52,6 +56,8 @@
 #>
 
 #Requires -RunAsAdministrator
+param([switch]$Resume)   # -Resume = stage 2 (post-reboot): re-sweep appx, then prompt + sysprep
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 $Work = "$env:TEMP\WS2025ServerPrep"
@@ -105,6 +111,70 @@ function ConvertTo-PSStringLiteral {
 }
 
 # ---------------------------------------------------------------
+# Two-stage build support. Stage 1 (default) installs/configures and writes
+# the answer file, then sets a temporary auto-logon and reboots (the reboot the
+# Defender removal already requires). A one-time logon-triggered scheduled task
+# relaunches this script as stage 2 (-Resume), which re-sweeps appx and prompts
+# before syspreping. Requires the download-and-run invocation (a real script
+# file on disk) - it cannot resume an `irm | iex` piped run.
+# ---------------------------------------------------------------
+$ResumeTaskName = "ArcGoldImageResume"
+$WinlogonKey    = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+
+function Invoke-AppxSweep {
+    # Remove appx installed for a user but NOT provisioned for all users - the
+    # classic "Sysprep was not able to validate" blocker.
+    Write-Host "== Sweeping unprovisioned appx packages ==" -ForegroundColor Cyan
+    $provisioned = (Get-AppxProvisionedPackage -Online).DisplayName
+    Get-AppxPackage -AllUsers | Where-Object {
+        $_.Name -notin $provisioned -and -not $_.IsFramework -and -not $_.NonRemovable
+    } | ForEach-Object {
+        Write-Host "  removing unprovisioned: $($_.Name)"
+        Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue
+    }
+}
+
+function Register-GoldImageResume {
+    # Schedule this script to relaunch as stage 2 at the next logon, elevated.
+    if (-not $PSCommandPath) {
+        Write-Warning "No script file on disk (looks like an 'irm | iex' run) - cannot auto-resume."
+        Write-Warning "Reboot manually, then re-run the downloaded script with -Resume to finish and sysprep."
+        return $false
+    }
+    try {
+        $action    = New-ScheduledTaskAction -Execute "powershell.exe" `
+                        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$PSCommandPath`" -Resume"
+        $trigger   = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+        Register-ScheduledTask -TaskName $ResumeTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        return $true
+    } catch {
+        Write-Warning "Could not register the stage-2 resume task: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Set-TemplateAutoLogon {
+    # TEMPORARY one-shot auto-logon on the TEMPLATE so the reboot resumes stage 2
+    # with nobody at the console. Distinct from the clone's own AutoLogon in the
+    # answer file. Scrubbed by Clear-TemplateAutoLogon at the START of stage 2 -
+    # before the sysprep prompt - so it never survives into the image.
+    param([string]$User, [string]$PlainPassword)
+    Set-ItemProperty -Path $WinlogonKey -Name AutoAdminLogon    -Value "1"
+    Set-ItemProperty -Path $WinlogonKey -Name DefaultUserName   -Value $User
+    Set-ItemProperty -Path $WinlogonKey -Name DefaultDomainName -Value $env:COMPUTERNAME
+    Set-ItemProperty -Path $WinlogonKey -Name DefaultPassword   -Value $PlainPassword
+    New-ItemProperty  -Path $WinlogonKey -Name AutoLogonCount -Value 1 -PropertyType DWord -Force | Out-Null
+}
+
+function Clear-TemplateAutoLogon {
+    Set-ItemProperty    -Path $WinlogonKey -Name AutoAdminLogon -Value "0" -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $WinlogonKey -Name DefaultPassword -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $WinlogonKey -Name AutoLogonCount  -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
 # failed image builds. trap ensures the transcript is closed even if
 # a later step throws (ErrorActionPreference is 'Stop' above).
@@ -115,6 +185,45 @@ $LogFile = Join-Path $LogDir ("Prep-WS2025-Server-Template_{0}.log" -f (Get-Date
 Start-Transcript -Path $LogFile -Append | Out-Null
 trap { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null }
 Write-Host "Logging this run to $LogFile" -ForegroundColor DarkGray
+
+# ---------------------------------------------------------------
+# STAGE 2 (-Resume): runs after the stage-1 reboot, relaunched by the one-time
+# scheduled task. Tears down the stage-1->2 handoff, re-sweeps appx, checks
+# BitLocker, reminds about Sentinel enrolment, then prompts before generalising.
+# Returns before the stage-1 body below, so install/config steps don't rerun.
+# ---------------------------------------------------------------
+if ($Resume) {
+    Unregister-ScheduledTask -TaskName $ResumeTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Clear-TemplateAutoLogon
+    Write-Host "== Resuming (stage 2) after reboot ==" -ForegroundColor Cyan
+
+    Invoke-AppxSweep
+
+    if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+        $blv = Get-BitLockerVolume -MountPoint C: -ErrorAction SilentlyContinue
+        if ($blv -and $blv.VolumeStatus -ne 'FullyDecrypted') {
+            Write-Warning "C: is not fully decrypted ($($blv.VolumeStatus)) - sysprep will refuse it. Resolve before generalising."
+        } else {
+            Write-Host "  C: fully decrypted." -ForegroundColor Green
+        }
+    }
+
+    Write-Host "`n*** BEFORE YOU SYSPREP ***" -ForegroundColor Yellow
+    Write-Host "  - Windows Defender was removed - install/enrol Sentinel now if this image needs EDR before it serves production traffic." -ForegroundColor Yellow
+    Write-Host "  (You can do that in another window - this prompt will wait.)" -ForegroundColor DarkGray
+    Write-Host "`nReady to generalise. This will run:" -ForegroundColor Green
+    Write-Host "  C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green
+    $go = Read-Host "Run sysprep /generalize /shutdown now? (y/N)"
+    if ($go -match '^[Yy]') {
+        Write-Host "  syspreping - the VM will shut down when done. Snapshot/clone the template after it powers off." -ForegroundColor Cyan
+        Stop-Transcript | Out-Null
+        & C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml
+        return
+    }
+    Write-Host "  Skipped. When ready, sysprep manually with the command above, or re-run this script with -Resume." -ForegroundColor Yellow
+    Stop-Transcript | Out-Null
+    return
+}
 
 # ---------------------------------------------------------------
 # 0. Standard local admin account - ADOPTS the currently logged-in
@@ -286,17 +395,7 @@ if ((Get-WindowsFeature Windows-Defender).Installed) {
 # 4. Sysprep-readiness sweep: remove appx installed for a user but
 #    not provisioned for all users (classic sysprep validation failure)
 # ---------------------------------------------------------------
-Write-Host "== Sweeping unprovisioned appx packages ==" -ForegroundColor Cyan
-
-$Provisioned = (Get-AppxProvisionedPackage -Online).DisplayName
-Get-AppxPackage -AllUsers | Where-Object {
-    $_.Name -notin $Provisioned -and
-    -not $_.IsFramework -and
-    -not $_.NonRemovable
-} | ForEach-Object {
-    Write-Host "  removing unprovisioned: $($_.Name)"
-    Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction SilentlyContinue
-}
+Invoke-AppxSweep
 
 # ---------------------------------------------------------------
 # 5. BitLocker: ensure decrypted, prevent device encryption on clones
@@ -532,8 +631,14 @@ if ($StandingAdminReady) {
     }
 }
 
+# FirstLogonCommands are ALWAYS emitted: every clone must delete the plaintext
+# answer file, and must defensively remove the stage-2 build resume task and any
+# leftover template auto-logon in case they survived generalize (a scheduled task
+# and Winlogon values both do) - otherwise a leaked task could pop an elevated
+# "sysprep now?" prompt on a production clone. The rename/join command is added
+# on top when a prefix and/or domain join was requested.
 $firstLogonXml = ""
-if ($StandingAdminReady -or $JoinDomain -or $NamePrefix) {
+if ($true) {
     $commands = [System.Collections.Generic.List[string]]::new()
     $order = 1
     $commands.Add(@"
@@ -541,6 +646,14 @@ if ($StandingAdminReady -or $JoinDomain -or $NamePrefix) {
           <Order>$order</Order>
           <CommandLine>cmd /c del /f /q C:\Windows\Panther\unattend.xml</CommandLine>
           <Description>Remove sysprep answer file (contains plaintext credentials) immediately after first boot</Description>
+        </SynchronousCommand>
+"@)
+    $order++
+    $commands.Add(@"
+        <SynchronousCommand wcm:action="add">
+          <Order>$order</Order>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Unregister-ScheduledTask -TaskName '$ResumeTaskName' -Confirm:`$false -ErrorAction SilentlyContinue; `$w='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'; Set-ItemProperty `$w AutoAdminLogon '0' -ErrorAction SilentlyContinue; Remove-ItemProperty `$w DefaultPassword -ErrorAction SilentlyContinue; Remove-ItemProperty `$w AutoLogonCount -ErrorAction SilentlyContinue"</CommandLine>
+          <Description>Defensively remove the stage-2 build resume task and any leftover template auto-logon (in case a bypassed stage 2 let them survive generalize)</Description>
         </SynchronousCommand>
 "@)
     $order++
@@ -633,7 +746,30 @@ Write-Host "  written to C:\Windows\Panther\unattend.xml"
 # ---------------------------------------------------------------
 Set-Location -Path $env:SystemDrive\
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
-Write-Host "`nDone. REBOOT NOW (Defender removal). After reboot: install/enrol Sentinel BEFORE this host serves production traffic," -ForegroundColor Green
-Write-Host "then generalise with the EXACT command below (sysprep.exe is NOT on PATH - the full path is required):" -ForegroundColor Green
-Write-Host "  C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green
-Stop-Transcript | Out-Null
+
+Write-Host "`nStage 1 complete (installs, Defender removal, answer file, appx sweep, hardening)." -ForegroundColor Green
+$resumeReady = Register-GoldImageResume
+if ($resumeReady) {
+    # Temporary one-shot auto-logon so the reboot resumes hands-free. Stage 2
+    # scrubs it before the sysprep prompt. This reboot is the one the Defender
+    # removal already requires. Fall back to manual login if there's no admin.
+    if ($StandingAdminReady) {
+        $alPw = [System.Net.NetworkCredential]::new('', $AdminPasswordSecure).Password
+        Set-TemplateAutoLogon -User $AdminUser -PlainPassword $alPw
+        $alPw = $null
+        Write-Host "This VM will AUTO-LOG-IN as $AdminUser after the reboot and resume stage 2 by itself - no login needed." -ForegroundColor Green
+    } else {
+        Write-Warning "No standing admin, so no auto-logon: after the reboot, log in manually to trigger stage 2."
+    }
+    Write-Host "Stage 2 re-sweeps appx, checks BitLocker, reminds you to enrol Sentinel, then prompts before syspreping." -ForegroundColor Green
+    Write-Host "If stage 2 doesn't auto-start, run:  & '$PSCommandPath' -Resume" -ForegroundColor DarkGray
+    Write-Host "`nRebooting in 15 seconds (required for the Defender removal). Press Ctrl+C to cancel..." -ForegroundColor Yellow
+    Stop-Transcript | Out-Null
+    Start-Sleep -Seconds 15
+    Restart-Computer -Force
+} else {
+    Write-Host "REBOOT this VM (required for Defender removal), then run the downloaded script again with -Resume." -ForegroundColor Yellow
+    Write-Host "Before syspreping: install/enrol Sentinel. Manual sysprep command (sysprep.exe is NOT on PATH):" -ForegroundColor Green
+    Write-Host "  C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml" -ForegroundColor Green
+    Stop-Transcript | Out-Null
+}

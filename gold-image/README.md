@@ -14,39 +14,29 @@ See `CHANGELOG.md` for version history.
 
 ## Run order
 
-> **W11 is moving to a two-stage automated flow** (see below); RDSH/Server still use the single-pass flow in steps 1–4 until the two-stage build is validated on a real clone.
+All three scripts use the same **two-stage, download-then-run** flow.
 
-### W11 (two-stage, download-then-run)
+1. **Download then run** the prep script on the template VM (elevated) — do *not* pipe it with `irm | iex`, because the auto-reboot needs a script file on disk to resume from. Paste as a **single line** (multi-line paste breaks in the console); it saves the script next to the logs and runs it. Swap the filename for the template you're building:
 
-1. **Download then run** the prep script on the template VM (elevated) — do *not* pipe it with `irm | iex`, because the auto-reboot needs a script file on disk to resume from. Paste this as a **single line** (multi-line paste breaks in the console); it saves the script next to the logs and runs it:
+   | Template | Script |
+   |---|---|
+   | W11 VDI | `Prep-W11-VDI-GoldenImage.ps1` |
+   | WS2025 RDSH | `Prep-WS2025-RDSH-Template.ps1` |
+   | WS2025 Server | `Prep-WS2025-Server-Template.ps1` |
+
    ```powershell
    $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p
    ```
-   Note the standing-admin password when prompted. **Stage 1** installs/configures/writes the answer file, then reboots automatically. **Stage 2** resumes at your next logon (via a one-time scheduled task), re-sweeps appx, checks BitLocker, and **prompts yes/no before syspreping**. Logged to `C:\ArcLogs\GoldImagePrep\`.
-2. **Validate the answer file in WSIM** (below) any time before the stage-2 sysprep prompt.
-3. Answer **yes** at the stage-2 prompt to generalize + shut down, then clone.
+   Note the standing-admin password when prompted. **Stage 1** installs/configures/writes the answer file, sets a temporary one-shot auto-logon, then reboots automatically. The VM **auto-logs-in** and **stage 2** resumes by itself (via a one-time elevated scheduled task): re-sweeps appx, checks BitLocker, and **prompts yes/no before syspreping**. Logged to `C:\ArcLogs\GoldImagePrep\`.
 
-### RDSH / Server (single-pass — current)
+2. **On RDSH/Server**, stage 2 pauses at a reminder to **install/enrol Sentinel** (Defender is removed on those templates) and — on RDSH — verify Office/Teams, before you answer yes. The prompt waits, so do those in another window first.
 
-1. **Run the prep script** on the template VM (elevated):
-   ```powershell
-   Set-ExecutionPolicy Bypass -Scope Process -Force
-   irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-WS2025-RDSH-Template.ps1 | iex
-   ```
-   Note down the standing-admin password when prompted. The full run is logged to `C:\ArcLogs\GoldImagePrep\`.
+3. **Validate the answer file in WSIM** (below) any time before the stage-2 sysprep prompt.
 
-2. **Reboot once, offline.** Several installs suppress their own reboot (VMware Tools) and the locale change needs one to apply. Do it with the NIC disconnected so the Store doesn't re-provision the appx packages the script just removed.
-
-3. **Validate the answer file in WSIM** — see below. Do this *before* sysprep; it's a desk-check that catches invalid `unattend.xml` settings without burning a sysprep/clone cycle.
-
-4. **Sysprep + generalize** with the exact command the script prints (`sysprep.exe` is not on PATH):
-   ```
-   C:\Windows\System32\Sysprep\sysprep.exe /oobe /generalize /shutdown /unattend:C:\Windows\Panther\unattend.xml
-   ```
-
-5. **Clone**, then on first boot of a clone confirm:
+4. Answer **yes** at the stage-2 prompt to generalize + shut down, then clone. On first boot of a clone confirm:
    - OOBE is fully skipped (boots straight to sign-in).
    - The rename/domain-join fired — check `C:\Windows\Temp\ArcDomainJoin.log` on the clone.
+   - No leftover `DefaultPassword` under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`.
 
 ## Validating the answer file in WSIM before sysprep
 

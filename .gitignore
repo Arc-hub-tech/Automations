@@ -1,0 +1,4 @@
+# Diagnostic / log artifacts - may contain internal infra detail; never commit (public repo)
+*.log
+*.LOG
+NetSetup.LOG

@@ -355,6 +355,33 @@ if ($JoinDomain) {
     } while ($p1 -ne $p2)
     $DomainJoinPasswordPlain = $p1
     $p1 = $null; $p2 = $null; $joinPwSecure = $null; $joinPwConfirm = $null
+    # Validate the target OU actually exists in AD before baking it into every
+    # clone. A typo here (e.g. "U=Single" for "OU=Single") is otherwise embedded
+    # verbatim and fails the domain join on EVERY clone at first boot with an
+    # opaque 0x2 "cannot find the file specified" (LDAP_NO_SUCH_OBJECT on the
+    # missing container) - discovered only hours later, per clone. Bind with the
+    # join creds: first to the domain root (proves AD is reachable AND the creds
+    # are valid), then to the OU. If AD can't be reached from this build network,
+    # warn and continue rather than block an offline prep.
+    while ($DomainOU) {
+        try {
+            $rootDe = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$DomainName", $DomainJoinUser, $DomainJoinPasswordPlain)
+            $rootDe.RefreshCache()   # force a real server read - .Guid/.NativeObject do NOT validate existence
+        } catch {
+            Write-Warning "  Couldn't reach or authenticate to '$DomainName' from this build VM to validate the OU: $($_.Exception.Message.Trim())"
+            Write-Warning "  Skipping OU validation - DOUBLE-CHECK this DN is exactly right, it is baked into every clone: $DomainOU"
+            break
+        }
+        try {
+            $ouDe = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$DomainName/$DomainOU", $DomainJoinUser, $DomainJoinPasswordPlain)
+            $ouDe.RefreshCache()     # force a real server read - throws "no such object" if the OU is missing
+            Write-Host "  OU verified in AD: $DomainOU" -ForegroundColor Green
+            break
+        } catch {
+            Write-Warning "  OU '$DomainOU' not found in '$DomainName' (AD reached and credentials OK, so that container does not exist - check for a typo, e.g. 'U=' instead of 'OU=')."
+            $DomainOU = Read-Host "  Re-enter target OU distinguished name (blank = default Computers container)"
+        }
+    }
     Write-Host "  will join '$DomainName'$(if ($DomainOU) { " (OU: $DomainOU)" }) on each clone's first boot." -ForegroundColor Green
 } else {
     Write-Host "  skipping domain join - clones stay in a workgroup unless joined manually." -ForegroundColor Yellow

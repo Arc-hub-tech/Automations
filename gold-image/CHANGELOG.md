@@ -4,6 +4,9 @@ All notable changes to `Prep-W11-VDI-GoldenImage.ps1`, `Prep-WS2025-RDSH-Templat
 
 ## [Unreleased]
 
+### Fixed
+- **Intermittent domain join failing at first boot (all three scripts).** The emitted `ArcDomainJoin.ps1` called `Add-Computer` immediately at first logon, before the clone's NIC/DHCP/DNS stack had settled - so on clones where networking came up slowly the DC locator found no domain controller and the join threw `The system cannot find the file specified` (error `0x2` - the domain's SRV records weren't resolvable yet), leaving the box in `WORKGROUP` under its default `DESKTOP-*` name. Because `-NewName` is part of the same atomic `Add-Computer` call, a failed join also lost the rename, and the readiness timing varied per clone, which is what produced the "sometimes it joins, sometimes not" symptom (confirmed from a failed clone's `C:\Windows\Temp\ArcDomainJoin.log` showing `FAILED ... The system cannot find the file specified` - i.e. the FirstLogonCommand *did* run, so it was never the AutoLogon/answer-file-discovery path). The join branch now waits for a domain controller to be locatable (`nltest /dsgetdc:<domain> /force`, polled up to ~5 min) before attempting the join, then retries `Add-Computer` up to 5 times; each wait/retry is logged to `ArcDomainJoin.log`, and it only gives up (logging a clear "DNS/network not ready" message) after both loops are exhausted. Deliberately *not* moved to `SetupComplete.cmd`, which runs even earlier in boot when DNS is less settled and would make this worse. The rename-only branch is unchanged (no DC needed). The *diagnosis* is confirmed from a real failed W11 AVD clone (`0x2` in `ArcDomainJoin.log`); the `nltest /dsgetdc` probe's success=exit-0 behaviour was verified on a live domain-joined box. The *fix itself* has not yet booted on a clone - all three scripts received the identical change and a first-boot validation on each is still pending.
+
 ## [v1.5] - 2026-07-17
 
 ### Added

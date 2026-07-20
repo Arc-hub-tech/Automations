@@ -1003,8 +1003,25 @@ if ($true) {
             if ($DomainOU) {
                 $scriptLines.Add("    `$params.OUPath = $(ConvertTo-PSStringLiteral $DomainOU)")
             }
-            $scriptLines.Add('    Add-Computer @params -ErrorAction Stop')
-            $scriptLines.Add('    $needReboot = $true')
+            # Add-Computer at first boot frequently races the network/DNS coming
+            # up and returns "The system cannot find the file specified" (0x2 = the
+            # DC locator found no domain controller because the domain's SRV records
+            # weren't resolvable yet). Wait for a DC to be locatable via nltest,
+            # then retry the join itself a few times, before giving up. Emitted only
+            # for the join branch - a plain rename needs no DC.
+            $scriptLines.Add('    $domain = $params.DomainName')
+            $scriptLines.Add('    $dcFound = $false')
+            $scriptLines.Add('    for ($i = 1; $i -le 30; $i++) {')
+            $scriptLines.Add('        & nltest.exe /dsgetdc:$domain /force > $null 2>&1')
+            $scriptLines.Add('        if ($LASTEXITCODE -eq 0) { $dcFound = $true; break }')
+            $scriptLines.Add('        "$(Get-Date -Format o) waiting for DC $domain ($i/30)..." | Out-File C:\Windows\Temp\ArcDomainJoin.log -Append')
+            $scriptLines.Add('        Start-Sleep -Seconds 10')
+            $scriptLines.Add('    }')
+            $scriptLines.Add('    if (-not $dcFound) { throw "No domain controller for $domain locatable after ~5 min - DNS/network not ready at first boot." }')
+            $scriptLines.Add('    for ($j = 1; $j -le 5; $j++) {')
+            $scriptLines.Add('        try { Add-Computer @params -ErrorAction Stop; $needReboot = $true; break }')
+            $scriptLines.Add('        catch { if ($j -eq 5) { throw }; "$(Get-Date -Format o) join attempt $j failed: $($_.Exception.Message) - retrying..." | Out-File C:\Windows\Temp\ArcDomainJoin.log -Append; Start-Sleep -Seconds 15 }')
+            $scriptLines.Add('    }')
         } else {
             $scriptLines.Add('    if ($newName) { Rename-Computer -NewName $newName -Force -ErrorAction Stop; $needReboot = $true }')
         }

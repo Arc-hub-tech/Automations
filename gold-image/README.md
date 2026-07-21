@@ -12,6 +12,15 @@ Each script is run **once**, in an elevated PowerShell session, on the template 
 
 See `CHANGELOG.md` for version history.
 
+## Branching & releases
+
+The download one-liners below are **live**: whatever sits on the branch they point at is what runs on a template. So the repo uses two branches:
+
+- **`main` — production.** The one-liners here and in each script header fetch from `.../main/...`; `main` is what operators build from. Only validated releases land here, and it is **branch-protected** — changes arrive by pull request, not direct push.
+- **`develop` — work in progress.** On `develop` the same one-liners point at `.../develop/...` and `$ScriptVersion` carries a `-dev` suffix (e.g. `1.7.0-dev`), so a dev build's start-up banner is obviously not production. Do all WIP here (or on short-lived feature branches off it).
+
+**Cutting a release:** merge `develop` → `main` via PR, then as part of the cut revert the one-liner URLs to `/main/`, drop the `-dev` suffix from `$ScriptVersion` (e.g. `1.7.0-dev` → `1.7`), move `CHANGELOG` `[Unreleased]` → `[vX.Y] - <date>`, and tag `vX.Y`. All three scripts share one version — bump in lockstep.
+
 ## Run order
 
 All three scripts use the same **two-stage, download-then-run** flow.

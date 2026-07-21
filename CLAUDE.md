@@ -4,11 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-This repository is a placeholder. It currently contains only a `LICENSE` file (GPLv3) — no source code, build configuration, or documentation has been added yet.
+Active. The repository holds Arc Systems internal automation tooling, currently PowerShell:
+
+- `gold-image/` — Windows gold-image prep scripts (W11 VDI, WS2025 RDSH, WS2025 general Server) that turn a fresh VM into a sysprep-ready template. See `gold-image/README.md` and `gold-image/CHANGELOG.md`.
+- `windows-debloat/` — a standalone Windows debloat script.
 
 ## Purpose
 
-Intended home for Arc Systems internal automation tooling. Scope, language/stack, and structure have not been decided yet.
+Home for Arc Systems internal automation tooling.
+
+## Branching & release workflow
+
+The gold-image scripts are fetched at runtime via an `irm` one-liner, so whatever is on the branch that one-liner points at is **live** on any template building from it. Two branches:
+
+- **`main` = production/live**, and **branch-protected** — changes land via pull request, not direct push. The one-liners in the script headers and `gold-image/README.md` point at `/main/`. Keep it stable; never push work-in-progress here.
+- **`develop` = work in progress.** Its one-liners point at `/develop/` and `$ScriptVersion` carries a `-dev` suffix so dev builds are visually distinct. Commit WIP here (or feature branches off it).
+
+**Release cut:** merge `develop` → `main` (via PR); revert the one-liner URLs to `/main/`; drop the `-dev` suffix from `$ScriptVersion` (e.g. `1.7.0-dev` → `1.7`); move `CHANGELOG` `[Unreleased]` → `[vX.Y]`; tag `vX.Y`. All three gold-image scripts share one version — bump in lockstep.
 
 ## Secrets & safety
 

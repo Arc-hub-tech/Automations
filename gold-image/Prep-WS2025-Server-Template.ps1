@@ -580,6 +580,21 @@ Set-RegistryValue -Path $sys -Name "ConsentPromptBehaviorAdmin" -Value 5
 Set-RegistryValue -Path $sys -Name "PromptOnSecureDesktop" -Value 1
 Set-RegistryValue -Path $sys -Name "InactivityTimeoutSecs" -Value 900
 
+# Enable Remote Desktop - the standard LAN remote-admin path. fDenyTSConnections=0
+# is the "Allow remote connections to this computer" switch; then open the Remote
+# Desktop firewall group so the listener is actually reachable. The group is
+# enabled by its locale-independent resource string (@FirewallAPI.dll,-28752)
+# rather than the English "Remote Desktop" display name, so it works on any OS
+# language. NLA/TLS/high-encryption are enforced immediately below, so remote
+# access is on but hardened.
+Set-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+try {
+    Enable-NetFirewallRule -Group "@FirewallAPI.dll,-28752" -ErrorAction Stop
+    Write-Host "  Remote Desktop enabled (firewall rules opened)."
+} catch {
+    Write-Warning "  Could not open the Remote Desktop firewall rules - $($_.Exception.Message). Enable manually if RDP access is needed."
+}
+
 # RDP: require NLA, TLS security layer, high encryption (for admin RDP access)
 $rdp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
 Set-RegistryValue -Path $rdp -Name "UserAuthentication" -Value 1

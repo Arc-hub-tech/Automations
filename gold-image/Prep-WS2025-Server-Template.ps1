@@ -60,9 +60,10 @@ param([switch]$Resume)   # -Resume = stage 2 (post-reboot): re-sweep appx, then 
 
 # Version of this script, surfaced in the run banner/transcript so a build log
 # unambiguously records which revision produced an image. Bump in lockstep with
-# the CHANGELOG (all three gold-image scripts share one version); the '-dev'
-# suffix marks work still in [Unreleased] (not yet cut to a validated release).
-$ScriptVersion = '1.6.0-dev'
+# the CHANGELOG (all three gold-image scripts share one version); use a '-dev'
+# suffix (e.g. 1.7.0-dev) while work accumulates under [Unreleased], and drop it
+# when that work is cut to a released version.
+$ScriptVersion = '1.6'
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'

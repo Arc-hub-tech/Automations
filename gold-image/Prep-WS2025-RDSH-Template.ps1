@@ -63,6 +63,12 @@
 #Requires -RunAsAdministrator
 param([switch]$Resume)   # -Resume = stage 2 (post-reboot): re-sweep appx, then prompt + sysprep
 
+# Version of this script, surfaced in the run banner/transcript so a build log
+# unambiguously records which revision produced an image. Bump in lockstep with
+# the CHANGELOG (all three gold-image scripts share one version); the '-dev'
+# suffix marks work still in [Unreleased] (not yet cut to a validated release).
+$ScriptVersion = '1.6.0-dev'
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 $Work = "$env:TEMP\RDSHPrep"
@@ -238,6 +244,7 @@ $LogFile = Join-Path $LogDir ("Prep-WS2025-RDSH-Template_{0}.log" -f (Get-Date -
 Start-Transcript -Path $LogFile -Append | Out-Null
 trap { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null }
 Write-Host "Logging this run to $LogFile" -ForegroundColor DarkGray
+Write-Host ("Prep-WS2025-RDSH-Template.ps1  v{0}" -f $ScriptVersion) -ForegroundColor Cyan
 
 # ---------------------------------------------------------------
 # STAGE 2 (-Resume): runs after the stage-1 reboot, relaunched by the one-time

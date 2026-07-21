@@ -2,6 +2,10 @@
 
 All notable changes to `Prep-W11-VDI-GoldenImage.ps1`, `Prep-WS2025-RDSH-Template.ps1`, and `Prep-WS2025-Server-Template.ps1`.
 
+## [Unreleased]
+
+_Work in progress on the `develop` branch. `$ScriptVersion` is `1.7.0-dev` here; the download one-liners point at `/develop/`. On the v1.7 release cut these revert to `/main/` and `$ScriptVersion` drops to `1.7`._
+
 ## [v1.6] - 2026-07-21
 
 ### Added

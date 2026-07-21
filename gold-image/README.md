@@ -25,7 +25,7 @@ All three scripts use the same **two-stage, download-then-run** flow.
    | WS2025 Server | `Prep-WS2025-Server-Template.ps1` |
 
    ```powershell
-   $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p
+   $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p
    ```
    Note the standing-admin password when prompted. **Stage 1** installs/configures/writes the answer file, sets a temporary one-shot auto-logon, then reboots automatically. The VM **auto-logs-in** and **stage 2** resumes by itself (via a one-time elevated scheduled task): re-sweeps appx, checks BitLocker, and **prompts yes/no before syspreping**. Logged to `C:\ArcLogs\GoldImagePrep\`.
 

@@ -11,7 +11,7 @@
     (multi-line paste breaks in the console) - it saves the script next
     to the logs under C:\ArcLogs\GoldImagePrep, then runs it:
 
-       $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/main/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p
+       $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p
 
     Why download-then-run (not `irm | iex`): this is a two-stage build -
     stage 1 installs/configures then REBOOTS to flush pending operations;
@@ -53,7 +53,7 @@ param([switch]$Resume)   # -Resume = stage 2 (post-reboot): re-sweep appx, then 
 # the CHANGELOG (all three gold-image scripts share one version); use a '-dev'
 # suffix (e.g. 1.7.0-dev) while work accumulates under [Unreleased], and drop it
 # when that work is cut to a released version.
-$ScriptVersion = '1.6'
+$ScriptVersion = '1.7.0-dev'
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # Invoke-WebRequest is dramatically faster with the progress UI off

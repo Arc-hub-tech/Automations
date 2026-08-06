@@ -1,0 +1,119 @@
+; ============================================================================
+;  Arc Systems - Workstation baseline v1  (LGPO text format)
+; ============================================================================
+;  This file is the SOURCE OF TRUTH for the local-policy baseline. It is applied
+;  to a machine's Local Group Policy by Apply-Baseline.ps1 (via LGPO.exe /t),
+;  which re-asserts it on a schedule so any drift self-heals back to this state.
+;
+;  FORMAT (LGPO.exe text format - one stanza per setting, blank line between):
+;      <Computer|User>            <- which hive: HKLM (Computer) or HKCU (User)
+;      <registry key path>        <- relative to the hive root, no HKLM\/HKCU\ prefix
+;      <value name>
+;      <TYPE:data>                <- DWORD:1, SZ:text, or DELETE to remove a value
+;  Lines starting with ';' are comments. To REMOVE a setting a previous version
+;  set, don't just delete its stanza (LGPO won't un-set it) - change the last
+;  line to DELETE so the re-apply actively clears it.
+;
+;  This is a STARTER baseline - safe, well-known, registry/policy-backed hardening
+;  that mirrors the CE+/ISO 27001 posture the gold-image scripts already apply.
+;  Review and edit it down to Arc's actual standard before rolling out. Every
+;  change here is a versioned, PR-reviewed edit (see gpo/README.md).
+; ============================================================================
+
+; --- Network: turn off LLMNR (removes a common credential-relay/poisoning path)
+Computer
+Software\Policies\Microsoft\Windows NT\DNSClient
+EnableMulticast
+DWORD:0
+
+; --- Removable media: disable AutoRun on every drive type (0xFF = 255)
+Computer
+Software\Microsoft\Windows\CurrentVersion\Policies\Explorer
+NoDriveTypeAutoRun
+DWORD:255
+
+; --- Removable media: turn off AutoPlay for non-volume devices
+Computer
+Software\Policies\Microsoft\Windows\Explorer
+NoAutoplayfornonVolume
+DWORD:1
+
+; --- SmartScreen: on for Explorer, block (not just warn) on unrecognised apps
+Computer
+Software\Policies\Microsoft\Windows\System
+EnableSmartScreen
+DWORD:1
+
+Computer
+Software\Policies\Microsoft\Windows\System
+ShellSmartScreenLevel
+SZ:Block
+
+; --- UAC: keep enabled, prompt admins for consent on the secure desktop
+Computer
+Software\Microsoft\Windows\CurrentVersion\Policies\System
+EnableLUA
+DWORD:1
+
+Computer
+Software\Microsoft\Windows\CurrentVersion\Policies\System
+ConsentPromptBehaviorAdmin
+DWORD:2
+
+Computer
+Software\Microsoft\Windows\CurrentVersion\Policies\System
+PromptOnSecureDesktop
+DWORD:1
+
+; --- Sign-in: don't display the last signed-in user's name
+Computer
+Software\Microsoft\Windows\CurrentVersion\Policies\System
+DontDisplayLastUserName
+DWORD:1
+
+; --- Session: lock the machine after 15 min (900s) of inactivity at the lock/logon UI
+Computer
+Software\Microsoft\Windows\CurrentVersion\Policies\System
+InactivityTimeoutSecs
+DWORD:900
+
+; --- Windows Installer: never install MSIs with elevated (SYSTEM) privileges
+Computer
+Software\Policies\Microsoft\Windows\Installer
+AlwaysInstallElevated
+DWORD:0
+
+; --- Logging: enable PowerShell script-block logging (feeds Sentinel/EDR)
+Computer
+Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging
+EnableScriptBlockLogging
+DWORD:1
+
+; --- Credentials: stop WDigest caching cleartext credentials in LSASS
+;     (not a Policies key, so it tattoos - fine here, the schedule re-asserts it)
+Computer
+System\CurrentControlSet\Control\SecurityProviders\WDigest
+UseLogonCredential
+DWORD:0
+
+; --- Per-user: secure screensaver, locks the desktop after 15 min idle
+User
+Software\Policies\Microsoft\Windows\Control Panel\Desktop
+ScreenSaveActive
+SZ:1
+
+User
+Software\Policies\Microsoft\Windows\Control Panel\Desktop
+ScreenSaverIsSecure
+SZ:1
+
+User
+Software\Policies\Microsoft\Windows\Control Panel\Desktop
+ScreenSaveTimeOut
+SZ:900
+
+; --- Per-user: never install MSIs elevated (pairs with the Computer-side value)
+User
+Software\Policies\Microsoft\Windows\Installer
+AlwaysInstallElevated
+DWORD:0

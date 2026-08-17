@@ -1,6 +1,6 @@
 <#
     Read-ArcCapacityBuffer.ps1
-    Arc (U.K.) Systems Ltd - Platform & Infrastructure
+    Datto capacity sampling toolset - Platform & Infrastructure
 
     This is the real logic for DATTO RMM COMPONENT 2 of 3 ("Arc - Capacity Analyse"),
     but it is NOT what's pasted into that Datto component - Invoke-ArcCapacityAnalyse.ps1
@@ -34,8 +34,9 @@
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
 
-    Version : 1.3  -  17/08/2026  (header updated: now fetched by Invoke-ArcCapacityAnalyse.ps1
-              rather than pasted into Datto directly - no logic change)
+    Version : 1.4  -  17/08/2026  (header updated: now fetched by Invoke-ArcCapacityAnalyse.ps1
+              rather than pasted into Datto directly; removed the company-name header credit
+              for public-repo visibility - no logic change)
 #>
 
 #Requires -Version 5.1

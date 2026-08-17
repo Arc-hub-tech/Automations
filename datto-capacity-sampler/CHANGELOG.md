@@ -1,0 +1,125 @@
+# Changelog
+
+All notable changes to the Datto capacity sampler tooling (`Deploy-ArcCapacitySampler.ps1`,
+`Arc-CapacitySampler.ps1`, `Read-ArcCapacityBuffer.ps1`, `Get-ArcCapacityScreen.ps1`). Each
+script versions independently — see its own header comment for its current version.
+
+## [Unreleased]
+
+_Work in progress on the `develop` branch._
+
+### Fixed
+_Found by a pre-commit code review of the changes below; see each item for what was wrong and why._
+- **Missing TLS 1.2 enforcement (`Deploy-ArcCapacitySampler.ps1` v1.2, `Invoke-ArcCapacityAnalyse.ps1`
+  / `Invoke-ArcCapacityScreen.ps1` v1.1).** None of the three GitHub-fetching scripts forced TLS
+  1.2 before calling `Invoke-WebRequest` against `raw.githubusercontent.com`, even though
+  `gpo/Apply-Baseline.ps1` and `gpo/Register-DriftTask.ps1` already carry this exact fix in this
+  same repo. Windows Server 2012R2/early 2016 — explicitly a supported OS per these scripts' own
+  headers — doesn't default to TLS 1.2, and GitHub's raw-content CDN requires it, so every fetch
+  would have failed outright on that OS tier with no obvious diagnostic. Fixed by setting
+  `[Net.ServicePointManager]::SecurityProtocol = Tls12` at the top of all three scripts.
+- **A permanently broken fetch looked identical to a one-off blip, forever (`Deploy-ArcCapacitySampler.ps1`
+  v1.2).** A bad `usrBranch` or a proxy permanently blocking GitHub produced the same WARNING as a
+  transient failure, indefinitely, with no escalation. Now tracks consecutive fetch failures in
+  `deploy-fetch-state.json` beside the payload and escalates to a genuine `FAILED` status (and
+  non-zero exit) after 7 consecutive daily failures, resetting to 0 on the next success.
+- **`usrSeedNow` still defaulted to forcing a sample on every run (`Deploy-ArcCapacitySampler.ps1`
+  v1.2).** Recommending a daily schedule (this same changeset, below) without revisiting this
+  meant every device would force an extra off-cycle sample plus a 12-second blocking wait once a
+  day instead of roughly 12x/year. Now auto-detects a genuinely fresh install and only seeds then,
+  regardless of the `usrSeedNow` value — no operator action needed.
+- **SQL counter cache locked in a total resolution failure for 30 days (`Arc-CapacitySampler.ps1`
+  v1.3).** If SQL's Memory Manager/Buffer Manager counter sets failed to resolve even once (e.g.
+  moments after a SQL install/reboot, before perf counters register), that null result was cached
+  for the full 30-day `$CacheDays` window with no retry path. Now only caches a resolution that
+  found at least one counter set; a total failure retries on the next 15-minute sample instead.
+  Pre-existing logic carried over from the original bundle, not introduced by the disk-guard work
+  below, but surfaced by the same review pass.
+- **Buffer directory creation could throw unhandled ahead of the new disk guard (`Arc-CapacitySampler.ps1`
+  v1.3).** `New-Item` for the buffer directory ran outside the main try/catch and before the disk
+  guard (which needs the directory to already exist to log to it) — if the directory was ever
+  missing while the drive was already critically low, this would crash with a raw error instead of
+  the guard's intended clean skip. Now wrapped so it fails the same clean way.
+- **Disk guard relied on catching an exception for non-local `-BufferPath` values (`Arc-CapacitySampler.ps1`
+  v1.3).** `System.IO.DriveInfo` throws for a UNC path; the guard caught this and silently disabled
+  itself, correctly in outcome (the guard is cosmetic, not a disk-space safeguard - see below) but
+  via exception-driven control flow. Now checks the path shape first and treats a non-drive-letter
+  `-BufferPath` as an intentional "guard not applicable" case with the same fail-open result.
+- **Fetch/retry logic duplicated 3x with no "keep in sync" signal.** `Deploy-ArcCapacitySampler.ps1`,
+  `Invoke-ArcCapacityAnalyse.ps1` and `Invoke-ArcCapacityScreen.ps1` each independently implement
+  the same retry block (unavoidable — they're pasted separately into Datto's console with no
+  shared file available at runtime), but nothing marked them as needing to move together. Each now
+  carries a `KEEP THIS RETRY LOOP IN SYNC` comment naming the other two files.
+- **No fallback if the weekly/ad-hoc stub's fetch failed (`Invoke-ArcCapacityAnalyse.ps1` /
+  `Invoke-ArcCapacityScreen.ps1` v1.1).** Unlike Component 1's git → attachment → keep-existing
+  chain, a fetch failure here skipped the entire run outright. Both stubs now cache the last
+  successfully-fetched copy of their target script under
+  `C:\ProgramData\Arc\CapacitySampler\cache\` and run that on a fetch failure instead of skipping
+  — only reporting `FETCH_FAILED` if no cached copy exists yet (a component's first-ever run).
+- **`exit $LASTEXITCODE` after `& $Local` depended on an unenforced contract (`Invoke-ArcCapacityAnalyse.ps1`
+  / `Invoke-ArcCapacityScreen.ps1` v1.1).** Not a live bug — every current branch of
+  `Read-ArcCapacityBuffer.ps1`/`Get-ArcCapacityScreen.ps1` calls an explicit `exit` — but a future
+  edit adding a bare `return` would leave `$LASTEXITCODE` stale/null, and `exit $null` reports
+  success (0) regardless of what happened. Now resets `$LASTEXITCODE` to `$null` before invoking
+  the fetched script and fails closed (`exit 1`) if it's still `$null` afterwards.
+- One candidate from the same review — a theory that an empty `samples.csv` could cause
+  `Export-Csv -Append` to silently write headerless rows — was investigated and refuted by direct
+  testing; no change made.
+
+### Added
+- **Low disk space guard in `Arc-CapacitySampler.ps1` (v1.2).** Skips a sample cleanly (logged,
+  exit 0) if its buffer's drive has under 500MB free (`$MinFreeMB`, hardcoded default — not
+  wired through Datto variables). Not intended to relieve disk pressure — the buffer/log
+  footprint is a few hundred KB regardless — the point is failing clean rather than repeating a
+  write error every 15 minutes on an already-critical drive. Datto's own low-disk-space
+  monitor/alert is assumed present and covers the actual incident; this only avoids noisy
+  failures and leaves a visible coverage gap in `Cap: Window` for the affected period.
+
+- **Git as the source of truth for deployed monitors, so a revision needs a git merge, not a
+  Datto re-paste.** Three scripts are now pasted into their Datto components once and fetch the
+  real payload/logic fresh from this repo's raw content (branch selectable per-component via a
+  new `usrBranch` variable, default `main`) on every run:
+  - `Deploy-ArcCapacitySampler.ps1` (v1.1) — now fetches `Arc-CapacitySampler.ps1` from git first
+    (3 attempts with backoff), hash-compares it against the on-device copy, and only redeploys if
+    it changed. The file attachment is now an **optional fallback** for a device's first deploy
+    if the fetch is briefly unreachable — no longer required. A fetch failure on a device that
+    already has the sampler installed just logs a warning and leaves the existing payload
+    running untouched, rather than failing the job. Recommended schedule changed from monthly to
+    **daily**, since the daily run is what turns a git merge into a same-day fleet update.
+  - `Invoke-ArcCapacityAnalyse.ps1` (v1.0, new) — bootstrap stub pasted into `Arc — Capacity
+    Analyse`. Fetches and runs `Read-ArcCapacityBuffer.ps1` from git on every (weekly) run; that
+    existing weekly cadence is itself the check-back, no separate timer needed. Fails the job
+    with `CapacityStatus=FETCH_FAILED` after 3 retries, since a weekly job failing is easy to
+    notice and re-run.
+  - `Invoke-ArcCapacityScreen.ps1` (v1.0, new) — same pattern for `Arc — Capacity Screen`,
+    fetching and running `Get-ArcCapacityScreen.ps1`; fails with `ScreenStatus=FETCH_FAILED`.
+  - `Read-ArcCapacityBuffer.ps1` (v1.3) and `Get-ArcCapacityScreen.ps1` (v1.1) — header comments
+    only, updated to state that these are now fetched by their respective bootstrap stub rather
+    than pasted into Datto directly. No logic change.
+  - `README.md` restructured accordingly: component table now distinguishes what's actually
+    pasted into Datto from what's fetched, `Branching & releases` describes the fetch-and-hash
+    delivery model and the daily/weekly cadence split, Deployment/Troubleshooting/Rollback
+    sections updated for `usrBranch` and the new `FETCH_FAILED` / fallback states.
+
+- **Brought into the repo.** Initial import of the Datto RMM capacity-sampling toolset:
+  - `Deploy-ArcCapacitySampler.ps1` (v1.0) — Component 1, installs the on-device sampler and its
+    scheduled task (SYSTEM, boot trigger, idempotent/hash-checked payload copy).
+  - `Arc-CapacitySampler.ps1` (v1.1) — on-device 15-minute sampler, file attachment on Component
+    1. Committed Bytes / Available MBytes / hard fault rate, total + max-core CPU + processor
+    queue length, RDSH session count, SQL Total/Target Server Memory + PLE with a cached counter
+    set resolution. CSV ring buffer with schema-change detection (archives the old buffer rather
+    than throwing on an `Export-Csv -Append` schema mismatch).
+  - `Read-ArcCapacityBuffer.ps1` (v1.2) — Component 2, weekly aggregation of the buffer into
+    percentile RAM/CPU demand, role detection (DC/SQL/Exchange/RDSH/File server/Veeam/Generic)
+    with role-based floors and RAM-sizing exclusions, pressure guardrails (mem pressure,
+    single-thread bound, CPU pressure), UDF 60–66 write-back, optional per-device CSV export, and
+    a conservative short-window mode (max×1.4, gross-only, forced below a 7-day window).
+  - `Get-ArcCapacityScreen.ps1` (v1.0) — Component 3, same-day over-allocation screen with no
+    buffer history required (peak working-set sum as a conservative upper bound, average CPU
+    since boot from idle time, no vCPU recommendation), UDF 70–73 write-back, uptime gate.
+  - Status: Pilot — built and pilot-tested per the rollout plan in `README.md`; full estate
+    rollout in progress as of 14/08/2026.
+  - No functional changes made during import — scripts carried over as authored; only the
+    accompanying documentation was restructured into this repo's `README.md`/`CHANGELOG.md`
+    convention, and site-identifying examples (real hostnames/site names) were replaced with
+    placeholders.

@@ -1,6 +1,6 @@
 # Datto capacity sampler
 
-Estate-wide RAM and CPU white-space measurement for Arc-managed Windows servers, delivered as
+Estate-wide RAM and CPU white-space measurement for monitored Windows servers, delivered as
 Datto RMM components. Guest-side demand only — Committed Bytes rather than `FreePhysicalMemory`,
 highest single-core utilisation rather than just total — drives right-sizing recommendations,
 with role-aware floors/exclusions and pressure guardrails so a bad reading **suppresses** a
@@ -189,10 +189,10 @@ Analyse values are not.
 ### Target filter
 
 Create a device filter rather than using the built-in "All Windows Servers" filter — scope it to
-only the servers you actually control the sizing decision for. Filter on `Operating System
-contains Server` plus whatever site/tag/group boundary matches that scope in your Datto account;
-including anything outside it makes the aggregate reclaim figure meaningless. Fall back to a
-device-level exclusion for any edge cases a filter can't cleanly separate.
+your target servers. Filter on `Operating System contains Server` plus whatever site/tag/group
+boundary matches that scope; including anything outside it makes the aggregate reclaim figure
+meaningless. Fall back to a device-level exclusion for any edge cases a filter can't cleanly
+separate.
 
 ### Pilot
 

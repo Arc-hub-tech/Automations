@@ -188,11 +188,11 @@ Analyse values are not.
 
 ### Target filter
 
-Create a device filter rather than using the built-in "All Windows Servers" filter.
-**Co-location customers must be excluded** — they run their own estates, their guests aren't
-Arc's to right-size, and including them makes the aggregate reclaim figure meaningless. Filter on
-the hosted platform sites plus `Operating System contains Server`. Where co-location and managed
-workloads share a site, use a device-level exclusion instead.
+Create a device filter rather than using the built-in "All Windows Servers" filter — scope it to
+only the servers you actually control the sizing decision for. Filter on `Operating System
+contains Server` plus whatever site/tag/group boundary matches that scope in your Datto account;
+including anything outside it makes the aggregate reclaim figure meaningless. Fall back to a
+device-level exclusion for any edge cases a filter can't cleanly separate.
 
 ### Pilot
 
@@ -346,8 +346,8 @@ $rows | Sort-Object { [int]$_.ReclaimGB } -Descending |
 The components run as SYSTEM under the machine account, so the share needs write for `Domain
 Computers` on both share and NTFS permissions. If permissions are wrong the components still
 report success and skip the export, with a line in the activity log. `EffectiveCores` and
-`CommitP95GB` in the export feed platform pod sizing directly, so the same dataset answers the
-overcommit ratio question without a second pass.
+`CommitP95GB` in the export feed platform capacity planning directly, so the same dataset answers
+the overcommit ratio question without a second pass.
 
 ## Verification
 
@@ -453,9 +453,9 @@ need removing from Datto to roll back a *logic* revision — just merge the prev
 
 **Datto only ever sees the guest.** No ballooning, no swap-in rate, no CPU ready time. Guest-side
 demand is the correct input for right-sizing allocations, which is where most of the white space
-sits — but hypervisor-side allocated-vs-active needs Prism Central for the Nutanix estate or
-RVTools for VMware. Use both: RVTools/Prism Central for the hypervisor view, this for the in-guest
-truth.
+sits — but hypervisor-side allocated-vs-active needs your hypervisor's own reporting (e.g. Nutanix
+Prism Central, VMware RVTools, or the equivalent for your platform). Use both: the hypervisor view
+for allocated-vs-active, this tool for the in-guest truth.
 
 **The domain controller RAM floor is a flat 4GB, and this is wrong.** ESE sizes the AD database
 cache dynamically against available memory, so a DC's committed bytes partly reflects what it was

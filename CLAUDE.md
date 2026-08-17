@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Active. The repository holds Arc Systems internal automation tooling, currently PowerShell:
 
 - `gold-image/` — Windows gold-image prep scripts (W11 VDI, WS2025 RDSH, WS2025 general Server) that turn a fresh VM into a sysprep-ready template. See `gold-image/README.md` and `gold-image/CHANGELOG.md`.
+- `datto-capacity-sampler/` — Datto RMM components that sample guest RAM/CPU demand across the server estate (15-min on-device buffer, weekly percentile aggregation, plus a same-day screen) and write right-sizing recommendations to UDFs. Delivered by pasting/attaching scripts into Datto Automation components, not a runtime `irm` fetch. Each script versions independently. See `datto-capacity-sampler/README.md` and `datto-capacity-sampler/CHANGELOG.md`.
 - `windows-debloat/` — a standalone Windows debloat script.
 
 ## Purpose

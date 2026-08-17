@@ -1,6 +1,6 @@
 <#
     Deploy-ArcCapacitySampler.ps1
-    Arc (U.K.) Systems Ltd - Platform & Infrastructure
+    Datto capacity sampling toolset - Platform & Infrastructure
 
     DATTO RMM COMPONENT 1 of 2  -  Script (PowerShell), Windows, Devices
 
@@ -32,9 +32,10 @@
                                                         the daily schedule doesn't force
                                                         a redundant sample every run
 
-    Version : 1.2  -  17/08/2026  (TLS 1.2; escalates to FAILED after 7 consecutive fetch
+    Version : 1.3  -  17/08/2026  (TLS 1.2; escalates to FAILED after 7 consecutive fetch
               failures instead of an indefinite WARNING; seed-on-deploy now fires only on a
-              genuinely fresh install, not every daily run)
+              genuinely fresh install, not every daily run; removed the company-name header
+              credit and scheduled task Author field for public-repo visibility)
 #>
 
 #Requires -Version 5.1
@@ -296,7 +297,7 @@ try {
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Author>Arc (U.K.) Systems Ltd</Author>
+    <Author>Datto RMM Automation</Author>
     <Description>Samples committed memory, CPU utilisation and per-core spread to a rolling buffer for platform capacity right-sizing. Managed by Datto RMM - do not modify manually.</Description>
     <URI>$FullTask</URI>
   </RegistrationInfo>

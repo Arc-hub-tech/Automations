@@ -8,6 +8,14 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Changed
+- **Removed the company-name credit from every script header and from the scheduled task's
+  `<Author>` field** (all six `.ps1` files bumped a patch version). These scripts live in a
+  public repo; the literal entity name doesn't need to be in the file headers or baked into
+  metadata a device's Task Scheduler exposes. Functional "Arc"-branded identifiers — the install
+  path, scheduled task name, script names, and Datto component naming — are unchanged, since
+  already-deployed devices depend on them and renaming those is a separate, bigger exercise.
+
 ### Fixed
 _Found by a pre-commit code review of the changes below; see each item for what was wrong and why._
 - **Missing TLS 1.2 enforcement (`Deploy-ArcCapacitySampler.ps1` v1.2, `Invoke-ArcCapacityAnalyse.ps1`

@@ -1,6 +1,6 @@
 <#
     Invoke-ArcCapacityAnalyse.ps1
-    Arc (U.K.) Systems Ltd - Platform & Infrastructure
+    Datto capacity sampling toolset - Platform & Infrastructure
 
     DATTO RMM COMPONENT 2 of 3  -  Script (PowerShell), Windows, Devices
 
@@ -27,7 +27,8 @@
                                                    point a pilot device at 'develop'
                                                    to test a revision before merging
 
-    Version : 1.1  -  17/08/2026  (TLS 1.2, fail-closed exit code, last-good-copy cache fallback)
+    Version : 1.2  -  17/08/2026  (TLS 1.2, fail-closed exit code, last-good-copy cache fallback,
+              removed the company-name header credit for public-repo visibility)
 #>
 
 #Requires -Version 5.1

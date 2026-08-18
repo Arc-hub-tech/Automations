@@ -27,9 +27,12 @@
                                                    point a pilot device at 'develop'
                                                    to test a revision before merging
 
-    Version : 1.3  -  18/08/2026  (TLS 1.2, fail-closed exit code, last-good-copy cache fallback,
-              removed the company-name header credit and internal team byline for
-              public-repo visibility)
+    Version : 1.4  -  18/08/2026  (fixed a confirmed production bug on ARC-DC03:
+              $LASTEXITCODE does not reliably propagate across the & $Local invocation
+              in Datto's actual execution environment, so a genuinely successful run
+              was being reported as a failure. Success/failure is now determined from
+              the fetched script's own <-Start Result-> block - ScreenStatus whitelisted
+              against known-OK values - rather than the process exit code)
 #>
 
 #Requires -Version 5.1
@@ -102,15 +105,31 @@ if ($fetched) {
 
 Write-Output ''
 
-$LASTEXITCODE = $null
-& $Local
+# $LASTEXITCODE does not reliably propagate across this invocation in Datto's
+# actual execution environment - confirmed in production (ARC-DC03): a
+# genuinely successful NO_ACTION run reached its own `exit 0` and still left
+# $LASTEXITCODE unset here. Whatever Datto's component runner does differs
+# from a plain `powershell.exe -File` invocation in a way that breaks that
+# propagation, so don't rely on it. The <-Start Result-> block Get-ArcCapacityScreen.ps1
+# writes IS reliable (it's plain Write-Output, captured the same way as
+# everything else this stub prints) - use that as the success/failure signal
+# instead. Whitelist the known-OK statuses rather than blocklist known-bad
+# ones, so a status this stub hasn't seen before (a future addition, or
+# ScreenStatus=BAD_UDF_BASE, which the real script already treats as a
+# failure) fails closed by default instead of silently passing.
+& $Local | Tee-Object -Variable capturedOutput
+$resultText = $capturedOutput -join "`n"
 
-if ($null -eq $LASTEXITCODE) {
-    # Every current branch of Get-ArcCapacityScreen.ps1 calls an explicit exit,
-    # but that's an implicit contract with a file that's fetched and can change
-    # independently of this stub. Fail closed rather than let a future branch
-    # that returns without exiting read as a silent success.
-    Write-Output 'Get-ArcCapacityScreen.ps1 returned without an exit code - treating as a failure'
+if ($resultText -notmatch '<-Start Result->') {
+    Write-Output ''
+    Write-Output 'Get-ArcCapacityScreen.ps1 produced no <-Start Result-> block - treating as a failure'
     exit 1
 }
-exit $LASTEXITCODE
+$statusMatch = [regex]::Match($resultText, 'ScreenStatus=(\S+)')
+$okStatuses  = @('CANDIDATE', 'LOW_UPTIME', 'NO_ACTION')
+if (-not $statusMatch.Success -or ($okStatuses -notcontains $statusMatch.Groups[1].Value)) {
+    Write-Output ''
+    Write-Output "Get-ArcCapacityScreen.ps1 reported ScreenStatus=$($statusMatch.Groups[1].Value) - treating as a failure"
+    exit 1
+}
+exit 0

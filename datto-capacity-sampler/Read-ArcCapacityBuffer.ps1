@@ -1,6 +1,6 @@
 <#
     Read-ArcCapacityBuffer.ps1
-    Datto capacity sampling toolset - Platform & Infrastructure
+    Datto capacity sampling toolset
 
     This is the real logic for DATTO RMM COMPONENT 2 of 3 ("Arc - Capacity Analyse"),
     but it is NOT what's pasted into that Datto component - Invoke-ArcCapacityAnalyse.ps1
@@ -55,11 +55,12 @@
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
 
-    Version : 1.5  -  17/08/2026  (proper under-provisioning detection: growth-sizing
-              recommendation for RAM and vCPU, symmetric with the existing
-              reclaim/reduce logic and sharing the same target computation. New UDFs
-              Custom67 Growth GB, Custom68 Growth vCPU, Custom69 Growth Verdict -
-              usrUdfBase now needs 10 consecutive fields instead of 7)
+    Version : 1.6  -  18/08/2026  (removed the internal team byline for public-repo
+              visibility - no logic change. Previous: 1.5 added proper
+              under-provisioning detection - growth-sizing recommendation for RAM and vCPU,
+              symmetric with the existing reclaim/reduce logic and sharing the same target
+              computation. New UDFs Custom67 Growth GB, Custom68 Growth vCPU, Custom69
+              Growth Verdict - usrUdfBase now needs 10 consecutive fields instead of 7)
 #>
 
 #Requires -Version 5.1

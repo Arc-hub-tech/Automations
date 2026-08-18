@@ -1,6 +1,6 @@
 <#
     Invoke-ArcCapacityAnalyse.ps1
-    Datto capacity sampling toolset - Platform & Infrastructure
+    Datto capacity sampling toolset
 
     DATTO RMM COMPONENT 2 of 3  -  Script (PowerShell), Windows, Devices
 
@@ -27,8 +27,9 @@
                                                    point a pilot device at 'develop'
                                                    to test a revision before merging
 
-    Version : 1.2  -  17/08/2026  (TLS 1.2, fail-closed exit code, last-good-copy cache fallback,
-              removed the company-name header credit for public-repo visibility)
+    Version : 1.3  -  18/08/2026  (TLS 1.2, fail-closed exit code, last-good-copy cache fallback,
+              removed the company-name header credit and internal team byline for
+              public-repo visibility)
 #>
 
 #Requires -Version 5.1

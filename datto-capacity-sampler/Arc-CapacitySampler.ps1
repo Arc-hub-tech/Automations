@@ -1,6 +1,6 @@
 <#
     Arc-CapacitySampler.ps1
-    Datto capacity sampling toolset - Platform & Infrastructure
+    Datto capacity sampling toolset
 
     Purpose : Single-shot capacity sample written to a rolling CSV ring buffer.
               Invoked by scheduled task 'Arc Capacity Sampler' every 15 minutes.
@@ -25,11 +25,12 @@
               rather than repeat a write error every 15 minutes. Datto's own
               low-disk-space monitor is the actual alert for that condition.
 
-    Version : 1.4  -  17/08/2026  (directory creation now fails clean instead of throwing
+    Version : 1.5  -  18/08/2026  (directory creation now fails clean instead of throwing
               on a critically-low first install; SQL counter cache no longer locks in a
               total resolution failure for 30 days; disk guard skips UNC/non-drive paths
               by pattern check instead of relying on a caught exception; removed the
-              company-name header credit for public-repo visibility)
+              company-name header credit and the internal team byline for public-repo
+              visibility)
 #>
 
 #Requires -Version 5.1

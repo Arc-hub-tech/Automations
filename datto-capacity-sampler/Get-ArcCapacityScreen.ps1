@@ -1,6 +1,6 @@
 <#
     Get-ArcCapacityScreen.ps1
-    Datto capacity sampling toolset - Platform & Infrastructure
+    Datto capacity sampling toolset
 
     This is the real logic for DATTO RMM COMPONENT 3 of 3 ("Arc - Capacity Screen"),
     but it is NOT what's pasted into that Datto component - Invoke-ArcCapacityScreen.ps1
@@ -40,9 +40,9 @@
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
 
-    Version : 1.2  -  17/08/2026  (header updated: now fetched by Invoke-ArcCapacityScreen.ps1
+    Version : 1.3  -  18/08/2026  (header updated: now fetched by Invoke-ArcCapacityScreen.ps1
               rather than pasted into Datto directly; removed the company-name header credit
-              for public-repo visibility - no logic change)
+              and internal team byline for public-repo visibility - no logic change)
 #>
 
 #Requires -Version 5.1

@@ -193,6 +193,12 @@ Fields); values are per device. Datto caps UDF labels at 22 characters.
 > out-of-range value there only downgrades to a `WARNING` and skips the marker for that run rather
 > than failing the job — the actual sampler deploy must never fail over an auxiliary field.
 
+### `Arc — Capacity Sampler Deploy` (default field 79, 1 field, valid 1–300)
+
+| UDF | Suggested label | Content | Example |
+|---|---|---|---|
+| Custom79 | `Cap: Enrolled` | Enrollment marker — see **Self-maintaining device filter** | `ENROLLED \| 18/08/2026 22:15` |
+
 ### `Arc — Capacity Analyse` (default base 60, 10 consecutive fields, valid 1–291)
 
 | UDF | Suggested label | Content | Example |
@@ -312,8 +318,9 @@ once. Then run `Arc — Capacity Screen` against the same set for an immediate s
 
   #### Self-maintaining device filter
 
-  Component 1 writes `ENROLLED | <date/time>` to `Custom79` (`usrEnrollUdf`, outside the 60–73
-  range the other two components use) on every successful run — cleared back to blank on
+  Component 1 writes `ENROLLED | <date/time>` to `Custom79` (`usrEnrollUdf`, suggested label
+  `Cap: Enrolled` — outside the 60–73 range the other two components use) on every successful
+  run — cleared back to blank on
   `usrUninstall=true`. Build a Datto Device Filter on `Custom79 is not blank` and target **all
   three components'** recurring schedules at that filter instead of a hand-maintained Device Group:
   a device gains membership the moment Component 1 first deploys to it, and loses it the moment

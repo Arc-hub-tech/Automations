@@ -27,7 +27,7 @@
                                                    point a pilot device at 'develop'
                                                    to test a revision before merging
 
-    Version : 1.4  -  18/08/2026  (fixed a confirmed production bug on ARC-DC03:
+    Version : 1.4  -  18/08/2026  (fixed a confirmed production bug:
               $LASTEXITCODE does not reliably propagate across the & $Local invocation
               in Datto's actual execution environment, so a genuinely successful run
               was being reported as a failure. Success/failure is now determined from
@@ -106,7 +106,7 @@ if ($fetched) {
 Write-Output ''
 
 # $LASTEXITCODE does not reliably propagate across this invocation in Datto's
-# actual execution environment - confirmed in production (ARC-DC03): a
+# actual execution environment - confirmed in production: a
 # genuinely successful NO_ACTION run reached its own `exit 0` and still left
 # $LASTEXITCODE unset here. Whatever Datto's component runner does differs
 # from a plain `powershell.exe -File` invocation in a way that breaks that

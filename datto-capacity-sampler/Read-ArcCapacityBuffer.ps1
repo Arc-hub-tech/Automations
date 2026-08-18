@@ -11,32 +11,55 @@
     Purpose : Reads the rolling buffer written by Arc-CapacitySampler.ps1, computes
               percentile demand for memory and CPU, applies role-based floors and
               pressure guardrails, and stamps the result into user-defined fields
-              for Devices grid export.
+              for Devices grid export. Sizes in both directions - reclaim when
+              over-allocated, growth when under-provisioned - from one shared target.
 
     Sizing logic
       RAM   Target      = max( RoleFloor , p95 Committed x 1.25 )
-            Reclaim     = Allocated - Target, floored to a 2GB increment,
-                          suppressed below 4GB (not worth a change window).
+            Reclaim     = Allocated - Target when positive, floored to a 2GB
+                          increment, suppressed below 4GB (not worth a change window)
+            Growth      = Target - Allocated when positive, ceilinged to a 2GB
+                          increment. Escalates independently of Target whenever the
+                          memory-pressure guardrail is active (min available <1GB or
+                          p95 faults >10/s), using max Committed rather than p95 -
+                          active thrashing is a peak problem, not a typical-case one -
+                          with the same mode-appropriate multiplier as the primary
+                          target (shared via Get-SizingTarget, so the two can't drift
+                          onto different multipliers). If pressure is active but even
+                          that escalation shows no shortfall, flags REVIEW rather than
+                          forcing a number the math doesn't support.
       CPU   EffCores    = (p95 Total% / 100) x vCPU
-            Recommended = ceil( EffCores / 0.65 ), rounded up to an even count.
+            Reduce      = current vCPU minus ceil( EffCores / 0.65 ) [rounded even]
+                          when that's lower than current
+            Growth      = ceil( EffCores / 0.65 ) [rounded even] minus current vCPU
+                          when that's higher than current. Queue-driven CPU pressure
+                          that the total%-based model doesn't catch (e.g. many
+                          short-lived threads) is flagged for manual review instead
+                          of forcing a fabricated core count.
 
     Guardrails - any of these suppress the recommendation rather than degrade it:
       - Sample coverage below 60% of the expected window
-      - Minimum Available memory under 1GB, or p95 hard faults above 10/sec
-      - p95 max-core above 85% while total is near the single-thread ceiling
-      - Role exclusions: SQL, Exchange, Veeam proxy/repository
+      - Minimum Available memory under 1GB, or p95 hard faults above 10/sec (also
+        the growth-escalation trigger above)
+      - p95 max-core above 85% while total is near the single-thread ceiling -
+        suppresses BOTH reduction and growth, since more vCPU doesn't help a
+        workload that can't spread past one core
+      - Role exclusions from RAM sizing (both directions): SQL, Exchange, Veeam
+        proxy/repository
 
     Component input variables (all optional):
-              usrUdfBase       Integer  default 60    First UDF index, uses 7 consecutive fields (1-294)
+              usrUdfBase       Integer  default 60    First UDF index, uses 10 consecutive fields (1-291)
               usrWindowDays    Integer  default 14    Analysis window
               usrInterval      Integer  default 15    Must match the sampler
               usrExportPath    String   default ''    Optional UNC for per-device CSV row
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
 
-    Version : 1.4  -  17/08/2026  (header updated: now fetched by Invoke-ArcCapacityAnalyse.ps1
-              rather than pasted into Datto directly; removed the company-name header credit
-              for public-repo visibility - no logic change)
+    Version : 1.5  -  17/08/2026  (proper under-provisioning detection: growth-sizing
+              recommendation for RAM and vCPU, symmetric with the existing
+              reclaim/reduce logic and sharing the same target computation. New UDFs
+              Custom67 Growth GB, Custom68 Growth vCPU, Custom69 Growth Verdict -
+              usrUdfBase now needs 10 consecutive fields instead of 7)
 #>
 
 #Requires -Version 5.1
@@ -81,12 +104,13 @@ if ($WindowDays -lt 7 -and -not $Conservative) {
     Write-Output "NOTE: window of $WindowDays days is under 7 - conservative mode forced."
 }
 
-# Datto RMM supports UDF 1-300 (registry values Custom1-Custom300). Seven
-# consecutive fields are required, so the highest valid base is 294.
+# Datto RMM supports UDF 1-300 (registry values Custom1-Custom300). Ten
+# consecutive fields are required (seven for reclaim/reduce, three more for
+# the growth-sizing fields), so the highest valid base is 291.
 # Fail loudly - silently falling back to a default would overwrite whatever
 # occupies the default range on every device in the job.
 $UdfMax = 300
-$UdfCount = 7
+$UdfCount = 10
 if ($UdfBase -lt 1 -or $UdfBase -gt ($UdfMax - $UdfCount + 1)) {
     Write-Output "usrUdfBase of $UdfBase is invalid - must be between 1 and $($UdfMax - $UdfCount + 1) to fit $UdfCount consecutive fields."
     Write-Output ''
@@ -134,6 +158,15 @@ function Set-Udf {
 
 function Get-Floor2   { param([double]$Value) [int]([math]::Floor($Value / 2) * 2) }
 function Get-CeilEven { param([double]$Value) $i = [int][math]::Ceiling($Value); if ($i % 2 -ne 0) { $i++ }; $i }
+
+# Shared by both the primary RAM target and the memory-pressure escalation target
+# below, so the two can never drift onto different multipliers - the escalation
+# always uses whichever multiplier the current mode (standard/conservative)
+# selected, even though it evaluates a different basis (max, not p95/basisGB).
+function Get-SizingTarget {
+    param([double]$FloorGB, [double]$BasisGB, [double]$Multiplier)
+    [math]::Max($FloorGB, [math]::Round($BasisGB * $Multiplier, 2))
+}
 
 # ---------------------------------------------------------------------------
 # Role detection
@@ -237,6 +270,7 @@ try {
         Set-Udf -Index ($UdfBase + 0) -Value $windowText
         for ($i = 1; $i -le 5; $i++) { Set-Udf -Index ($UdfBase + $i) -Value '' }
         Set-Udf -Index ($UdfBase + 6) -Value ('NO DATA IN WINDOW | ' + (Get-Date -Format 'dd/MM/yyyy HH:mm'))
+        for ($i = 7; $i -le 9; $i++) { Set-Udf -Index ($UdfBase + $i) -Value '' }
         Write-Output "No samples inside the $WindowDays day window. Buffer holds $($allRows.Count) row(s) in total."
         Write-Output ''
         Write-Output '<-Start Result->'
@@ -308,24 +342,29 @@ try {
     if ($cpuPressure) { $flags.Add('CPU-PRESSURE') }
 
     # =======================================================================
-    # RAM recommendation
+    # RAM recommendation - reclaim (over-allocated) or growth (under-provisioned)
+    #   Both directions share one target: Target = max(RoleFloor, basis x
+    #   multiplier). Where Allocated sits relative to Target decides which way
+    #   (or neither) the recommendation goes, so the two directions can never
+    #   disagree with each other about what "right-sized" means.
     # =======================================================================
     $ramFloorGB = $RamFloor[$role]
     if (-not $ramFloorGB) { $ramFloorGB = 4 }
 
-    $reclaimGB  = 0
-    $ramVerdict = ''
-    $tag        = if ($Conservative) { 'PROVISIONAL ' } else { '' }
+    $reclaimGB     = 0
+    $growthGB      = 0
+    $ramVerdict    = ''
+    $growthVerdict = ''
+    $tag           = if ($Conservative) { 'PROVISIONAL ' } else { '' }
 
     if (-not $confident) {
-        $ramVerdict = "INSUFFICIENT DATA - $coverage% coverage"
+        $ramVerdict    = "INSUFFICIENT DATA - $coverage% coverage"
+        $growthVerdict = "INSUFFICIENT DATA - $coverage% coverage"
     }
     elseif ($RamExcludedRoles -contains $role) {
         $ramVerdict = "EXCLUDED ($role) - guest commit reflects configured cap, not demand"
         if ($sqlNote) { $ramVerdict += " | $sqlNote" }
-    }
-    elseif ($memPressure) {
-        $ramVerdict = "NO RECLAIM - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s)"
+        $growthVerdict = "EXCLUDED ($role) - size from platform-specific metrics, not guest commit"
     }
     else {
         if ($Conservative) {
@@ -339,47 +378,112 @@ try {
             $basisLabel = 'p95'
         }
 
-        $targetGB = [math]::Max($ramFloorGB, [math]::Round($basisGB * $multiplier, 2))
-        $raw      = $allocatedGB - $targetGB
-        $reclaimGB = if ($raw -gt 0) { Get-Floor2 -Value $raw } else { 0 }
+        $targetGB = Get-SizingTarget -FloorGB $ramFloorGB -BasisGB $basisGB -Multiplier $multiplier
+        $raw      = $allocatedGB - $targetGB   # positive => reclaim headroom; negative => short of target
 
-        # Conservative mode only acts on gross over-allocation. 40% rather than
-        # 50%: the 1.4x multiplier is already doing conservative work, and at 50%
-        # a 32GB VM with 12GB peak demand - the most obvious candidate there is -
-        # falls just outside and gets deferred for no good reason.
-        $minReclaim = if ($Conservative) { [math]::Max(8, $allocatedGB * 0.4) } else { 4 }
+        # --- Reclaim side ---------------------------------------------------
+        if ($memPressure) {
+            $ramVerdict = "NO RECLAIM - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s)"
+            if ($raw -lt 0) { $ramVerdict += ' - see growth verdict' }
+        }
+        elseif ($raw -gt 0) {
+            $reclaimGB = Get-Floor2 -Value $raw
 
-        if ($reclaimGB -lt $minReclaim) {
-            $shortfall = $reclaimGB
-            $reclaimGB = 0
-            if ($Conservative) {
-                $ramVerdict = "${tag}NO CHANGE - ${shortfall}GB is not gross over-allocation, defer to full window"
+            # Conservative mode only acts on gross over-allocation. 40% rather
+            # than 50%: the 1.4x multiplier is already doing conservative work,
+            # and at 50% a 32GB VM with 12GB peak demand - the most obvious
+            # candidate there is - falls just outside and gets deferred for no
+            # good reason.
+            $minReclaim = if ($Conservative) { [math]::Max(8, $allocatedGB * 0.4) } else { 4 }
+
+            if ($reclaimGB -lt $minReclaim) {
+                $shortfall = $reclaimGB
+                $reclaimGB = 0
+                if ($Conservative) {
+                    $ramVerdict = "${tag}NO CHANGE - ${shortfall}GB is not gross over-allocation, defer to full window"
+                } else {
+                    $ramVerdict = 'NO CHANGE - under 4GB reclaim, not worth a change window'
+                }
             } else {
-                $ramVerdict = 'NO CHANGE - under 4GB reclaim, not worth a change window'
+                $newAlloc   = [int]($allocatedGB - $reclaimGB)
+                $ramVerdict = "${tag}RECLAIM ${reclaimGB}GB -> ${newAlloc}GB (${basisLabel} ${basisGB}GB x${multiplier})"
             }
+        }
+        elseif ($raw -lt 0) {
+            $ramVerdict = 'NO CHANGE - below sized target, see growth verdict'
+        }
+        else {
+            $ramVerdict = 'NO CHANGE - already at sized target'
+        }
+
+        # --- Growth side ------------------------------------------------------
+        # Standard trigger: demand plus headroom already exceeds allocation.
+        if ($raw -lt 0) {
+            $growthGB = Get-CeilEven -Value (-$raw)
+        }
+
+        # Pressure escalation: active symptoms (available memory near zero,
+        # real hard faults) are a more direct signal than a percentile crossing
+        # a threshold, and can fire even when the trigger above doesn't - a
+        # host can be thrashing on short spikes that a 14-day p95 smooths over.
+        # Uses max, not p95, since the concern here is the peak that's actually
+        # causing the pain, not the typical case - but the SAME mode-appropriate
+        # multiplier as the primary target, via the shared helper, so this can't
+        # silently end up narrower than standard mode's own margin.
+        if ($memPressure) {
+            $pressureTarget = Get-SizingTarget -FloorGB $ramFloorGB -BasisGB $commitMax -Multiplier $multiplier
+            $pressureRaw    = $allocatedGB - $pressureTarget
+            $pressureGrowth = if ($pressureRaw -lt 0) { Get-CeilEven -Value (-$pressureRaw) } else { 0 }
+            if ($pressureGrowth -gt $growthGB) { $growthGB = $pressureGrowth }
+        }
+
+        if ($growthGB -gt 0) {
+            $newAllocGrow = [int]($allocatedGB + $growthGB)
+            if ($memPressure) {
+                # Real pressure symptoms are present right now regardless of
+                # which trigger (percentile or pressure-escalation) produced
+                # the winning number - label URGENT either way.
+                $growthVerdict = "${tag}URGENT +${growthGB}GB -> ${newAllocGrow}GB (active memory pressure: min avail ${availMin}GB, p95 faults ${faultP95}/s)"
+            } else {
+                $growthVerdict = "${tag}GROWTH +${growthGB}GB -> ${newAllocGrow}GB (${basisLabel} ${basisGB}GB x${multiplier}, target ${targetGB}GB)"
+            }
+            $flags.Add('GROWTH')
+        }
+        elseif ($memPressure) {
+            # Active pressure symptoms, but even the max-based target doesn't
+            # show a shortfall - the pressure likely has some other cause (a
+            # leaking process, a transient spike) rather than insufficient
+            # allocation. Flag for a look rather than fabricate a number the
+            # math doesn't actually support - same pattern as CPU's queue-driven
+            # REVIEW case below.
+            $growthVerdict = "REVIEW - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s) without a matching allocation shortfall - investigate before resizing"
+            $flags.Add('MEM-REVIEW')
         } else {
-            $newAlloc   = [int]($allocatedGB - $reclaimGB)
-            $ramVerdict = "${tag}RECLAIM ${reclaimGB}GB -> ${newAlloc}GB (${basisLabel} ${basisGB}GB x${multiplier})"
+            $growthVerdict = 'NO CHANGE - demand within allocation'
         }
     }
 
     # =======================================================================
-    # vCPU recommendation
+    # vCPU recommendation - reduction (over-provisioned) or growth (under-provisioned)
     # =======================================================================
     $cpuFloor = $vCpuFloor[$role]
     if (-not $cpuFloor) { $cpuFloor = 2 }
 
-    $recVcpu    = $vCPU
-    $cpuVerdict = ''
+    $recVcpu          = $vCPU
+    $vcpuGrowth       = 0
+    $cpuVerdict       = ''
+    $cpuGrowthVerdict = ''
 
     if (-not $confident) {
-        $cpuVerdict = "INSUFFICIENT DATA - $coverage% coverage"
+        $cpuVerdict       = "INSUFFICIENT DATA - $coverage% coverage"
+        $cpuGrowthVerdict = "INSUFFICIENT DATA - $coverage% coverage"
     }
     elseif ($singleThreadBound) {
         $cpuVerdict = "NO CHANGE - single-thread bound (p95 max-core ${maxCoreP95}%)"
-    }
-    elseif ($cpuPressure) {
-        $cpuVerdict = "NO REDUCTION - CPU pressure (p95 ${cpuTotalP95}%, p95 queue ${queueP95})"
+        # More vCPU doesn't help a workload that can't spread past one core -
+        # deliberately not offered as growth even if queue depth is also high;
+        # the fix here is workload-side, not allocation-side.
+        $cpuGrowthVerdict = 'NO CHANGE - single-thread bound, more vCPU would not help'
     }
     else {
         if ($Conservative) {
@@ -393,19 +497,63 @@ try {
             $basisLabel  = 'p95'
         }
 
-        $sized   = Get-CeilEven -Value ($cpuBasis / $headroom)
-        $recVcpu = [math]::Max($cpuFloor, $sized)
+        $sized = Get-CeilEven -Value ($cpuBasis / $headroom)
 
-        if ($Conservative -and $recVcpu -gt ($vCPU * 0.5)) {
-            $recVcpu    = $vCPU
-            $cpuVerdict = "${tag}NO CHANGE - reduction under half, defer to full window"
+        # --- Reduction side --------------------------------------------------
+        if ($cpuPressure) {
+            $cpuVerdict = "NO REDUCTION - CPU pressure (p95 ${cpuTotalP95}%, p95 queue ${queueP95})"
+            if ($sized -gt $vCPU) { $cpuVerdict += ' - see growth verdict' }
         }
-        elseif ($recVcpu -ge $vCPU) {
-            $recVcpu    = $vCPU
-            $cpuVerdict = 'NO CHANGE - vCPU already at or below sized requirement'
-        } else {
-            $cpuVerdict = "${tag}REDUCE to $recVcpu vCPU (${basisLabel} demand ${cpuBasis} cores at $([int]($headroom*100))% target)"
+        elseif ($sized -lt $vCPU) {
+            $recVcpu = [math]::Max($cpuFloor, $sized)
+            if ($Conservative -and $recVcpu -gt ($vCPU * 0.5)) {
+                $recVcpu    = $vCPU
+                $cpuVerdict = "${tag}NO CHANGE - reduction under half, defer to full window"
+            } else {
+                $cpuVerdict = "${tag}REDUCE to $recVcpu vCPU (${basisLabel} demand ${cpuBasis} cores at $([int]($headroom*100))% target)"
+            }
         }
+        elseif ($sized -gt $vCPU) {
+            $cpuVerdict = 'NO CHANGE - below sized requirement, see growth verdict'
+        }
+        else {
+            $cpuVerdict = 'NO CHANGE - vCPU already at sized requirement'
+        }
+
+        # --- Growth side -------------------------------------------------------
+        if ($sized -gt $vCPU) {
+            $vcpuGrowth       = $sized - $vCPU
+            $cpuGrowthVerdict = "${tag}GROWTH +$vcpuGrowth vCPU -> $sized vCPU (${basisLabel} demand ${cpuBasis} cores at $([int]($headroom*100))% target)"
+            $flags.Add('CPU-GROWTH')
+        }
+        # Queue-driven pressure can appear without the total%-based sizing model
+        # catching it (e.g. many short-lived threads contending briefly). Flag
+        # it for manual review rather than fabricate a core count queue depth
+        # alone doesn't cleanly map to. Still adds CPU-GROWTH so a worklist
+        # built on the flag (not just "Growth vCPU not equal 00") catches this
+        # host too - Custom68 has no number to filter on here.
+        elseif ($cpuPressure -and $queueP95 -gt (2 * $vCPU)) {
+            $cpuGrowthVerdict = "REVIEW - queue pressure (p95 queue ${queueP95}) not reflected in total utilisation; sizing model may understate demand"
+            $flags.Add('CPU-GROWTH')
+        }
+        else {
+            $cpuGrowthVerdict = 'NO CHANGE - demand within current vCPU'
+        }
+    }
+
+    # A device should never be shown as both a reclaim and a growth candidate
+    # for the same metric - today's branch structure happens to guarantee that,
+    # but that guarantee is a consequence of how the branches are written, not
+    # something structurally enforced. Assert it explicitly rather than trust
+    # it silently holds if this logic is ever touched again: growth wins, since
+    # this tool treats a missed growth candidate as the worse failure mode.
+    if ($reclaimGB -gt 0 -and $growthGB -gt 0) {
+        $reclaimGB = 0
+        $ramVerdict = 'NO CHANGE - reclaim/growth conflict resolved in favour of growth, see growth verdict'
+    }
+    if ($recVcpu -lt $vCPU -and $vcpuGrowth -gt 0) {
+        $recVcpu = $vCPU
+        $cpuVerdict = 'NO CHANGE - reduce/growth conflict resolved in favour of growth, see growth verdict'
     }
 
     # =======================================================================
@@ -427,6 +575,9 @@ try {
     Set-Udf -Index ($UdfBase + 4) -Value ('{0:D2}' -f $recVcpu)     # zero-padded, same reason
     Set-Udf -Index ($UdfBase + 5) -Value $flagText
     Set-Udf -Index ($UdfBase + 6) -Value $summary
+    Set-Udf -Index ($UdfBase + 7) -Value ('{0:D3}' -f $growthGB)    # zero-padded, same reason
+    Set-Udf -Index ($UdfBase + 8) -Value ('{0:D2}' -f $vcpuGrowth)  # zero-padded, same reason
+    Set-Udf -Index ($UdfBase + 9) -Value ('RAM: {0} || CPU: {1} || {2}' -f $growthVerdict, $cpuGrowthVerdict, (Get-Date -Format 'dd/MM/yyyy HH:mm'))
 
     # =======================================================================
     # Optional per-device CSV row for estate-wide aggregation
@@ -455,6 +606,8 @@ try {
                 HardFaultsP95   = $faultP95
                 ReclaimGB       = $reclaimGB
                 RamVerdict      = $ramVerdict
+                GrowthGB        = $growthGB
+                GrowthVerdict   = $growthVerdict
                 vCPU            = $vCPU
                 CpuTotalP50Pct  = $cpuTotalP50
                 CpuTotalP95Pct  = $cpuTotalP95
@@ -463,6 +616,8 @@ try {
                 EffectiveCores  = $effectiveCores
                 RecommendedVcpu = $recVcpu
                 CpuVerdict      = $cpuVerdict
+                VcpuGrowth      = $vcpuGrowth
+                CpuGrowthVerdict = $cpuGrowthVerdict
                 SqlNote         = $sqlNote
             } | Export-Csv -LiteralPath $rowFile -NoTypeInformation -Encoding UTF8 -Force
             Write-Output "Exported device row to $rowFile"
@@ -481,13 +636,15 @@ try {
     Write-Output ''
     Write-Output "Memory          : $ramDetail"
     Write-Output "Memory verdict  : $ramVerdict"
+    Write-Output "Memory growth   : $growthVerdict"
     if ($sqlNote) { Write-Output "SQL             : $sqlNote" }
     Write-Output ''
     Write-Output "CPU             : $cpuDetail"
     Write-Output "Effective cores : $effectiveCores of $vCPU allocated"
     Write-Output "CPU verdict     : $cpuVerdict"
+    Write-Output "CPU growth      : $cpuGrowthVerdict"
     Write-Output ''
-    Write-Output "UDFs written    : Custom$UdfBase - Custom$($UdfBase + 6)"
+    Write-Output "UDFs written    : Custom$UdfBase - Custom$($UdfBase + 9)"
 
     Write-Output ''
     Write-Output '<-Start Result->'
@@ -495,6 +652,8 @@ try {
     Write-Output "ReclaimGB=$reclaimGB"
     Write-Output "RecommendedVcpu=$recVcpu"
     Write-Output "CurrentVcpu=$vCPU"
+    Write-Output "GrowthGB=$growthGB"
+    Write-Output "VcpuGrowth=$vcpuGrowth"
     Write-Output ('Mode=' + $(if ($Conservative) { 'Conservative' } else { 'Standard' }))
     Write-Output '<-End Result->'
 

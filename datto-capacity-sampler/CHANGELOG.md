@@ -8,6 +8,66 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Added
+- **Under-provisioning detection with a growth-sizing recommendation (`Read-ArcCapacityBuffer.ps1`
+  v1.5).** Previously the guardrails (`MEM-PRESSURE`, `CPU-PRESSURE`) only ever suppressed a
+  reclaim/reduce recommendation on a struggling host — there was no equivalent "this host needs
+  more" output, just a flag and a verdict sentence. Growth-sizing now shares the same target
+  computation as reclaim/reduce, via a new shared `Get-SizingTarget` helper (`Target =
+  max(RoleFloor, basis × multiplier)`), and reads the other side of it: when demand plus headroom
+  already exceeds allocation, that's a growth candidate. RAM growth additionally escalates
+  independently whenever `MEM-PRESSURE` is active, using max Committed rather than p95 (a host can
+  be thrashing on short spikes a 14-day p95 smooths flat) and the same mode-appropriate multiplier
+  as the primary target; when pressure is active but even that escalation shows no allocation
+  shortfall, it flags `REVIEW` rather than forcing a number the math doesn't support. vCPU growth
+  mirrors the existing reduce calculation, and flags `REVIEW` (without fabricating a core count,
+  but still setting the `CPU-GROWTH` flag so a flag-based worklist catches it) when `CPU-PRESSURE`
+  is queue-driven rather than total%-driven. A structural guard before UDF write-back now enforces
+  — rather than assumes — that a device is never shown as both a reclaim and a growth candidate for
+  the same metric. New UDFs `Custom67` (`Cap: Growth GB`), `Custom68` (`Cap: Growth vCPU`),
+  `Custom69` (`Cap: Growth Verdict`) — `usrUdfBase` now needs **10** consecutive fields instead of
+  7 (valid range 1–291, was 1–294). New flags `GROWTH` and `CPU-GROWTH`. Per-device CSV export
+  gains `GrowthGB`, `GrowthVerdict`, `VcpuGrowth`, `CpuGrowthVerdict` columns. Deliberately scoped
+  to `Arc — Capacity Analyse` only — `Arc — Capacity Screen`'s same-day, no-history basis is the
+  wrong foundation for a recommendation meant to catch active pressure via a max-based figure it
+  has no percentile history to compute.
+
+### Fixed
+_Found by a pre-commit code review of the growth-sizing addition above; see each item for what was
+wrong and why. All caught before this ever ran on a real device._
+- **A memory-pressure event, however transient, forced a fabricated `URGENT +2GB` growth
+  recommendation regardless of actual need.** The "floor to a minimum 2GB" guard on the
+  pressure-escalation path was based on a wrong assumption about the rounding helper it fed from —
+  that helper already never returns a value below 2 for any positive input, so the floor only ever
+  fired when the escalation had legitimately computed zero shortfall, silently overriding it to 2.
+  A device with enormous real headroom that merely had one transient available-memory dip (a
+  backup job, an AV scan) would have shown a false urgent-growth flag. Replaced with a `REVIEW`
+  verdict when pressure is active but no shortfall is actually confirmed, matching the pattern
+  already used for CPU's queue-driven case.
+- **The same pressure-escalation path hardcoded a 1.25× multiplier instead of the mode-appropriate
+  one**, so conservative mode's escalation was narrower than conservative mode's own standard
+  margin — backwards for a mode that exists to add safety margin under noisier data. Fixed by
+  extracting a shared `Get-SizingTarget` helper both the primary target and the escalation target
+  now call, so the two can no longer drift onto different multipliers.
+- **Queue-driven CPU growth set a `REVIEW` verdict but never added the `CPU-GROWTH` flag**, so a
+  worklist filtered on that flag (or on `Cap: Growth vCPU not equal to 00`, which stays `00` for
+  this case since there's no number to show) would silently miss these hosts entirely — exactly
+  the failure mode this tool's own design philosophy says is worse than a missed reclaim. Now sets
+  the flag alongside the text.
+- **The "never both a reclaim and a growth candidate" invariant was incidental, not enforced** — it
+  held only because of how the guardrail branches happened to be ordered, not because anything
+  structurally guaranteed it. A future guardrail refinement (e.g. partial reclaim under mild
+  pressure) could have silently broken it. Added an explicit check before UDF write-back that
+  resolves any such conflict in favour of growth.
+- **A new `Get-Ceil2` helper duplicated the existing `Get-CeilEven` exactly** (confirmed by direct
+  testing — both round up to the nearest even number for any positive input). Removed; RAM growth
+  now uses `Get-CeilEven` like CPU growth already did.
+- **Neither pressure-suppressed verdict pointed to a waiting growth recommendation.** "NO RECLAIM -
+  memory pressure" and "NO REDUCTION - CPU pressure" gave no indication when the same host also had
+  a growth recommendation sitting in the adjacent UDF, risking an operator reading only one verdict
+  field and concluding no action was needed. Both now append "- see growth verdict" when that's
+  the case.
+
 ### Changed
 - **Removed the company-name credit from every script header and from the scheduled task's
   `<Author>` field** (all six `.ps1` files bumped a patch version). These scripts live in a

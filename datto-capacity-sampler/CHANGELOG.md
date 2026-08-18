@@ -9,6 +9,19 @@ script versions independently — see its own header comment for its current ver
 _Work in progress on the `develop` branch._
 
 ### Added
+- **Self-maintaining device filter via a new enrollment marker**
+  (`Deploy-ArcCapacitySampler.ps1` v1.5). New `usrEnrollUdf` variable, default `79` — Component 1
+  writes `ENROLLED | <date/time>` to that field on every successful run and clears it on
+  `usrUninstall=true`. Lets a Datto Device Filter key off `Custom79 is not blank` so the device
+  group used to target all three components' recurring schedules stays correct on its own as
+  devices are enrolled or removed, instead of a hand-maintained group. Written regardless of
+  `SamplerStatus` as long as the scheduled task is actually registered — it tracks fleet
+  membership, not today's fetch health, which is already reported separately. Set `usrEnrollUdf=0`
+  to disable if that UDF is already in use for something else; an out-of-range index downgrades to
+  `WARNING` and skips the marker for that run rather than failing the deploy — an auxiliary field
+  must never take down the core job.
+
+### Added
 - **Domain controller RAM floor is now a function of actual DIT size** (`Read-ArcCapacityBuffer.ps1`
   v1.8) — closes the open item from Known limitations. Previously every DC used the same flat
   4GB floor regardless of how large its `ntds.dit` actually was; since ESE dynamically caches the

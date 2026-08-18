@@ -8,6 +8,60 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Added
+- **Domain controller RAM floor is now a function of actual DIT size** (`Read-ArcCapacityBuffer.ps1`
+  v1.8) — closes the open item from Known limitations. Previously every DC used the same flat
+  4GB floor regardless of how large its `ntds.dit` actually was; since ESE dynamically caches the
+  DIT against available memory (no manual tuning needed on any currently supported Windows
+  Server version), a large-DIT DC genuinely benefits from more RAM and a flat floor risked
+  recommending a reclaim into that legitimate demand. New `Get-DcDitSizeGB` helper reads the
+  actual configured DIT path from the registry (not assuming the default location, since it's
+  commonly relocated) and computes the floor as `max(4GB, ceil(DIT size × 1.15 + 2GB))` — a
+  reasoned estimate, not a vendor-published constant, same status as this tool's other
+  multipliers. Only ever raises the floor, never lowers it. Feeds into the *same* shared
+  `Get-SizingTarget` reclaim and growth already use, so both directions automatically respect the
+  new floor with no separate logic path. `Cap: RAM Detail` gains a DC-specific suffix showing the
+  resolved DIT size and computed floor (or that it couldn't be resolved) so the number driving
+  the recommendation is never silent. Does not check for a legacy manual NTDS cache-size cap
+  (`Database cache size (max)` / `EDB max buffers`) that would prevent added RAM from actually
+  being used — deliberately out of scope for now. CSV export gains `DitSizeGB`/`RamFloorGB`
+  columns.
+
+### Fixed
+_Found by a pre-commit code review of the DIT-floor addition above; see each item for what was
+wrong and why. Both caught before this ever ran on a real device._
+- **An unresolvable DIT size silently fell back to the flat 4GB floor and computed a live verdict
+  anyway** — the exact known-wrong value this whole feature exists to move away from. Every other
+  guardrail in this file suppresses the recommendation rather than degrade it (`EXCLUDED` roles,
+  `MEM-PRESSURE`, `CPU-PRESSURE`); the DIT floor didn't follow that pattern. Fixed: `DIT-UNKNOWN`
+  now suppresses both the RAM and growth verdict to `REVIEW` entirely, matching the rest of the
+  file, rather than silently computing against a floor the tool's own docs call wrong.
+- **A large-but-uncompacted DIT could manufacture an evidence-free growth recommendation with no
+  correlation to actual measured demand.** A DIT can grow from tombstone/whitespace bloat after
+  years without an offline defrag, with no live-memory equivalent — the DIT-raised floor alone
+  was enough to trigger a firm `GROWTH` verdict even when p95 committed memory showed the host
+  comfortably within its current allocation (worked example: 32GB DIT, 16GB allocated, 5GB p95
+  commit — no memory pressure — produced a firm `GROWTH +56GB` before this fix). Fixed: the
+  DIT-raised target is now cross-checked against the *same* target computed with the flat,
+  non-DIT floor. If the flat-floor evidence doesn't independently support growth, the verdict
+  downgrades to `REVIEW`/`DIT-REVIEW` instead of asserting a number the measured demand doesn't
+  back up. Active memory pressure is unaffected by this check — it's independent, stronger
+  evidence and still produces a firm `URGENT` verdict regardless. The DIT floor's original,
+  intended protection (preventing an inappropriate *reclaim* recommendation on a large-DIT DC)
+  is unaffected by this fix — only the *growth* side needed the extra corroboration.
+- Two lower-severity items also addressed: the DC-specific `Cap: RAM Detail` suffix logic was
+  duplicated (same role/null checks re-derived ~230 lines apart) — consolidated into one
+  suffix computed once, alongside the floor, and reused at the write-back site; and the DIT
+  formula's deliberate non-use of the existing `Get-SizingTarget` helper (additive, not a
+  max-of-floor-and-basis) is now called out in a comment, since the surface similarity invites a
+  future "helpful" consolidation that would silently change the arithmetic.
+- Validated against 6 scenarios before committing: the exact flagged bug case (bloated DIT, no
+  corroborating demand → now `REVIEW` not a fabricated number), a genuinely under-provisioned
+  large-DIT DC (evidence corroborates → firm `GROWTH` still fires), a large DIT correctly
+  preventing an over-reclaim (the feature's original purpose, unaffected), a small DIT deferring
+  to the flat floor, the `DIT-UNKNOWN` full-suppression path, and active memory pressure
+  correctly overriding the new evidence check to still produce `URGENT`.
+
 ### Fixed
 - **Confirmed production bug: a genuinely successful `Arc — Capacity Screen` run on a real
   device was reported as a failure** (`Invoke-ArcCapacityAnalyse.ps1` v1.4,

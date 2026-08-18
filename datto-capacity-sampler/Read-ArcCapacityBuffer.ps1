@@ -15,7 +15,24 @@
               over-allocated, growth when under-provisioned - from one shared target.
 
     Sizing logic
-      RAM   Target      = max( RoleFloor , p95 Committed x 1.25 )
+      RAM   RoleFloor   = flat per-role minimum, except DomainController: raised to
+                          ceil(DIT size x 1.15 + 2GB) where the DIT path can be read
+                          from the registry, since ESE dynamically caches the DIT
+                          against available memory on any currently supported
+                          Windows Server version - no manual tuning needed, but a
+                          large-DIT DC genuinely needs more RAM to benefit from that.
+                          Never LOWERS the floor. If the DIT path can't be resolved,
+                          the RAM verdict and growth verdict are both suppressed to
+                          REVIEW/DIT-UNKNOWN rather than silently computed against the
+                          flat floor this exists because it's wrong for a large DIT.
+                          If the DIT-raised floor alone would trigger growth but actual
+                          measured demand (the same target using the flat floor)
+                          doesn't corroborate it, that also downgrades to REVIEW/
+                          DIT-REVIEW instead of asserting a number - a DIT can be large
+                          from tombstone/whitespace bloat with no live-memory
+                          equivalent. Active memory pressure is independent, stronger
+                          evidence and still fires URGENT regardless of this check.
+            Target      = max( RoleFloor , p95 Committed x 1.25 )
             Reclaim     = Allocated - Target when positive, floored to a 2GB
                           increment, suppressed below 4GB (not worth a change window)
             Growth      = Target - Allocated when positive, ceilinged to a 2GB
@@ -55,12 +72,18 @@
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
 
-    Version : 1.6  -  18/08/2026  (removed the internal team byline for public-repo
-              visibility - no logic change. Previous: 1.5 added proper
-              under-provisioning detection - growth-sizing recommendation for RAM and vCPU,
-              symmetric with the existing reclaim/reduce logic and sharing the same target
-              computation. New UDFs Custom67 Growth GB, Custom68 Growth vCPU, Custom69
-              Growth Verdict - usrUdfBase now needs 10 consecutive fields instead of 7)
+    Version : 1.8  -  18/08/2026  (domain controller RAM floor is now a function of
+              actual DIT size where it can be read from the registry, rather than a
+              flat 4GB - closes the open item from Known limitations. DIT-UNKNOWN
+              suppresses the recommendation entirely rather than falling back to the
+              flat floor and computing anyway; a DIT-driven-only growth trigger with
+              no corroborating measured demand downgrades to DIT-REVIEW instead of
+              asserting a number - both caught by a pre-commit review pass before
+              this ran on a real device. CSV export gains DitSizeGB/RamFloorGB
+              columns. Previous: 1.6 removed the internal team byline; 1.5 added
+              under-provisioning detection - growth-sizing recommendation for RAM and
+              vCPU, symmetric with reclaim/reduce and sharing the same target
+              computation, with new UDFs Custom67-69)
 #>
 
 #Requires -Version 5.1
@@ -167,6 +190,27 @@ function Get-CeilEven { param([double]$Value) $i = [int][math]::Ceiling($Value);
 function Get-SizingTarget {
     param([double]$FloorGB, [double]$BasisGB, [double]$Multiplier)
     [math]::Max($FloorGB, [math]::Round($BasisGB * $Multiplier, 2))
+}
+
+# Domain controllers: the flat RoleFloor below is wrong for a DC with a large
+# DIT - ESE dynamically sizes its database cache against available memory, up
+# to the DIT's own size, with no registry tuning required on any currently
+# supported Windows Server version. A DC with a large DIT genuinely benefits
+# from more RAM to cache it, so a flat floor risks recommending a reclaim into
+# that legitimate demand. Reads the actual configured DIT path from the
+# registry rather than assuming the default %SystemRoot%\NTDS\ntds.dit
+# location, since it's commonly relocated to its own volume. Returns $null
+# (never a guessed default) on any failure, so the caller falls back to the
+# flat RoleFloor explicitly rather than silently sizing against a wrong number.
+function Get-DcDitSizeGB {
+    try {
+        $ntdsParams = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters' -ErrorAction Stop
+        $ditPath = $ntdsParams.'DSA Database File'
+        if ([string]::IsNullOrWhiteSpace($ditPath) -or -not (Test-Path -LiteralPath $ditPath)) { return $null }
+        [math]::Round((Get-Item -LiteralPath $ditPath).Length / 1GB, 2)
+    } catch {
+        $null
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -352,6 +396,42 @@ try {
     $ramFloorGB = $RamFloor[$role]
     if (-not $ramFloorGB) { $ramFloorGB = 4 }
 
+    # DC floor becomes a function of the actual DIT size where it can be
+    # determined - see Get-DcDitSizeGB above for why. 1.15x + 2GB is a reasoned
+    # estimate (DIT fully cacheable plus ESE/version-store overhead plus a
+    # baseline for the OS and other DC services), not a vendor-published
+    # constant - same status as this tool's other multipliers (1.25, 1.4,
+    # 65%). Only ever raises the floor, never lowers it below the flat value.
+    # $flatFloorGB (pre-DIT) is kept alongside for an evidence check below -
+    # deliberately NOT expressed as a Get-SizingTarget call despite the
+    # surface similarity, since this is additive (basis + overhead), not a
+    # max(floor, basis x multiplier) - folding it into that shared helper
+    # would silently change the arithmetic.
+    $flatFloorGB = $ramFloorGB
+    $ditSizeGB   = $null
+    $ditUnknown  = $false
+    if ($role -eq 'DomainController') {
+        $ditSizeGB = Get-DcDitSizeGB
+        if ($null -ne $ditSizeGB) {
+            $ditFloorGB = [math]::Ceiling(($ditSizeGB * 1.15) + 2)
+            $ramFloorGB = [math]::Max($ramFloorGB, $ditFloorGB)
+        } else {
+            $ditUnknown = $true
+            $flags.Add('DIT-UNKNOWN')
+        }
+    }
+
+    # Built once, here, alongside the floor computation it describes, rather
+    # than re-deriving the same role/null checks again down at the RAM Detail
+    # UDF write-back - keeps the two from being able to drift out of sync.
+    $dcDetailSuffix = if ($role -ne 'DomainController') {
+        ''
+    } elseif ($null -ne $ditSizeGB) {
+        " | DIT ${ditSizeGB}GB -> floor ${ramFloorGB}GB"
+    } else {
+        ' | DIT size unknown -> flat floor'
+    }
+
     $reclaimGB     = 0
     $growthGB      = 0
     $ramVerdict    = ''
@@ -366,6 +446,15 @@ try {
         $ramVerdict = "EXCLUDED ($role) - guest commit reflects configured cap, not demand"
         if ($sqlNote) { $ramVerdict += " | $sqlNote" }
         $growthVerdict = "EXCLUDED ($role) - size from platform-specific metrics, not guest commit"
+    }
+    elseif ($ditUnknown) {
+        # Same "suppress rather than degrade" philosophy as every other
+        # guardrail in this file - the flat 4GB floor this would otherwise
+        # fall back to is exactly the value this whole feature exists because
+        # it's wrong for a large-DIT DC. Silently computing a live reclaim
+        # verdict against a known-wrong floor is worse than no verdict.
+        $ramVerdict    = 'REVIEW - DIT size could not be resolved, cannot confirm a safe RAM floor for this DC'
+        $growthVerdict = 'REVIEW - DIT size could not be resolved, cannot confirm a safe RAM floor for this DC'
     }
     else {
         if ($Conservative) {
@@ -419,8 +508,26 @@ try {
 
         # --- Growth side ------------------------------------------------------
         # Standard trigger: demand plus headroom already exceeds allocation.
+        # For a DC, $raw uses the (possibly DIT-raised) floor - but a DIT can be
+        # large from tombstone/whitespace bloat with no live-memory equivalent,
+        # so before asserting a growth number, check whether ACTUAL measured
+        # demand (the flat, non-DIT-adjusted target) corroborates it. If the
+        # evidence alone wouldn't ask for growth, the DIT floor alone is
+        # driving this - flag for review instead of asserting a number the
+        # commit-bytes evidence doesn't support. Non-DC roles are unaffected:
+        # $flatFloorGB equals $ramFloorGB for them, so $evidenceRaw equals $raw
+        # and this check can never trigger.
+        $evidenceTargetGB = Get-SizingTarget -FloorGB $flatFloorGB -BasisGB $basisGB -Multiplier $multiplier
+        $evidenceRaw      = $allocatedGB - $evidenceTargetGB
+        $ditDrivenOnly    = $false
+
         if ($raw -lt 0) {
-            $growthGB = Get-CeilEven -Value (-$raw)
+            if ($evidenceRaw -ge 0) {
+                $ditDrivenOnly = $true
+                $flags.Add('DIT-REVIEW')
+            } else {
+                $growthGB = Get-CeilEven -Value (-$raw)
+            }
         }
 
         # Pressure escalation: active symptoms (available memory near zero,
@@ -459,7 +566,11 @@ try {
             # REVIEW case below.
             $growthVerdict = "REVIEW - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s) without a matching allocation shortfall - investigate before resizing"
             $flags.Add('MEM-REVIEW')
-        } else {
+        }
+        elseif ($ditDrivenOnly) {
+            $growthVerdict = "REVIEW - DIT-derived floor (${ramFloorGB}GB) exceeds allocation but measured demand (${basisLabel} ${basisGB}GB) doesn't corroborate it - a large DIT can be tombstone/whitespace bloat with no live-memory equivalent; check for an overdue offline defrag before resizing"
+        }
+        else {
             $growthVerdict = 'NO CHANGE - demand within allocation'
         }
     }
@@ -560,8 +671,8 @@ try {
     # =======================================================================
     # UDF write-back
     # =======================================================================
-    $ramDetail = 'Alloc {0}GB | Commit p50 {1} p95 {2} max {3}GB | MinAvail {4}GB | Faults p95 {5}/s' -f `
-                 $allocatedGB, $commitP50, $commitP95, $commitMax, $availMin, $faultP95
+    $ramDetail = ('Alloc {0}GB | Commit p50 {1} p95 {2} max {3}GB | MinAvail {4}GB | Faults p95 {5}/s' -f `
+                 $allocatedGB, $commitP50, $commitP95, $commitMax, $availMin, $faultP95) + $dcDetailSuffix
 
     $cpuDetail = '{0} vCPU | Total p50 {1}% p95 {2}% max {3}% | MaxCore p95 {4}% | Queue p95 {5} max {6}' -f `
                  $vCPU, $cpuTotalP50, $cpuTotalP95, $cpuTotalMax, $maxCoreP95, $queueP95, $queueMax
@@ -605,6 +716,8 @@ try {
                 CommitMaxGB     = $commitMax
                 MinAvailGB      = $availMin
                 HardFaultsP95   = $faultP95
+                DitSizeGB       = $ditSizeGB
+                RamFloorGB      = $ramFloorGB
                 ReclaimGB       = $reclaimGB
                 RamVerdict      = $ramVerdict
                 GrowthGB        = $growthGB

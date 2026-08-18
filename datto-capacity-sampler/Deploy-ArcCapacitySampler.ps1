@@ -31,12 +31,19 @@
                                                         an already-deployed device, so
                                                         the daily schedule doesn't force
                                                         a redundant sample every run
+              usrEnrollUdf     Integer  default 79     UDF index to mark this device as
+                                                        enrolled - lets a Datto Device
+                                                        Filter key off "sampler installed"
+                                                        so a device group used to target
+                                                        these components stays correct on
+                                                        its own as devices are
+                                                        added/removed, rather than being
+                                                        maintained by hand. Cleared on
+                                                        usrUninstall=true. Set explicitly
+                                                        to 0 to disable the marker
 
-    Version : 1.4  -  18/08/2026  (TLS 1.2; escalates to FAILED after 7 consecutive fetch
-              failures instead of an indefinite WARNING; seed-on-deploy now fires only on a
-              genuinely fresh install, not every daily run; removed the company-name header
-              credit, scheduled task Author field, and internal team byline for
-              public-repo visibility)
+    Version : 1.5  -  18/08/2026  (added usrEnrollUdf, default 79, so enrollment can drive
+              a self-maintaining Device Filter instead of a hand-managed device group)
 #>
 
 #Requires -Version 5.1
@@ -80,6 +87,13 @@ $Uninstall       = Get-DattoBool   -Name 'usrUninstall' -Default $false
 $SeedNow         = Get-DattoBool   -Name 'usrSeedNow'   -Default $true
 $Branch          = Get-DattoString -Name 'usrBranch'    -Default 'main'
 
+# Get-DattoInt treats a literal "0" the same as blank (falls back to Default),
+# so an explicit 0 needs handling before that helper to actually mean
+# "disabled" rather than silently re-enabling the marker at the default index.
+$EnrollUdfRaw = [Environment]::GetEnvironmentVariable('usrEnrollUdf')
+$EnrollUdf    = if (-not [string]::IsNullOrWhiteSpace($EnrollUdfRaw) -and $EnrollUdfRaw.Trim() -eq '0') { 0 } `
+                else { Get-DattoInt -Name 'usrEnrollUdf' -Default 79 }
+
 $RepoRawBase = 'https://raw.githubusercontent.com/Arc-hub-tech/Automations'
 $InstallDir  = 'C:\ProgramData\Arc\CapacitySampler'
 $ScriptName  = 'Arc-CapacitySampler.ps1'
@@ -104,6 +118,35 @@ $details = New-Object System.Collections.Generic.List[string]
 
 function Add-Detail { param([string]$m) $details.Add($m); Write-Output $m }
 
+# Enrollment marker - lets a Datto Device Filter key off "sampler installed"
+# (Custom79 not blank, by default) instead of a hand-maintained device group,
+# so the group used to target these components' recurring schedule stays
+# correct on its own as devices are added/removed. Set usrEnrollUdf=0 to
+# disable if this UDF slot is already in use for something else. Invalid here
+# only downgrades to WARNING and skips the marker - it must never fail the
+# actual sampler deploy, which is the job that matters.
+$UdfMax = 300
+$EnrollUdfValid = $false
+if ($EnrollUdf -gt 0) {
+    if ($EnrollUdf -gt $UdfMax) {
+        $status = 'WARNING'
+        Add-Detail "usrEnrollUdf of $EnrollUdf is invalid (must be 1-$UdfMax) - skipping the enrollment marker for this run"
+    } else {
+        if ($EnrollUdf -eq 1) {
+            Add-Detail 'WARNING: UDF 1 is reserved by Datto Ransomware Detection for isolation notices and will be overwritten by usrEnrollUdf.'
+        }
+        $EnrollUdfValid = $true
+    }
+}
+
+function Set-DeployUdf {
+    param([int]$Index, [string]$Value)
+    $udfKey = 'HKLM:\SOFTWARE\CentraStage'
+    if ($Value.Length -gt 255) { $Value = $Value.Substring(0, 255) }
+    if (-not (Test-Path -LiteralPath $udfKey)) { New-Item -Path $udfKey -Force | Out-Null }
+    Set-ItemProperty -LiteralPath $udfKey -Name "Custom$Index" -Value $Value -Force
+}
+
 function Remove-SamplerTask {
     $existing = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue
     if ($existing) {
@@ -126,6 +169,11 @@ try {
     if ($Uninstall) {
         if (Remove-SamplerTask) { Add-Detail "Removed scheduled task $FullTask" }
         else                    { Add-Detail 'No scheduled task present' }
+
+        if ($EnrollUdfValid) {
+            Set-DeployUdf -Index $EnrollUdf -Value ''
+            Add-Detail "Cleared enrollment marker (Custom$EnrollUdf)"
+        }
 
         if (Test-Path -LiteralPath $InstallDir) {
             Remove-Item -LiteralPath $InstallDir -Recurse -Force
@@ -383,6 +431,15 @@ try {
 
     $expected = [int](($RetentionDays * 24 * 60) / $IntervalMinutes)
     Add-Detail "Buffer will reach full depth ($expected samples) in $RetentionDays days"
+
+    # Written whenever the task is actually registered, regardless of $status -
+    # this marks fleet membership (sampler installed and scheduled), not
+    # today's fetch health, which SamplerStatus already covers separately. A
+    # device mid a git-fetch WARNING is still enrolled and still sampling.
+    if ($EnrollUdfValid) {
+        Set-DeployUdf -Index $EnrollUdf -Value ('ENROLLED | ' + (Get-Date -Format 'dd/MM/yyyy HH:mm'))
+        Add-Detail "Enrollment marker written (Custom$EnrollUdf)"
+    }
 
     Write-Output ''
     Write-Output '<-Start Result->'

@@ -188,7 +188,10 @@ Fields); values are per device. Datto caps UDF labels at 22 characters.
 > Check the existing UDF map in Global Settings before first run. `usrUdfBase` /
 > `usrScreenUdfBase` overwrite without warning, and an out-of-range value now fails the job
 > rather than silently falling back to the default — a typo can't quietly clobber a range that's
-> already in use elsewhere in the account.
+> already in use elsewhere in the account. `usrEnrollUdf` (Component 1, default `79` — see
+> **Self-maintaining device filter** below) is the same overwrite-without-warning risk, but an
+> out-of-range value there only downgrades to a `WARNING` and skips the marker for that run rather
+> than failing the job — the actual sampler deploy must never fail over an auxiliary field.
 
 ### `Arc — Capacity Analyse` (default base 60, 10 consecutive fields, valid 1–291)
 
@@ -299,12 +302,28 @@ once. Then run `Arc — Capacity Screen` against the same set for an immediate s
   | `usrRetention` | Integer | 14 | Ring buffer depth in days |
   | `usrSeedNow` | Boolean | true | Take one sample immediately on a genuinely fresh install — automatically skipped on an already-deployed device, so the daily recurring run never forces a redundant off-cycle sample regardless of this setting |
   | `usrUninstall` | Boolean | false | Remove task, payload and collected samples |
+  | `usrEnrollUdf` | Integer | 79 | UDF index to mark this device as enrolled — see **Self-maintaining device filter** below. Set to `0` to disable |
 
   Registers `\Arc\Arc Capacity Sampler`, running as SYSTEM with a boot trigger so reboots don't
   create gaps. **Overhead per sample:** one CIM query per performance class plus a 2-second
   settle for the processor class — under a second of CPU, a few KB written. Buffer at 14 days /
   15 minutes is 1,344 rows, roughly 150KB. The daily git-fetch check itself is a single small file
   download — negligible next to the sampling overhead.
+
+  #### Self-maintaining device filter
+
+  Component 1 writes `ENROLLED | <date/time>` to `Custom79` (`usrEnrollUdf`, outside the 60–73
+  range the other two components use) on every successful run — cleared back to blank on
+  `usrUninstall=true`. Build a Datto Device Filter on `Custom79 is not blank` and target **all
+  three components'** recurring schedules at that filter instead of a hand-maintained Device Group:
+  a device gains membership the moment Component 1 first deploys to it, and loses it the moment
+  it's uninstalled, with no one having to remember to update group membership either way. Set
+  `usrEnrollUdf=0` to disable if this UDF slot is already in use for something else, or a
+  manually-scoped filter or group already does the job — this doesn't replace the **Target filter**
+  guidance below, it's an alternative for keeping that filter's membership accurate on its own. A
+  stale-looking timestamp on an otherwise-enrolled device is a useful heartbeat too — it means
+  Component 1 hasn't completed a run recently, independent of whatever `SamplerStatus` last
+  reported.
 
 * `Arc — Capacity Analyse` (Component 2) — same category/type. Paste in
   `Invoke-ArcCapacityAnalyse.ps1` (the bootstrap stub — see Branching & releases); no file

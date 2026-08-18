@@ -108,7 +108,23 @@ Both directions — reclaim (over-allocated) and growth (under-provisioned) — 
 target, so they can never disagree about what "right-sized" means:
 
 ```
-RAM   Target      = max( RoleFloor , p95 Committed × 1.25 )
+RAM   RoleFloor   = flat per-role minimum, except DomainController: raised to
+                    ceil( DIT size × 1.15 + 2GB ) where the DIT path can be read
+                    from the registry — ESE dynamically caches the DIT against
+                    available memory on any currently supported Windows Server
+                    version, no manual tuning needed, but a large-DIT DC
+                    genuinely needs more RAM to benefit from that. Never lowers
+                    the floor. If the DIT path can't be resolved, suppresses the
+                    RAM/growth verdict entirely (flags DIT-UNKNOWN) rather than
+                    silently computing against the flat floor this exists
+                    because it's wrong. If the DIT-raised floor alone would
+                    trigger growth but the SAME target using the flat floor
+                    doesn't, downgrades to REVIEW (flags DIT-REVIEW) instead of
+                    asserting a number — a DIT can be large from tombstone/
+                    whitespace bloat with no live-memory equivalent. Active
+                    memory pressure is independent, stronger evidence and still
+                    fires URGENT regardless of this check
+      Target      = max( RoleFloor , p95 Committed × 1.25 )
       Reclaim     = Allocated − Target when positive, floored to a 2GB increment,
                     suppressed below 4GB (not worth a change window)
       Growth      = Target − Allocated when positive, ceilinged to a 2GB increment.
@@ -134,8 +150,18 @@ exists at all: a host can be thrashing on short spikes that a 14-day p95 smooths
 pressure symptoms (available memory near zero, real hard faults) get to override what the
 percentile math alone would conclude.
 
-Role floors (RAM GB / vCPU): DC 4/2 · RDSH 8/4 · File server 8/2 · SQL 8/4 · Exchange 16/4 ·
-Veeam 8/4 · Generic 4/2.
+Role floors (RAM GB / vCPU): DC 4/2 (RAM floor raised per DIT size where resolvable — see above)
+· RDSH 8/4 · File server 8/2 · SQL 8/4 · Exchange 16/4 · Veeam 8/4 · Generic 4/2.
+
+**The 1.15× / 2GB DIT margin is a reasoned estimate, not a vendor-published constant** — same
+status as this tool's other multipliers (1.25, 1.4, 65%). It only ever raises the DC floor above
+the flat 4GB, never below it, and there's no companion registry tuning required on any currently
+supported Windows Server version for the extra RAM to actually get used: NTDS's database cache
+sizes itself dynamically against available memory by default. The one thing this doesn't check
+for is a legacy manual cache-size cap (`Database cache size (max)` / `EDB max buffers` under
+`HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters`) — if an admin has previously capped
+NTDS's cache for some other reason, added RAM won't help until that cap is also raised, and this
+tool won't tell you that's why.
 
 ### Guardrails — these suppress a recommendation rather than degrade it
 
@@ -178,6 +204,11 @@ Fields); values are per device. Datto caps UDF labels at 22 characters.
 | Custom67 | `Cap: Growth GB` | **RAM growth recommendation — zero-padded** | `004` |
 | Custom68 | `Cap: Growth vCPU` | **vCPU growth recommendation — zero-padded** | `02` |
 | Custom69 | `Cap: Growth Verdict` | Growth verdict summary and timestamp | `RAM: URGENT +4GB -> 20GB … \|\| 14/08/2026 22:15` |
+
+On a domain controller, `Cap: RAM Detail` gets an extra suffix — either
+`| DIT 12.4GB -> floor 16GB` when the DIT size resolved, or `| DIT size unknown -> flat floor`
+when it didn't — so the floor a DC's reclaim/growth figures are measured against is never a
+silent number.
 
 `Cap: Reclaim GB`/`Cap: Rec vCPU` and `Cap: Growth GB`/`Cap: Growth vCPU` are deliberately kept as
 **separate fields rather than one signed number** — a device is never both a reclaim and a growth
@@ -226,6 +257,8 @@ Analyse values are not.
 | `SINGLE-THREAD` | One core near saturation on a low total; vCPU held in both directions |
 | `CPU-PRESSURE` | Sustained high utilisation or queue depth; no reduction offered, and growth flagged `REVIEW` if queue-driven |
 | `SQL` / `EXCH` / `VEEAM` | Excluded from RAM sizing by role, in both directions |
+| `DIT-UNKNOWN` | DC only — the DIT path couldn't be resolved from the registry, so both `Cap: Verdict` and `Cap: Growth Verdict` are suppressed to `REVIEW` rather than computed against the flat floor |
+| `DIT-REVIEW` | DC only — the DIT-raised floor alone would trigger growth, but the same target using the flat floor doesn't; measured demand doesn't corroborate it, so no growth number is forced |
 | `LOW-UPTIME` | Screen only — under `usrMinUptimeHrs`, peak working sets not yet representative |
 | `CANDIDATE` | Screen only — cleared the gross over-allocation test |
 
@@ -412,6 +445,11 @@ $rows | Sort-Object { [int]$_.ReclaimGB } -Descending |
 $rows | Where-Object { [int]$_.GrowthGB -gt 0 -or [int]$_.VcpuGrowth -gt 0 } |
         Sort-Object { [int]$_.GrowthGB } -Descending |
         Select-Object Hostname,Role,AllocatedGB,CommitMaxGB,GrowthGB,GrowthVerdict,vCPU,VcpuGrowth -First 25
+
+# DCs where DIT size couldn't be confirmed or a DIT-driven growth trigger wasn't
+# corroborated by measured demand - worth a manual look either way
+$rows | Where-Object { $_.Role -eq 'DomainController' -and $_.GrowthVerdict -match 'REVIEW' } |
+        Select-Object Hostname,DitSizeGB,RamFloorGB,AllocatedGB,CommitP95GB,GrowthVerdict
 ```
 
 The components run as SYSTEM under the machine account, so the share needs write for `Domain
@@ -531,12 +569,29 @@ sits — but hypervisor-side allocated-vs-active needs your hypervisor's own rep
 Prism Central, VMware RVTools, or the equivalent for your platform). Use both: the hypervisor view
 for allocated-vs-active, this tool for the in-guest truth.
 
-**The domain controller RAM floor is a flat 4GB, and this is wrong.** ESE sizes the AD database
-cache dynamically against available memory, so a DC's committed bytes partly reflects what it was
-given. The cache is bounded by the DIT size, so this is self-limiting and far milder than the SQL
-case — but a DC with a large DIT could receive a reclaim recommendation that shouldn't be acted
-on. **Do not action DC reclaim recommendations without checking `ntds.dit` size and `lsass`
-working set first.** Open item: make the DC floor a function of DIT size.
+**~~The domain controller RAM floor is a flat 4GB, and this is wrong~~ — addressed.** ESE sizes
+the AD database cache dynamically against available memory, so a DC's committed bytes partly
+reflects what it was given; a flat floor risked a reclaim recommendation into a large DIT's
+legitimate demand. The floor is now `max(4GB, ceil(DIT size × 1.15 + 2GB))` where the DIT path
+can be resolved from the registry (see Sizing logic above). Unlike the tool's other floors,
+resolution failure here doesn't fall back to computing anyway — it **suppresses the RAM/growth
+verdict to `REVIEW`/`DIT-UNKNOWN`**, matching the "suppress rather than degrade" guardrail
+philosophy used everywhere else in this tool, since silently reverting to the flat floor is
+exactly the known-wrong value this feature exists to avoid.
+
+**A large DIT alone doesn't force a growth recommendation.** DIT size can reflect tombstone or
+whitespace bloat from years without an offline defrag, with no live-memory equivalent — so a
+DIT-raised floor that would trigger growth is cross-checked against the *same* target using the
+flat floor first. If the flat-floor evidence doesn't independently support growth, the verdict
+downgrades to `REVIEW`/`DIT-REVIEW` rather than asserting a number the measured demand doesn't
+back up. Active memory pressure is unaffected by this check — it's independent, stronger
+evidence and still produces a firm `URGENT` verdict regardless.
+
+This doesn't remove the need for judgement entirely — the DIT size only bounds the
+*memory-caching* demand; **still check `lsass` working set before acting on a DC
+recommendation**, since other DC-hosted workloads (co-located DNS, a chatty LDAP consumer) aren't
+reflected in DIT size at all. Nor does it check for a legacy manual NTDS cache-size cap that
+would make added RAM ineffective — see Sizing logic above.
 
 **SQL is a separate exercise.** Given how much of a typical estate is SQL, expect a meaningful
 share to come back `EXCLUDED`.

@@ -8,6 +8,12 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Changed
+- **Removed the "Platform & Infrastructure" internal team byline from every script header**
+  (all six `.ps1` files bumped a patch version). Same reasoning as the earlier company-name
+  removal — this repo is public, and the header doesn't need to name an internal team any more
+  than it needs to name the company. The line now reads just "Datto capacity sampling toolset".
+
 ### Added
 - **Under-provisioning detection with a growth-sizing recommendation (`Read-ArcCapacityBuffer.ps1`
   v1.5).** Previously the guardrails (`MEM-PRESSURE`, `CPU-PRESSURE`) only ever suppressed a

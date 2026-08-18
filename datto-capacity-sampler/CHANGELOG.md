@@ -8,6 +8,25 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Fixed
+- **Confirmed production bug: a genuinely successful `Arc — Capacity Screen` run on a real
+  device (ARC-DC03) was reported as a failure** (`Invoke-ArcCapacityAnalyse.ps1` v1.4,
+  `Invoke-ArcCapacityScreen.ps1` v1.4). The fail-closed exit-code check added in the previous
+  fix pass assumed `$LASTEXITCODE` reliably propagates across the `& $Local` invocation of the
+  fetched script — it doesn't, in Datto's actual execution environment, even though two separate
+  local reproductions of the same invocation pattern worked fine. The device's console output
+  showed the fetched script reaching its normal `exit 0` and printing a complete `<-Start
+  Result->` block (`ScreenStatus=NO_ACTION`), immediately followed by the stub reporting "returned
+  without an exit code - treating as a failure." Since the previous fix made exit-code propagation
+  load-bearing, every run of both stubs was affected, not just this one case. Replaced entirely:
+  both stubs now determine success/failure from the fetched script's own `<-Start Result->`
+  block — which the ARC-DC03 output proves reliably arrives — with the status value whitelisted
+  against known-OK values (`OK`/`LOW_COVERAGE`/`NO_DATA` for Analyse,
+  `CANDIDATE`/`LOW_UPTIME`/`NO_ACTION` for Screen) rather than blocklisted against known-bad ones,
+  so an unrecognised or `BAD_UDF_BASE`/`FAILED` status still fails closed by default. Verified
+  against the exact production case plus four other scenarios (crash before any result block,
+  explicit `FAILED` status, `BAD_UDF_BASE`, and each whitelisted status) before committing.
+
 ### Changed
 - **Removed the "Platform & Infrastructure" internal team byline from every script header**
   (all six `.ps1` files bumped a patch version). Same reasoning as the earlier company-name

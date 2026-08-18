@@ -107,7 +107,7 @@ Write-Output ''
 
 # $LASTEXITCODE does not reliably propagate across this invocation in Datto's
 # actual execution environment - confirmed in production on the sibling
-# Screen stub (ARC-DC03): a genuinely successful run reached its own `exit 0`
+# Screen stub: a genuinely successful run reached its own `exit 0`
 # and still left $LASTEXITCODE unset here. Whatever Datto's component runner
 # does differs from a plain `powershell.exe -File` invocation in a way that
 # breaks that propagation, so don't rely on it. The <-Start Result-> block

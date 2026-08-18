@@ -10,7 +10,7 @@ _Work in progress on the `develop` branch._
 
 ### Fixed
 - **Confirmed production bug: a genuinely successful `Arc — Capacity Screen` run on a real
-  device (ARC-DC03) was reported as a failure** (`Invoke-ArcCapacityAnalyse.ps1` v1.4,
+  device was reported as a failure** (`Invoke-ArcCapacityAnalyse.ps1` v1.4,
   `Invoke-ArcCapacityScreen.ps1` v1.4). The fail-closed exit-code check added in the previous
   fix pass assumed `$LASTEXITCODE` reliably propagates across the `& $Local` invocation of the
   fetched script — it doesn't, in Datto's actual execution environment, even though two separate
@@ -20,7 +20,7 @@ _Work in progress on the `develop` branch._
   without an exit code - treating as a failure." Since the previous fix made exit-code propagation
   load-bearing, every run of both stubs was affected, not just this one case. Replaced entirely:
   both stubs now determine success/failure from the fetched script's own `<-Start Result->`
-  block — which the ARC-DC03 output proves reliably arrives — with the status value whitelisted
+  block — which the production output proves reliably arrives — with the status value whitelisted
   against known-OK values (`OK`/`LOW_COVERAGE`/`NO_DATA` for Analyse,
   `CANDIDATE`/`LOW_UPTIME`/`NO_ACTION` for Screen) rather than blocklisted against known-bad ones,
   so an unrecognised or `BAD_UDF_BASE`/`FAILED` status still fails closed by default. Verified

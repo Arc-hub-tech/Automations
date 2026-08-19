@@ -42,6 +42,13 @@
                                                         usrUninstall=true. Set explicitly
                                                         to 0 to disable the marker
 
+    Version : 1.6  -  19/08/2026  (stamps its own version as the first line of job output, so
+              "which version of the pasted script actually ran" is answerable from the log
+              instead of inferred; enrollment marker now always logs the resolved UDF index
+              and where it came from, and says so explicitly when disabled - the silent
+              disabled path made a switched-off marker indistinguishable in the job log from
+              a pre-1.5 component still being pasted in)
+
     Version : 1.5  -  18/08/2026  (added usrEnrollUdf, default 79, so enrollment can drive
               a self-maintaining Device Filter instead of a hand-managed device group)
 #>
@@ -52,6 +59,18 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
+
+# Keep in step with the Version history in the header block above.
+#
+# This script is PASTED into Datto's console rather than fetched from git, so
+# unlike the payload it installs there's nothing in the job output that would
+# otherwise reveal which revision ran. That gap is not academic: a rollout
+# where the marker silently didn't appear on some sites could not be pinned on
+# "an older paste" versus "a per-job variable override" from the log alone.
+# Emitted before anything that can fail, so even a crashed run identifies
+# itself.
+$ScriptVersion = '1.6'
+Write-Output "Deploy-ArcCapacitySampler.ps1 v$ScriptVersion"
 
 # Force TLS 1.2 for the GitHub fetch on older PowerShell hosts (2012R2/2016 default
 # to SSL3/TLS1.0, which raw.githubusercontent.com rejects) - same fix as gpo/Apply-Baseline.ps1.
@@ -127,6 +146,16 @@ function Add-Detail { param([string]$m) $details.Add($m); Write-Output $m }
 # actual sampler deploy, which is the job that matters.
 $UdfMax = 300
 $EnrollUdfValid = $false
+
+# Always echo what was resolved and from where. Without this, the disabled
+# (usrEnrollUdf=0) path produced no output at all, making a job log from a
+# device with the marker switched off byte-identical to one still running a
+# pre-1.5 component - two completely different problems that need opposite
+# fixes. Every other suppression in this toolset announces itself; this one
+# didn't, and that cost a live rollout's worth of diagnosis.
+$enrollSource = if ([string]::IsNullOrWhiteSpace($EnrollUdfRaw)) { 'script default' }
+                else { "usrEnrollUdf=$($EnrollUdfRaw.Trim())" }
+
 if ($EnrollUdf -gt 0) {
     if ($EnrollUdf -gt $UdfMax) {
         $status = 'WARNING'
@@ -136,7 +165,10 @@ if ($EnrollUdf -gt 0) {
             Add-Detail 'WARNING: UDF 1 is reserved by Datto Ransomware Detection for isolation notices and will be overwritten by usrEnrollUdf.'
         }
         $EnrollUdfValid = $true
+        Add-Detail "Enrollment marker target: Custom$EnrollUdf ($enrollSource)"
     }
+} else {
+    Add-Detail "Enrollment marker disabled ($enrollSource) - no UDF written or cleared this run"
 }
 
 function Set-DeployUdf {
@@ -145,6 +177,31 @@ function Set-DeployUdf {
     if ($Value.Length -gt 255) { $Value = $Value.Substring(0, 255) }
     if (-not (Test-Path -LiteralPath $udfKey)) { New-Item -Path $udfKey -Force | Out-Null }
     Set-ItemProperty -LiteralPath $udfKey -Name "Custom$Index" -Value $Value -Force
+}
+
+# Reads the payload's own "Version : X.Y" header line off disk. The payload is
+# fetched from git and changes without a re-paste, so the SHA256 already logged
+# on copy identifies it uniquely but tells a human nothing - this makes the
+# installed revision readable at a glance. Read from the installed path rather
+# than the fetch, so it reports what is actually on the device now. Never
+# throws: a missing or unparseable header reports 'unknown' rather than failing
+# a deploy over a cosmetic field.
+function Get-PayloadVersion {
+    param([string]$Path)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return 'unknown' }
+        # 120 lines, not 60: header blocks in this toolset run to ~85 lines
+        # once a few revisions have accumulated (Read-ArcCapacityBuffer.ps1
+        # already carries its Version line at 75). Too small a window fails
+        # silently to 'unknown' rather than visibly.
+        foreach ($line in (Get-Content -LiteralPath $Path -TotalCount 120)) {
+            $m = [regex]::Match($line, '^\s*Version\s*:\s*(\S+)')
+            if ($m.Success) { return $m.Groups[1].Value }
+        }
+        return 'unknown'
+    } catch {
+        return 'unknown'
+    }
 }
 
 function Remove-SamplerTask {
@@ -183,6 +240,7 @@ try {
         Write-Output ''
         Write-Output '<-Start Result->'
         Write-Output 'SamplerStatus=UNINSTALLED'
+        Write-Output "SamplerDeployVersion=$ScriptVersion"
         Write-Output '<-End Result->'
         exit 0
     }
@@ -330,6 +388,12 @@ try {
         }
     }
 
+    # Reported on all three paths above (installed / already current / left
+    # as-is) so the log always states which sampler revision the device is
+    # actually running, not just whether this run changed it.
+    $PayloadVersion = Get-PayloadVersion -Path $ScriptPath
+    Add-Detail "$ScriptName on device is v$PayloadVersion"
+
     # =======================================================================
     # Scheduled task
     #   Registered from XML rather than New-ScheduledTaskTrigger. Indefinite
@@ -446,6 +510,8 @@ try {
     Write-Output "SamplerStatus=$status"
     Write-Output "SamplerInterval=${IntervalMinutes}m"
     Write-Output "SamplerRetention=${RetentionDays}d"
+    Write-Output "SamplerDeployVersion=$ScriptVersion"
+    Write-Output "SamplerPayloadVersion=$PayloadVersion"
     Write-Output '<-End Result->'
 
     if ($status -eq 'FAILED') { exit 1 }
@@ -457,6 +523,7 @@ catch {
     Write-Output '<-Start Result->'
     Write-Output 'SamplerStatus=FAILED'
     Write-Output "SamplerError=$($_.Exception.Message)"
+    Write-Output "SamplerDeployVersion=$ScriptVersion"
     Write-Output '<-End Result->'
     exit 1
 }

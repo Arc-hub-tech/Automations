@@ -499,6 +499,15 @@ Get-Content 'C:\ProgramData\Arc\CapacitySampler\samples.csv'
 
 Expect `LastTaskResult` of `0`, `NumberOfMissedRuns` of `0`, and a populated `NextRunTime`.
 
+**To confirm which revisions a device is running**, read Component 1's job output. Its first line
+is the pasted deploy script's own version (`Deploy-ArcCapacitySampler.ps1 v1.6`), and it reports the
+installed payload separately (`Arc-CapacitySampler.ps1 on device is v1.5`); both also appear in the
+result block as `SamplerDeployVersion=` / `SamplerPayloadVersion=`. These answer two genuinely
+different questions — the deploy version tells you what's **pasted into the Datto console** and only
+changes when someone re-pastes it, while the payload version tells you what git delivered to the
+device and changes on its own. A stale deploy version with a current payload is the normal signature
+of a component that needs re-pasting.
+
 **Two rows fifteen minutes apart is the actual proof.** The first row is written by the seed run
 that the deploy component triggers directly, which demonstrates the script works but not that the
 scheduled trigger fires — those are separate failure modes. Sample times land on `:02`, `:17`,
@@ -559,6 +568,7 @@ actual alert for that condition; a coverage gap in `Cap: Window` is the visible 
 | Sampler log shows "Sample skipped - ... below the 500MB guard threshold" | The buffer's drive is critically low on space — the sampler deliberately skips the write rather than repeat a failing one every 15 minutes. Not a fix for the underlying low-disk condition — Datto's own low-disk-space monitor/alert covers that; this just means the buffer will show a coverage gap for the affected period once space recovers |
 | `FETCH_FAILED` (Analyse/Screen) | The component's bootstrap stub couldn't reach GitHub after 3 attempts — check the device's outbound HTTPS (proxy/firewall must allow `raw.githubusercontent.com`), then re-run the job. Devices on Datto have a network path by definition, so a *persistent* failure here points at a proxy/allowlist gap, not a design limitation |
 | Component 1 shows `WARNING` / "keeping the currently installed payload unchanged" | Git fetch failed on a device that already has the sampler installed and no file attachment was provided — harmless and self-heals on the next scheduled run; the on-device sampler keeps running on its last-good payload throughout |
+| `Cap: Enrolled` blank on some devices but populated on others | Check the job output's first line for the deploy script version. Below v1.5 the component predates the marker entirely — re-paste Component 1. On v1.6+ the log states the resolved index and source (`Enrollment marker target: Custom79 (script default)`) or says the marker is disabled — note that **jobs carry their own variable overrides**, so one job passing `usrEnrollUdf=0` disables it for that job's devices only. On v1.5 exactly the marker is written silently or skipped silently, so those two cases are indistinguishable from the log — upgrade to v1.6+ before diagnosing further. Also check the job didn't fail before the write (`SamplerStatus=FAILED`) |
 | Component 1 shows `FAILED` / "has now failed N days in a row" | Git fetch has failed on 7+ **consecutive** daily runs — no longer treated as a one-off blip. Check the device's outbound HTTPS and the component's `usrBranch` value for a typo; the counter resets to 0 automatically on the next successful fetch |
 | Analyse/Screen output shows "running the last successfully-fetched copy (cached ...)" | The fetch failed but a previously-cached copy exists at `C:\ProgramData\Arc\CapacitySampler\cache\` and ran instead — the job still completes normally; check connectivity if this persists across multiple runs, since the cached copy will grow stale |
 | `Arc-CapacitySampler.ps1 not found` | Fetch failed **and** there's no file attachment **and** nothing is installed yet — this only happens on a device's very first deploy. Either fix connectivity or attach `Arc-CapacitySampler.ps1` as a one-time fallback |

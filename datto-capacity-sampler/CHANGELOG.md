@@ -8,6 +8,22 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Added
+- **Component 1 now stamps its own version into the job output** (`Deploy-ArcCapacitySampler.ps1`
+  v1.6), as the first line (`Deploy-ArcCapacitySampler.ps1 v1.6`) and as
+  `SamplerDeployVersion=` in the `<-Start Result->` block on all three exit paths, including the
+  failure path. This script is *pasted* into Datto's console rather than fetched, so nothing in the
+  output previously revealed which revision ran — during a multi-site rollout that made "an older
+  paste" indistinguishable from "a per-job variable override" from the log alone. Emitted before
+  anything that can fail, so even a crashed run identifies itself.
+- **The installed sampler payload's version is now reported too** —
+  `Arc-CapacitySampler.ps1 on device is v1.5`, plus `SamplerPayloadVersion=`. Read from the
+  installed file on disk (not the fetch) on all three copy paths — installed, already current, and
+  left as-is — so the log always states which sampler revision the device is actually running.
+  Since the payload is fetched from git and changes with no re-paste, the SHA256 already logged
+  identified it uniquely but told a human nothing. Falls back to `unknown` rather than failing a
+  deploy over a cosmetic field.
+
 ### Fixed
 - **The enrollment marker's disabled path was completely silent, making a live rollout
   undiagnosable** (`Deploy-ArcCapacitySampler.ps1` v1.6). With `usrEnrollUdf=0` the script wrote

@@ -181,9 +181,11 @@ figure and minimum PLE are reported instead (UDF 66), enough to triage which ins
 
 ## UDF map
 
-All 30 UDFs already exist on every Datto device — this process **labels** existing fields, it
-does not create new ones. Labels are account-wide (Setup → Global Settings → User-Defined
-Fields); values are per device. Datto caps UDF labels at 22 characters.
+UDFs already exist on every Datto device — this process **labels** existing fields, it does not
+create new ones. Labels are account-wide (Setup → Global Settings → User-Defined
+Fields); values are per device. Datto caps UDF labels at 22 characters. These scripts accept any
+index from 1–300 (registry values `Custom1`–`Custom300`); the ranges actually used are **60–69**
+(Analyse), **70–73** (Screen) and **79** (enrollment marker).
 
 > Check the existing UDF map in Global Settings before first run. `usrUdfBase` /
 > `usrScreenUdfBase` overwrite without warning, and an out-of-range value now fails the job
@@ -572,6 +574,7 @@ actual alert for that condition; a coverage gap in `Cap: Window` is the visible 
 | Component 1 shows `FAILED` / "has now failed N days in a row" | Git fetch has failed on 7+ **consecutive** daily runs — no longer treated as a one-off blip. Check the device's outbound HTTPS and the component's `usrBranch` value for a typo; the counter resets to 0 automatically on the next successful fetch |
 | Analyse/Screen output shows "running the last successfully-fetched copy (cached ...)" | The fetch failed but a previously-cached copy exists at `C:\ProgramData\Arc\CapacitySampler\cache\` and ran instead — the job still completes normally; check connectivity if this persists across multiple runs, since the cached copy will grow stale |
 | `Arc-CapacitySampler.ps1 not found` | Fetch failed **and** there's no file attachment **and** nothing is installed yet — this only happens on a device's very first deploy. Either fix connectivity or attach `Arc-CapacitySampler.ps1` as a one-time fallback |
+| `samples.csv` far larger than the ~175KB steady state | Sampler versions before v1.6 never trimmed the ring buffer (the trim test's row count was always 0), so `usrRetention` went unenforced and the buffer grew unbounded — ~24KB/day. Harmless to recommendations, since analysis windows by timestamp rather than buffer length. Resolves itself: once the device picks up sampler v1.6+ via Component 1, the next sample trims it back to `usrRetention` |
 | `No buffer at …` | `Arc — Capacity Sampler Deploy` hasn't run on that device |
 | `BAD_UDF_BASE` | `usrUdfBase` outside 1–291 (Analyse), or `usrScreenUdfBase` outside 1–297 (Screen) |
 | Coverage well under 100% | Device powered off for part of the window, or task disabled by GPO |

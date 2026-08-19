@@ -42,6 +42,10 @@
                                                         usrUninstall=true. Set explicitly
                                                         to 0 to disable the marker
 
+    Version : 1.7  -  19/08/2026  (seed sample now polls for the first data row instead of
+              sleeping a fixed 12s and testing only that the buffer file exists - the old check
+              reported "Seed sample taken ... 0 sample(s)" on a real fresh install)
+
     Version : 1.6  -  19/08/2026  (stamps its own version as the first line of job output, so
               "which version of the pasted script actually ran" is answerable from the log
               instead of inferred; enrollment marker now always logs the resolved UDF index
@@ -69,7 +73,7 @@ $ProgressPreference    = 'SilentlyContinue'
 # "an older paste" versus "a per-job variable override" from the log alone.
 # Emitted before anything that can fail, so even a crashed run identifies
 # itself.
-$ScriptVersion = '1.6'
+$ScriptVersion = '1.7'
 Write-Output "Deploy-ArcCapacitySampler.ps1 v$ScriptVersion"
 
 # Force TLS 1.2 for the GitHub fetch on older PowerShell hosts (2012R2/2016 default
@@ -339,8 +343,8 @@ try {
 
     # Captured before this run touches anything - distinguishes a genuinely fresh
     # deploy from a routine daily re-check, so seeding (below) doesn't force an
-    # extra off-cycle sample + 12s block on every device every day once Component
-    # 1 is scheduled daily rather than monthly.
+    # extra off-cycle sample plus its blocking wait on every device every day
+    # once Component 1 is scheduled daily rather than monthly.
     $isFreshInstall = -not (Test-Path -LiteralPath $ScriptPath)
 
     # =======================================================================
@@ -476,15 +480,58 @@ try {
     # Seed one sample so the aggregator has something on first pass
     #   Only on a genuinely fresh install - $isFreshInstall was captured before
     #   this run touched anything. Without this gate, scheduling this component
-    #   daily (recommended) would force an extra off-cycle sample plus a 12s
-    #   block on every device every day, forever, instead of once at deploy.
+    #   daily (recommended) would force an extra off-cycle sample plus a wait
+    #   on every device every day, forever, instead of once at deploy.
+    #
+    #   Waits for the first data ROW, not merely for the file to exist.
+    #
+    #   The "Seed sample taken - buffer now holds 0 sample(s)" seen in production
+    #   was caused by the sample-count expression below, which returned 0 for any
+    #   buffer of any size - not by this wait being too short. Two independent
+    #   weaknesses were present though, and both are fixed: the old check tested
+    #   only Test-Path, so a header-only buffer reported success; and a fixed
+    #   sleep is a race on a slow VM regardless of the count bug. Polling returns
+    #   the moment the row lands (usually a few seconds), so the normal case is
+    #   now faster than the old unconditional 12s block, while a slow VM gets the
+    #   time it actually needs.
+    #
+    #   A slow seed is not a deployment failure - the 15-minute schedule fills
+    #   the buffer regardless - so the timeout reports honestly without ever
+    #   escalating past WARNING.
     # =======================================================================
+    $SeedTimeoutSeconds  = 60
+    $SeedPollIntervalSec = 2
+
     if ($SeedNow -and $isFreshInstall) {
         Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath
-        Start-Sleep -Seconds 12
-        if (Test-Path -LiteralPath $BufferPath) {
-            $count = [math]::Max(0, @(Get-Content -LiteralPath $BufferPath -ReadCount 0).Count - 1)
-            Add-Detail "Seed sample taken - buffer now holds $count sample(s)"
+
+        $seedCount   = 0
+        $seedElapsed = 0
+        while ($seedElapsed -lt $SeedTimeoutSeconds) {
+            Start-Sleep -Seconds $SeedPollIntervalSec
+            $seedElapsed += $SeedPollIntervalSec
+
+            if (Test-Path -LiteralPath $BufferPath) {
+                try {
+                    # No -ReadCount 0 here: it emits the whole file as a single
+                    # array object, so @(...).Count is 1 for any file of any
+                    # size and the "- 1" for the header made this permanently 0.
+                    $seedCount = [math]::Max(0, @(Get-Content -LiteralPath $BufferPath).Count - 1)
+                } catch {
+                    # The sampler may hold the file open mid-write. A transient
+                    # read failure means "not ready yet", not "broken" - keep
+                    # polling rather than aborting on it.
+                    $seedCount = 0
+                }
+                if ($seedCount -gt 0) { break }
+            }
+        }
+
+        if ($seedCount -gt 0) {
+            Add-Detail "Seed sample taken after ${seedElapsed}s - buffer now holds $seedCount sample(s)"
+        } elseif (Test-Path -LiteralPath $BufferPath) {
+            $status = 'WARNING'
+            Add-Detail "Seed sample wrote no row within ${SeedTimeoutSeconds}s - buffer file exists but holds no samples yet. The 15-minute schedule will populate it; check sampler.log if it stays empty"
         } else {
             $status = 'WARNING'
             Add-Detail 'Seed sample produced no buffer file - check sampler.log on the device'

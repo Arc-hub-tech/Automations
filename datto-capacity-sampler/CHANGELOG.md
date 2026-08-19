@@ -8,6 +8,28 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Fixed
+- **The on-device ring buffer never trimmed, so `usrRetention` was silently unenforced**
+  (`Arc-CapacitySampler.ps1` v1.6). The row count driving the trim test used
+  `Get-Content -ReadCount 0`, which emits the whole file as a *single* array object — so
+  `@(...).Count` returned `1` for a buffer of any size, and subtracting the header pinned the count
+  at `0`. The guard `if ($lineCount -gt ($ringSize + 24))` was therefore always false and the
+  buffer grew without bound on every deployed device. **Recommendations were never affected** —
+  `Read-ArcCapacityBuffer.ps1` windows by timestamp cutoff, not by buffer length — so this cost
+  disk (~24KB/day, roughly 9MB/year) rather than correctness. Devices whose buffers have already
+  overgrown will trim back to `usrRetention` on their next sample after this reaches them.
+- **The seed sample always reported `0 sample(s)`** (`Deploy-ArcCapacitySampler.ps1` v1.7). Same
+  `-ReadCount 0` defect as above, in the deploy's post-seed count — which is what produced the
+  self-contradictory `Seed sample taken - buffer now holds 0 sample(s)` observed on a real fresh
+  install. Two further weaknesses in the same block were fixed alongside it: the success branch
+  tested only `Test-Path`, so a header-only buffer reported success; and the fixed 12-second sleep
+  was a race on a slow VM regardless. It now polls every 2s for up to 60s for the first actual data
+  row, returning as soon as one lands — so the normal case is *faster* than the old unconditional
+  12s block — and distinguishes "no buffer file" from "buffer exists but no rows yet". A slow seed
+  never escalates past `WARNING`, since the 15-minute schedule populates the buffer regardless.
+  Verified against 5 scenarios including the exact production case (header present, row arriving
+  later).
+
 ### Added
 - **Component 1 now stamps its own version into the job output** (`Deploy-ArcCapacitySampler.ps1`
   v1.6), as the first line (`Deploy-ArcCapacitySampler.ps1 v1.6`) and as
@@ -23,6 +45,12 @@ _Work in progress on the `develop` branch._
   Since the payload is fetched from git and changes with no re-paste, the SHA256 already logged
   identified it uniquely but told a human nothing. Falls back to `unknown` rather than failing a
   deploy over a cosmetic field.
+
+### Changed
+- **Corrected the README's "All 30 UDFs" claim**, which contradicted the scripts' own `1–300`
+  validation range and briefly misdirected diagnosis of a live enrollment-marker issue toward a
+  non-existent platform ceiling. Now states the accepted range (`Custom1`–`Custom300`) and the
+  ranges actually used: 60–69 (Analyse), 70–73 (Screen), 79 (enrollment marker).
 
 ### Fixed
 - **The enrollment marker's disabled path was completely silent, making a live rollout

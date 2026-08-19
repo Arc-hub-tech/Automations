@@ -305,7 +305,7 @@ Analyse values are not.
 | `DIT-REVIEW` | DC only — the DIT-raised floor alone would trigger growth, but the same target using the flat floor doesn't; measured demand doesn't corroborate it, so no growth number is forced |
 | `LOW-UPTIME` | Screen only — under `usrMinUptimeHrs`, peak working sets not yet representative |
 | `CANDIDATE` | Screen only — cleared the gross over-allocation test |
-| `UPSIZE` | Screen only — committed bytes exceed allocation, **or** available memory is under 1GB. Two independent triggers, and the verdict names which fired. The 1GB test is the same metric and threshold Component 2 uses for `MEM-PRESSURE`, so the two can't disagree. Outranks the uptime gate **and** the role exclusions (it's an observable fact, not a sizing claim). Reported, never sized — Component 2's growth-sizing produces the number |
+| `UPSIZE` | Screen only — available memory under 1GB, **or** committed bytes exceeding allocation *while* available memory is under 20% of allocation. The commit ratio never triggers alone. The 1GB test is the same metric and threshold Component 2 uses for `MEM-PRESSURE`, so the two can't disagree. The verdict names what fired. Outranks the uptime gate **and** the role exclusions (it's an observable fact, not a sizing claim). Reported, never sized — Component 2's growth-sizing produces the number |
 | `SQL-MINOR` | Screen only — a SQL instance is present but the engine isn't a material memory consumer (under 2GB, or under 25% of allocation), so the host is screened normally instead of excluded. Typically a bundled Express instance from an RDS Connection Broker, Veeam, or an LOB app |
 | `VEEAM-MINOR` | Screen only — Veeam is installed but only as an agent or installer service, i.e. this host is a backup *target*, not backup infrastructure. Screened normally instead of excluded |
 | `HYPER-V` | Screen only — the Hyper-V role is installed. Returns `NO SCREEN` regardless of every other role: guest-side demand can't describe a host whose memory is consumed by its VMs |
@@ -455,20 +455,25 @@ compute a max-based demand figure from. What the Screen does do is flag the one 
 history at all: `UPSIZE`, where committed bytes exceed 90% of allocation, meaning the host is
 leaning on its pagefile at the moment of measurement.
 
-`UPSIZE` fires on either of two independent triggers, and the verdict names which one:
+**Available memory is the primary evidence; the commit ratio never triggers on its own.** `UPSIZE`
+fires on either:
 
-* **committed bytes exceed allocation** — more is committed than physical RAM exists, so the
-  pagefile is definitely carrying some of it; or
-* **available memory under 1GB** — the OS is genuinely short of memory right now. This is the same
-  metric and threshold Component 2 uses for `MEM-PRESSURE`, so the two components can't disagree
-  about what "under memory pressure" means.
+* **available memory under 1GB** — the OS is genuinely short of memory right now, whatever the ratio
+  says. The same metric and threshold Component 2 uses for `MEM-PRESSURE`, so the two components
+  can't disagree about what "under memory pressure" means; or
+* **committed bytes exceeding allocation *and* available memory under 20% of allocation** —
+  over-committed *and* nearly out of headroom.
 
-**The commit ratio alone is not evidence of memory pressure**, which is why it isn't used that way.
-Committed bytes counts reservations the pagefile can back, so a host can sit near or even above its
-allocation with plenty of available memory and no performance consequence — an earlier
-ratio-only rule flagged a host at 93% of allocation that was holding 35% of its memory available.
-Equally, the ratio on its own misses hosts that are genuinely out of memory below 100%: a DC on 3GB
-(already under its own 4GB role floor) with 0.4GB available read `NO HEADROOM`.
+The verdict names what fired. The reason the ratio is never sufficient alone is that committed bytes
+counts reservations the pagefile can back, and much committed memory is never touched — so a host can
+sit well above its allocation with plenty free and no performance consequence. Two successive runs on
+a real estate proved it: a 90% ratio rule flagged a 96GB host holding 35% available, and tightening
+to 100% still flagged that host (108% commit, 30% available) plus three 32GB session hosts at 23–30%
+available. Commit charge routinely exceeds RAM on RDSH.
+
+Equally, the ratio on its own misses hosts that genuinely are short below 100% — a DC on 3GB (already
+under its own 4GB role floor) with 0.37GB available sits at only 88% commit, which is why the
+absolute available-memory trigger exists.
 
 `UPSIZE` deliberately **outranks both the uptime gate and the role exclusions**. Neither guard
 applies to it: it's an observable fact rather than a sizing claim, and a host out of memory 8 hours

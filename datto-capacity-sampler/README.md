@@ -384,11 +384,23 @@ rollout on `main`. Set `usrBranch=develop` only on pilot devices while testing a
 
 ### Same-day screen (`Arc — Capacity Screen`)
 
-Needs no history. Peak working set per process is retained by Windows since process start, so
-summing it gives a high-water mark with no observation window — it overcounts on purpose (shared
-pages double-counted, per-process peaks not simultaneous), making it a conservative upper bound.
-It will miss marginal candidates and won't produce false positives, the correct bias for a list
-meant to be acted on quickly.
+Needs no history. The basis is **committed bytes** — the same demand metric Component 2 sizes
+from, so the two agree on what "demand" means, just measured instantaneously rather than as a p95.
+
+It used to be `max(committed, peak working set sum)`, which in practice meant the peak sum won on
+most hosts. That was a deliberate over-count intended as a conservative upper bound, but it isn't
+bounded by physical memory: on a 73-device estate it exceeded allocated RAM on 20 of them, emitting
+verdicts like `basis 13.89GB against 8GB allocated`. A basis that exceeds the allocation it's being
+compared against can't support a verdict in either direction, and the ×1.4 multiplier compounded it.
+Peak working set sum is still collected and reported as context.
+
+**With a single instantaneous reading as the basis, the conservatism comes entirely from the
+gross-over-allocation gate** — reclaim must clear both 40% of allocation and 8GB. That gate is what
+does the real filtering, and it's why the screen stays a no-false-positives tool: switching the
+basis off peak working sets moved the estate result only from 90GB to 104GB, because the gate, not
+the basis, was the binding constraint. If you want the fuller picture sooner, run
+`Arc — Capacity Analyse` with `usrConservative=true` against whatever buffer has accumulated — a few
+days of real samples is better evidence than one instant reading, and it self-labels `PROVISIONAL`.
 
 CPU is average utilisation since boot, derived from System Idle Process kernel time rather than
 by summing per-process CPU (which would undercount anything that's since exited). **No vCPU
@@ -404,8 +416,13 @@ vCPU sizing comes from Component 2 on a real window:
   test existed — so a real host averaging 95.1% over 104 days (7.61 of 8 cores) produced no signal
   of any kind.
 
-Below `usrMinUptimeHrs` (default 24h) the peak working sets haven't had time to become
-representative and the screen declines to recommend, flagging `LOW-UPTIME`.
+Below `usrMinUptimeHrs` (default 24h) the screen declines to recommend, flagging `LOW-UPTIME`. This
+is now a **settling floor, not a warm-up period** — its original rationale was that peak working
+sets need time to become representative, which no longer applies to an instantaneous metric. It's
+retained only so a host measured mid-boot, with services still starting, isn't screened on an
+unrepresentative moment. Raising it much higher is counter-productive: a 7-day gate would defer 32
+of 73 devices on the estate and suppress most current candidates, including the four 96GB RDSH hosts
+that carry the largest single opportunity.
 
 Where Screen and Analyse disagree, **Analyse wins** — it measures demand over time rather than
 inferring it from a high-water mark.

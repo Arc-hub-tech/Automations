@@ -12,13 +12,17 @@
               once and returns a defensible candidate list immediately. Intended
               to run alongside, not instead of, the 14-day sampler.
 
-    How it gets history without waiting
-      Peak working set per process is retained by Windows since process start, so
-      summing it gives a high-water mark with no observation window. It overcounts
-      deliberately: shared pages are double-counted and per-process peaks did not
-      occur simultaneously. That makes it a conservative upper bound on demand,
-      which is exactly what a screen wants - it will miss marginal candidates and
-      will not produce false positives.
+    How it stays conservative without history
+      The basis is committed bytes - a current reading, and the same demand metric
+      Component 2 sizes from, so the two agree on what "demand" means. Peak working
+      set sum is still collected and reported as context but is NOT the basis; see
+      the note at $basisGB for why that changed.
+
+      With a single instantaneous reading as the basis, the conservatism comes
+      entirely from the gross-over-allocation gate: reclaim must clear both 40% of
+      allocation and 8GB. That is what stops a one-off measurement producing a
+      marginal recommendation, and it is doing the real filtering - switching the
+      basis off peak working sets moved a 73-device estate only from 90GB to 104GB.
 
       Average CPU since boot is derived from the System Idle Process kernel time
       rather than by summing per-process CPU, which would undercount anything that
@@ -31,7 +35,7 @@
       Component 2 on a proper window.
 
     Screening test
-      Basis   = max( current committed , sum of peak working sets )
+      Basis   = current committed bytes
       Target  = max( RoleFloor , Basis x 1.4 )
       Flag only where reclaim exceeds BOTH 40% of allocation and 8GB.
 
@@ -43,6 +47,14 @@
               usrScreenUdfBase Integer  default 70    First UDF index, uses 4 fields
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
+
+    Version : 1.5  -  19/08/2026  (basis moved off peak-working-set sum onto committed
+              bytes - the old max(committed, peakSum) exceeded allocated RAM on 20 of 73
+              real devices, which cannot support a verdict either way. Gross-over-allocation
+              gate and the 24h uptime floor both retained deliberately: the gate is what
+              provides conservatism now, and the uptime gate's original warm-up rationale
+              no longer applies to an instantaneous metric, so its wording is corrected to
+              describe what it actually is)
 
     Version : 1.4  -  19/08/2026  (three fixes from a 73-device estate export.
               SQL exclusion now requires the engine to be a MATERIAL memory consumer
@@ -274,7 +286,25 @@ try {
     $ramFloorGB = $RamFloor[$role]
     if (-not $ramFloorGB) { $ramFloorGB = 4 }
 
-    $basisGB   = [math]::Max($committedGB, $peakSumGB)
+    # Basis is committed bytes. Peak working set sum is reported alongside it as
+    # context but is deliberately NOT part of the basis any more.
+    #
+    # It used to be max(committed, peakSum), which in practice meant peakSum won
+    # on most hosts. Summing per-process peaks double-counts shared pages and
+    # adds peaks that never co-occurred, and the result is not bounded by
+    # physical memory: on a real 73-device estate it exceeded allocated RAM on
+    # 20 of them, producing output like "basis 13.89GB against 8GB allocated".
+    # As an intentional over-count it was defensible in principle, but a basis
+    # that exceeds the allocation it is being compared against cannot support a
+    # verdict either way, and applying the 1.4x multiplier on top compounded it.
+    #
+    # Committed bytes is private memory demand, is bounded by something real, and
+    # is what Component 2 sizes from - so the two components now agree on what
+    # "demand" means. The conservatism that peakSum was providing is retained
+    # instead by the gross-over-allocation gate below (must clear both 40% of
+    # allocation and 8GB), which is what actually does the filtering: switching
+    # the basis alone moved the estate result only from 90GB to 104GB.
+    $basisGB   = $committedGB
     $reclaimGB = 0
     $verdict   = ''
 
@@ -303,8 +333,14 @@ try {
         $verdict = "UPSIZE - commit ${committedGB}GB is ${pctOfAlloc}% of ${allocatedGB}GB allocated, no reclaim headroom${roleContext}"
     }
     elseif ($uptimeHrs -lt $MinUptimeHrs) {
+        # Now a sanity floor, not a warm-up period. The gate originally existed
+        # because peak working sets need time to become representative; with
+        # committed bytes as the basis that no longer applies, since commit is a
+        # current reading valid minutes after boot. It is kept only so a host
+        # measured mid-boot - services still starting, caches cold - is not
+        # screened on an unrepresentative moment.
         $flags.Add('LOW-UPTIME')
-        $verdict = "NO SCREEN - uptime ${uptimeText}, peak working sets not yet representative"
+        $verdict = "NO SCREEN - uptime ${uptimeText}, still settling after boot"
     }
     elseif ($RamExcludedRoles -contains $role) {
         # Cite the footprint that justified a SQL exclusion, so the decision is
@@ -428,9 +464,12 @@ try {
     Write-Output "CPU       : $cpuText"
     Write-Output "Verdict   : $verdict"
     Write-Output ''
-    Write-Output 'NOTE: screening figures only. Peak working set sums overcount shared pages and'
-    Write-Output '      non-simultaneous peaks, so this understates reclaim by design. Average CPU'
-    Write-Output '      since boot is not a vCPU sizing basis. Confirm against Component 2.'
+    Write-Output 'NOTE: screening figures only, from a single instantaneous reading. Reclaim is'
+    Write-Output '      gated to gross over-allocation (40% of allocation and 8GB) so a one-off'
+    Write-Output '      measurement cannot produce a marginal recommendation. PeakWS sum is'
+    Write-Output '      context only, not the basis - it overcounts shared pages and'
+    Write-Output '      non-simultaneous peaks. Average CPU since boot is not a vCPU sizing'
+    Write-Output '      basis. Confirm against Component 2.'
     Write-Output ''
     Write-Output '<-Start Result->'
     # ScreenStatus MUST stay within the set Invoke-ArcCapacityScreen.ps1

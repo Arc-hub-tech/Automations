@@ -8,8 +8,38 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Changed
+- **The Screen's sizing basis moved off peak-working-set sum onto committed bytes**
+  (`Get-ArcCapacityScreen.ps1` v1.5). It was `max(committed, peakSum)`, which in practice meant the
+  peak sum won on most hosts. Summing per-process peaks double-counts shared pages and adds peaks
+  that never co-occurred, and the result isn't bounded by physical memory — on a 73-device estate it
+  **exceeded allocated RAM on 20 of them**, emitting verdicts like `basis 13.89GB against 8GB
+  allocated`. As an intentional over-count it was defensible in principle, but a basis that exceeds
+  the allocation it's compared against can't support a verdict either way, and the ×1.4 multiplier
+  compounded it. Committed bytes is also what Component 2 sizes from, so the two components now
+  agree on what "demand" means. Peak working set sum is still collected and reported as context.
+
+  **The gross-over-allocation gate (40% of allocation and 8GB) and the 24h uptime floor were both
+  retained deliberately.** Measurement showed the gate, not the basis, was the binding constraint:
+  the basis change alone moves the estate from 90GB/5 devices to 104GB/6 devices, whereas relaxing
+  the gate would reach 248GB/22 devices. Keeping it preserves the Screen's no-false-positives
+  property, which matters more now the basis is a single instantaneous reading — an RDSH host at one
+  day's uptime fills up across the working week. For a fuller early picture, `Arc — Capacity Analyse`
+  with `usrConservative=true` reads real samples and self-labels `PROVISIONAL`.
+
+  A proposed 7-day uptime gate was measured and **rejected as counter-productive**: it would defer 32
+  of 73 devices, suppress 4 of the 5 then-current candidates, and suppress all four 96GB RDSH hosts
+  (1–3 days' uptime) that carry the largest single opportunity — cutting the screen to 26GB/2
+  devices. The gate's wording is corrected instead: it was justified as a peak-working-set warm-up
+  period, which no longer applies to an instantaneous metric, so it now reads as the settling floor
+  it actually is.
+
+  A proposed business-hours p95 CPU basis fed from a new aggregator UDF was **deferred** — Component
+  2 already sizes vCPU from a real 14-day window with per-core spread, and it would make the Screen
+  depend on sampling history it's designed not to need. `CPU-PRESSURE` below covers the urgent gap.
+
 ### Fixed
-_Three defects in `Get-ArcCapacityScreen.ps1` (v1.4), all found by reviewing a real 73-device estate
+_Three defects in `Get-ArcCapacityScreen.ps1`, all found by reviewing a real 73-device estate
 export rather than by testing._
 - **The SQL exclusion fired on mere presence of a SQL instance, excluding 21 of 73 devices** —
   among them RD gateways, a VPN host and plain file servers. None were mis-matched: the predicate

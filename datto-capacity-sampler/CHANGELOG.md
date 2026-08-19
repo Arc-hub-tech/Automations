@@ -9,6 +9,16 @@ script versions independently — see its own header comment for its current ver
 _Work in progress on the `develop` branch._
 
 ### Fixed
+- **The commit ratio still triggered `UPSIZE` on its own, and still produced false positives**
+  (`Get-ArcCapacityScreen.ps1` v1.8). Raising the ratio from 90% to 100% in v1.6 fixed the reported
+  case but not the class: on a 155-device run the same 96GB host reappeared at 108% commit while
+  holding **28.36GB (30%) available**, joined by three 32GB session hosts at 23–30% available and
+  five more at 21–29%. Commit charge routinely exceeds RAM on RDSH, because committed bytes counts
+  reservations the pagefile can back and much of it is never touched. Available memory is now the
+  primary evidence and the ratio never triggers alone: `UPSIZE` requires **available under 1GB**
+  (unchanged, matching Component 2's `MEM-PRESSURE`), or **commit exceeding allocation while
+  available is under 20% of allocation**. Verified against the export — 34 → 25 flagged, the nine
+  healthy hosts dropped, **nothing newly flagged** (the rule only tightens), no sub-1GB host missed.
 - **The Veeam exclusion matched any `Veeam*` service, treating every backed-up machine as backup
   infrastructure** (`Get-ArcCapacityScreen.ps1` v1.7) — the same over-broad mistake the SQL predicate
   made, found in the same estate export. Veeam installs its Installer/Deployment service on every

@@ -48,6 +48,12 @@
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
 
+    Version : 1.8  -  19/08/2026  (the commit ratio no longer triggers UPSIZE on its own -
+              at 100% it still flagged a 96GB host holding 30% of its memory available, plus
+              three session hosts at 23-30%. Commit charge routinely exceeds RAM on RDSH.
+              Over-commitment must now be accompanied by available memory under 20% of
+              allocation; the absolute available < 1GB trigger is unchanged)
+
     Version : 1.7  -  19/08/2026  (Veeam exclusion narrowed to backup INFRASTRUCTURE - matching
               any Veeam* service treated every backed-up machine as backup infra, discarding a
               file server's reclaim; agent/installer-only hosts are now VEEAM-MINOR and screened.
@@ -391,50 +397,61 @@ try {
     # exactly what they were doing - 12 hosts on a real estate sat over
     # allocation while reading NO HEADROOM or EXCLUDED.
     #
-    # Two independent triggers, because the commit ratio ALONE is not evidence of
-    # memory pressure and using it that way produced false positives on the first
-    # real run: SFP-RDS-1 was flagged at 93% of allocation while holding 33.46GB
-    # (35%) available, and SC-AM-RDS05 at 93% with 19% available. Neither host is
-    # short of memory. Committed bytes counts reservations the pagefile can back,
-    # so a host can sit near or above its allocation with plenty of available
-    # memory and no performance consequence.
+    # Available memory is the primary evidence; the commit ratio never triggers on
+    # its own. Committed bytes counts reservations the pagefile can back, and much
+    # committed memory is never touched, so a host can sit well above its
+    # allocation with plenty of memory free and no performance consequence. Two
+    # successive runs on a real estate proved that the hard way: a ratio-only rule
+    # at 90% flagged a 96GB host holding 35% available, and tightening it to 100%
+    # still flagged the same host (108% commit, 30% available) plus three 32GB
+    # session hosts at 23-30% available. Commit charge routinely exceeds RAM on
+    # RDSH.
     #
-    #   commit > allocation  - more committed than physical RAM exists, so the
-    #                          pagefile is definitely carrying some of it.
-    #   available < 1GB      - the OS is genuinely short of memory right now.
-    #                          Deliberately the same threshold and metric
-    #                          Component 2 uses for MEM-PRESSURE
-    #                          (Read-ArcCapacityBuffer.ps1: availMin < 1.0), so
-    #                          the two components cannot disagree about what
-    #                          "under memory pressure" means.
+    #   available < 1GB           - the OS is genuinely short of memory right now,
+    #                               whatever the ratio says. Deliberately the same
+    #                               metric and threshold Component 2 uses for
+    #                               MEM-PRESSURE (Read-ArcCapacityBuffer.ps1:
+    #                               availMin < 1.0), so the two components cannot
+    #                               disagree about what "under memory pressure"
+    #                               means. This is what catches hosts the ratio
+    #                               misses entirely - S2D-DC02, a DC on 3GB with
+    #                               0.37GB available, sits at only 88% commit.
     #
-    # The available-memory test is what catches the cases the ratio misses
-    # entirely: S2D-DC02 (a DC on 3GB, below its own 4GB role floor, with 0.4GB
-    # available) read NO HEADROOM under the ratio-only rule.
+    #   commit > allocation AND   - over-committed AND with little headroom left.
+    #   available < 20%             The second clause is what stops a busy session
+    #                               host being called distressed while a quarter of
+    #                               its memory is free.
     #
     # Reported, never sized: the screen says "look at this", and Component 2's
     # growth-sizing produces the actual number from a real window.
-    $overCommitted = (($allocatedGB -gt 0) -and ($committedGB -gt $allocatedGB)) -or
-                     ($availableGB -lt 1.0)
+    $OverCommitAvailFraction = 0.20
+
+    $lowAvailAbs     = ($availableGB -lt 1.0)
+    $exceedsAlloc    = ($allocatedGB -gt 0) -and ($committedGB -gt $allocatedGB)
+    $overCommitTight = $exceedsAlloc -and ($availableGB -lt ($allocatedGB * $OverCommitAvailFraction))
+    $overCommitted   = $lowAvailAbs -or $overCommitTight
 
     if ($overCommitted) {
         $flags.Add('UPSIZE')
         $pctOfAlloc  = if ($allocatedGB -gt 0) { [math]::Round(100 * $committedGB / $allocatedGB, 0) } else { 0 }
         $roleContext = if ($RamExcludedRoles -contains $role) { " | $role - confirm against the platform-specific metrics" } else { '' }
 
-        # Name the trigger. A host can reach UPSIZE on either condition alone, and
-        # the two mean different things to whoever reads the UDF: one is "the
-        # pagefile is carrying commit", the other is "the OS is out of memory
-        # now". Reporting only the commit percentage made the second case look
-        # like the first, or - on a host under 100% - look like a mistake.
-        $reasons = New-Object System.Collections.Generic.List[string]
-        if (($allocatedGB -gt 0) -and ($committedGB -gt $allocatedGB)) {
-            $reasons.Add("commit ${committedGB}GB exceeds ${allocatedGB}GB allocated (${pctOfAlloc}%)")
+        # Name what actually fired. The two triggers mean different things to
+        # whoever reads the UDF - "the OS is out of memory now" versus
+        # "over-committed and nearly out of headroom" - and reporting only a
+        # commit percentage made the first look like the second, or on a
+        # sub-100% host look like a mistake. Phrased so available memory is
+        # never mentioned twice.
+        $availPct = if ($allocatedGB -gt 0) { [math]::Round(100 * $availableGB / $allocatedGB, 0) } else { 0 }
+
+        $reason = if ($lowAvailAbs -and $exceedsAlloc) {
+            "commit ${committedGB}GB exceeds ${allocatedGB}GB allocated (${pctOfAlloc}%); only ${availableGB}GB available"
+        } elseif ($lowAvailAbs) {
+            "only ${availableGB}GB available"
+        } else {
+            "commit ${committedGB}GB exceeds ${allocatedGB}GB allocated (${pctOfAlloc}%) with only ${availableGB}GB (${availPct}%) available"
         }
-        if ($availableGB -lt 1.0) {
-            $reasons.Add("only ${availableGB}GB available")
-        }
-        $verdict = "UPSIZE - $($reasons -join '; ') - no reclaim headroom${roleContext}"
+        $verdict = "UPSIZE - $reason - no reclaim headroom${roleContext}"
     }
     elseif ($role -eq 'Hypervisor') {
         # Placed after UPSIZE deliberately: a hypervisor that is itself out of

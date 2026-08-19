@@ -179,6 +179,19 @@ reports the configured memory cap, not the requirement, in either direction — 
 figure and minimum PLE are reported instead (UDF 66), enough to triage which instances justify a
 `max server memory` review.
 
+**The SQL exclusion requires the engine to be a *material* memory consumer, not merely present.**
+That reasoning above only holds while SQL actually dominates memory on the host. Presence-only
+matching excluded 21 of 73 devices on a real estate — including RD gateways, a VPN host and plain
+file servers, none of them mis-matched: they genuinely carried a bundled instance
+(`MSSQL$SQLEXPRESS` from an RDS Connection Broker deployment, `MSSQL$VEEAMSQL*` from Veeam, or an
+LOB app's Express instance). A capped Express instance idling at a few hundred MB on a 12GB gateway
+doesn't distort that host's commit figure, and excluding it discarded real, safe reclaim. The
+Screen therefore requires `sqlservr` to hold **at least 2GB and at least 25% of allocated RAM** —
+both conditions, since the ratio alone over-fires on small hosts (Express's buffer pool caps around
+1.4GB) and the absolute alone under-fires on large ones. Below the bar the host is flagged
+`SQL-MINOR` and screened normally. The exclusion verdict cites the footprint that justified it, so
+the decision is auditable from the UDF rather than being an unexplained suppression.
+
 ## UDF map
 
 UDFs already exist on every Datto device — this process **labels** existing fields, it does not
@@ -272,6 +285,9 @@ Analyse values are not.
 | `DIT-REVIEW` | DC only — the DIT-raised floor alone would trigger growth, but the same target using the flat floor doesn't; measured demand doesn't corroborate it, so no growth number is forced |
 | `LOW-UPTIME` | Screen only — under `usrMinUptimeHrs`, peak working sets not yet representative |
 | `CANDIDATE` | Screen only — cleared the gross over-allocation test |
+| `UPSIZE` | Screen only — committed bytes above 90% of allocation, so the host is leaning on its pagefile now. Outranks the uptime gate **and** the role exclusions (it's an observable fact, not a sizing claim). Reported, never sized — Component 2's growth-sizing produces the number |
+| `SQL-MINOR` | Screen only — a SQL instance is present but the engine isn't a material memory consumer (under 2GB, or under 25% of allocation), so the host is screened normally instead of excluded. Typically a bundled Express instance from an RDS Connection Broker, Veeam, or an LOB app |
+| `CPU-PRESSURE` | Screen only (also a Component 2 flag) — average CPU since boot at or above 70%. Because averaging flattens spikes, a sustained average this high implies peaks well above it: this host needs *more* vCPU, not fewer |
 
 ## Deployment
 
@@ -368,30 +384,62 @@ rollout on `main`. Set `usrBranch=develop` only on pilot devices while testing a
 
 ### Same-day screen (`Arc — Capacity Screen`)
 
-Needs no history. Peak working set per process is retained by Windows since process start, so
-summing it gives a high-water mark with no observation window — it overcounts on purpose (shared
-pages double-counted, per-process peaks not simultaneous), making it a conservative upper bound.
-It will miss marginal candidates and won't produce false positives, the correct bias for a list
-meant to be acted on quickly.
+Needs no history. The basis is **committed bytes** — the same demand metric Component 2 sizes
+from, so the two agree on what "demand" means, just measured instantaneously rather than as a p95.
+
+It used to be `max(committed, peak working set sum)`, which in practice meant the peak sum won on
+most hosts. That was a deliberate over-count intended as a conservative upper bound, but it isn't
+bounded by physical memory: on a 73-device estate it exceeded allocated RAM on 20 of them, emitting
+verdicts like `basis 13.89GB against 8GB allocated`. A basis that exceeds the allocation it's being
+compared against can't support a verdict in either direction, and the ×1.4 multiplier compounded it.
+Peak working set sum is still collected and reported as context.
+
+**With a single instantaneous reading as the basis, the conservatism comes entirely from the
+gross-over-allocation gate** — reclaim must clear both 40% of allocation and 8GB. That gate is what
+does the real filtering, and it's why the screen stays a no-false-positives tool: switching the
+basis off peak working sets moved the estate result only from 90GB to 104GB, because the gate, not
+the basis, was the binding constraint. If you want the fuller picture sooner, run
+`Arc — Capacity Analyse` with `usrConservative=true` against whatever buffer has accumulated — a few
+days of real samples is better evidence than one instant reading, and it self-labels `PROVISIONAL`.
 
 CPU is average utilisation since boot, derived from System Idle Process kernel time rather than
 by summing per-process CPU (which would undercount anything that's since exited). **No vCPU
 recommendation is produced** — an average cannot size CPU; a host averaging 6% with a nightly 90%
-batch window still needs its cores. Hosts under 5% average on 8+ vCPU are flagged `CPU-REVIEW`
-for manual attention only; vCPU sizing comes from Component 2 on a real window.
+batch window still needs its cores. Two asymmetric thresholds flag hosts for manual attention only;
+vCPU sizing comes from Component 2 on a real window:
 
-Below `usrMinUptimeHrs` (default 24h) the peak working sets haven't had time to become
-representative and the screen declines to recommend, flagging `LOW-UPTIME`.
+* `CPU-REVIEW` — under 5% average on 8+ vCPU. Suspiciously idle, worth a look for reduction. Gated
+  on core count because trimming a 2–4 vCPU host isn't worth a change window.
+* `CPU-PRESSURE` — 70% or above, at **any** vCPU count (a saturated 2 vCPU host is as stuck as a
+  saturated 16 vCPU one). Because averaging flattens spikes, a sustained average this high is a
+  floor rather than a peak. The screen previously had *no* high-CPU path at all — only the idle
+  test existed — so a real host averaging 95.1% over 104 days (7.61 of 8 cores) produced no signal
+  of any kind.
+
+Below `usrMinUptimeHrs` (default 24h) the screen declines to recommend, flagging `LOW-UPTIME`. This
+is now a **settling floor, not a warm-up period** — its original rationale was that peak working
+sets need time to become representative, which no longer applies to an instantaneous metric. It's
+retained only so a host measured mid-boot, with services still starting, isn't screened on an
+unrepresentative moment. Raising it much higher is counter-productive: a 7-day gate would defer 32
+of 73 devices on the estate and suppress most current candidates, including the four 96GB RDSH hosts
+that carry the largest single opportunity.
 
 Where Screen and Analyse disagree, **Analyse wins** — it measures demand over time rather than
 inferring it from a high-water mark.
 
-**The Screen component does not detect under-provisioning.** Growth-sizing (Custom67–69) is only
-computed by `Arc — Capacity Analyse`, deliberately — a same-day, no-history screen is the wrong
-basis for a recommendation that's meant to catch active memory pressure using a max-based demand
-figure; Screen has no percentile history to compute that from. If a host looks like it's
-struggling and you can't wait for Analyse's window, that's a same-day judgement call, not
-something this component automates.
+**The Screen component does not size under-provisioning, but it does now flag it.** Growth
+*sizing* (Custom67–69) remains Component 2's job — a same-day screen has no percentile history to
+compute a max-based demand figure from. What the Screen does do is flag the one case that needs no
+history at all: `UPSIZE`, where committed bytes exceed 90% of allocation, meaning the host is
+leaning on its pagefile at the moment of measurement.
+
+`UPSIZE` deliberately **outranks both the uptime gate and the role exclusions**. Neither guard
+applies to it: over-commitment is an observable fact rather than a sizing claim, and a host
+over-committed 8 hours after boot is genuinely over-committed. This matters because those guards
+were actively hiding it — on a 73-device estate, 12 hosts sat at or over their allocation while
+reading `NO HEADROOM` or `EXCLUDED`, among them one at **237% of allocation** (9.46GB committed on
+4GB) that the exclusions had silenced completely. The exclusions exist to stop commit being used to
+size a host *down*; they were never meant to conceal a host that's out of memory.
 
 ### Provisional analysis before 14 days (conservative mode)
 

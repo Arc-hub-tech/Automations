@@ -8,6 +8,77 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Changed
+- **The Screen's sizing basis moved off peak-working-set sum onto committed bytes**
+  (`Get-ArcCapacityScreen.ps1` v1.5). It was `max(committed, peakSum)`, which in practice meant the
+  peak sum won on most hosts. Summing per-process peaks double-counts shared pages and adds peaks
+  that never co-occurred, and the result isn't bounded by physical memory — on a 73-device estate it
+  **exceeded allocated RAM on 20 of them**, emitting verdicts like `basis 13.89GB against 8GB
+  allocated`. As an intentional over-count it was defensible in principle, but a basis that exceeds
+  the allocation it's compared against can't support a verdict either way, and the ×1.4 multiplier
+  compounded it. Committed bytes is also what Component 2 sizes from, so the two components now
+  agree on what "demand" means. Peak working set sum is still collected and reported as context.
+
+  **The gross-over-allocation gate (40% of allocation and 8GB) and the 24h uptime floor were both
+  retained deliberately.** Measurement showed the gate, not the basis, was the binding constraint:
+  the basis change alone moves the estate from 90GB/5 devices to 104GB/6 devices, whereas relaxing
+  the gate would reach 248GB/22 devices. Keeping it preserves the Screen's no-false-positives
+  property, which matters more now the basis is a single instantaneous reading — an RDSH host at one
+  day's uptime fills up across the working week. For a fuller early picture, `Arc — Capacity Analyse`
+  with `usrConservative=true` reads real samples and self-labels `PROVISIONAL`.
+
+  A proposed 7-day uptime gate was measured and **rejected as counter-productive**: it would defer 32
+  of 73 devices, suppress 4 of the 5 then-current candidates, and suppress all four 96GB RDSH hosts
+  (1–3 days' uptime) that carry the largest single opportunity — cutting the screen to 26GB/2
+  devices. The gate's wording is corrected instead: it was justified as a peak-working-set warm-up
+  period, which no longer applies to an instantaneous metric, so it now reads as the settling floor
+  it actually is.
+
+  A proposed business-hours p95 CPU basis fed from a new aggregator UDF was **deferred** — Component
+  2 already sizes vCPU from a real 14-day window with per-core spread, and it would make the Screen
+  depend on sampling history it's designed not to need. `CPU-PRESSURE` below covers the urgent gap.
+
+### Fixed
+_Three defects in `Get-ArcCapacityScreen.ps1`, all found by reviewing a real 73-device estate
+export rather than by testing._
+- **The SQL exclusion fired on mere presence of a SQL instance, excluding 21 of 73 devices** —
+  among them RD gateways, a VPN host and plain file servers. None were mis-matched: the predicate
+  (`MSSQLSERVER` or `MSSQL$*`) cannot match `SQLWriter`, `SQLBrowser` or Native Client, which was
+  verified directly. Those hosts genuinely carry a bundled instance — `MSSQL$SQLEXPRESS` from an
+  RDS Connection Broker deployment, `MSSQL$VEEAMSQL*` from Veeam, or an LOB app's Express instance.
+  The predicate worked as designed; the design was too broad. The exclusion exists because commit
+  reports the configured `max server memory` rather than the requirement, which only holds while
+  SQL dominates memory — a capped Express instance idling at a few hundred MB on a 12GB gateway
+  doesn't distort anything, and excluding it discarded real reclaim (ARC-RDGW01 was sitting at 36%
+  of its allocation). Now requires `sqlservr` to hold **at least 2GB and at least 25% of allocated
+  RAM**; below that the host is flagged `SQL-MINOR` and screened normally. Both conditions
+  deliberately — the ratio alone over-fires on small hosts (Express caps its buffer pool near
+  1.4GB), the absolute alone under-fires on large ones. The exclusion verdict now cites the
+  footprint that justified it, so it's auditable from the UDF rather than an unexplained
+  suppression. Validated against 11 bounding scenarios.
+- **Hosts at or over their allocation were silently buried in `NO HEADROOM` or `EXCLUDED`** — 12 on
+  the estate export, including one at **237% of allocation** (9.46GB committed on 4GB) that the SQL
+  exclusion had silenced entirely. New `UPSIZE` verdict and flag where committed bytes exceed 90% of
+  allocation, deliberately **outranking both the uptime gate and the role exclusions**: neither
+  applies, because over-commitment is an observable fact rather than a sizing claim, and a host
+  over-committed 8 hours after boot is genuinely over-committed. Those guards exist to stop commit
+  being used to size a host *down*; they were never meant to conceal a host that's out of memory.
+  Reported, never sized — Component 2's growth-sizing still produces the number. Replaying the real
+  export surfaces 13 hosts, 7 of which were previously hidden behind `EXCLUDED`.
+- **There was no high-CPU path at all** — `CPU-REVIEW` only fired on `avgCpuPct < 5 -and vCPU >= 8`,
+  so the screen could only ever spot *idle* hosts. A real host averaging 95.1% since boot over 104
+  days (7.61 of 8 cores) produced no signal whatsoever. Added `CPU-PRESSURE` at 70% or above, at any
+  vCPU count, matching Component 2's flag name so one filter catches both. Because averaging
+  flattens spikes, a sustained average that high is a floor rather than a peak.
+
+  **`ScreenStatus` values are deliberately unchanged** (`CANDIDATE`/`LOW_UPTIME`/`NO_ACTION`).
+  `Invoke-ArcCapacityScreen.ps1` fails closed on any status it doesn't whitelist, and that stub is
+  *pasted* into Datto — so introducing `ScreenStatus=UPSIZE` would have reported a job failure on
+  every over-committed host until every device had been re-pasted. The new signals travel as
+  separate `ScreenUpsize=` / `ScreenCpuPressure=` result fields, which the stub ignores, keeping
+  this a git-only change that works against any already-pasted stub version. CSV export gains
+  `OverCommitted` and `SqlWsGB`.
+
 ### Fixed
 - **The on-device ring buffer never trimmed, so `usrRetention` was silently unenforced**
   (`Arc-CapacitySampler.ps1` v1.6). The row count driving the trim test used

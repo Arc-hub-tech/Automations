@@ -179,6 +179,26 @@ reports the configured memory cap, not the requirement, in either direction — 
 figure and minimum PLE are reported instead (UDF 66), enough to triage which instances justify a
 `max server memory` review.
 
+**The Veeam exclusion applies to backup *infrastructure*, not to machines being backed up.** That
+timing argument is about something which moves or stores backup data — it says nothing about a
+server that is merely a backup source. Matching any `Veeam*` service was the same over-broad mistake
+the SQL predicate made: Veeam installs its Installer/Deployment service on every managed server and
+its agent on protected endpoints, so on a real estate a 12GB file server with 8.58GB committed was
+classed as backup infrastructure and had its reclaim discarded. The Screen now matches only
+data-mover and control services (`VeeamBackup*`, `VeeamTransport*`, `VeeamNFS*`, `VeeamCatalog*`,
+`VeeamBroker*`, `VeeamMount*`, `VeeamHvIntegration*`, by prefix so version suffixes don't break the
+match). Agent- or installer-only hosts are flagged `VEEAM-MINOR` and screened normally. An
+unrecognised future service name falls through to `VEEAM-MINOR` — the gross-over-allocation gate
+still has to clear before anything is recommended, which keeps that failure mode cheap.
+
+**Hyper-V hosts return `NO SCREEN` regardless of every other role.** This tool measures guest-side
+demand, which can't describe a host whose memory is consumed by its VMs: a 127GB cluster node
+reporting 51GB committed and 78% sustained CPU is describing its guests, not itself, and neither
+figure supports a right-sizing decision. Detected via the `vmms` service, which exists only where
+the role is actually installed. Other hypervisors aren't detected because they never run this script
+— an ESXi host has no Windows guest OS — so Hyper-V is the only case that can reach a device filter.
+Size these from your hypervisor's own reporting instead.
+
 **The SQL exclusion requires the engine to be a *material* memory consumer, not merely present.**
 That reasoning above only holds while SQL actually dominates memory on the host. Presence-only
 matching excluded 21 of 73 devices on a real estate — including RD gateways, a VPN host and plain
@@ -285,8 +305,10 @@ Analyse values are not.
 | `DIT-REVIEW` | DC only — the DIT-raised floor alone would trigger growth, but the same target using the flat floor doesn't; measured demand doesn't corroborate it, so no growth number is forced |
 | `LOW-UPTIME` | Screen only — under `usrMinUptimeHrs`, peak working sets not yet representative |
 | `CANDIDATE` | Screen only — cleared the gross over-allocation test |
-| `UPSIZE` | Screen only — committed bytes above 90% of allocation, so the host is leaning on its pagefile now. Outranks the uptime gate **and** the role exclusions (it's an observable fact, not a sizing claim). Reported, never sized — Component 2's growth-sizing produces the number |
+| `UPSIZE` | Screen only — committed bytes exceed allocation, **or** available memory is under 1GB. Two independent triggers, and the verdict names which fired. The 1GB test is the same metric and threshold Component 2 uses for `MEM-PRESSURE`, so the two can't disagree. Outranks the uptime gate **and** the role exclusions (it's an observable fact, not a sizing claim). Reported, never sized — Component 2's growth-sizing produces the number |
 | `SQL-MINOR` | Screen only — a SQL instance is present but the engine isn't a material memory consumer (under 2GB, or under 25% of allocation), so the host is screened normally instead of excluded. Typically a bundled Express instance from an RDS Connection Broker, Veeam, or an LOB app |
+| `VEEAM-MINOR` | Screen only — Veeam is installed but only as an agent or installer service, i.e. this host is a backup *target*, not backup infrastructure. Screened normally instead of excluded |
+| `HYPER-V` | Screen only — the Hyper-V role is installed. Returns `NO SCREEN` regardless of every other role: guest-side demand can't describe a host whose memory is consumed by its VMs |
 | `CPU-PRESSURE` | Screen only (also a Component 2 flag) — average CPU since boot at or above 70%. Because averaging flattens spikes, a sustained average this high implies peaks well above it: this host needs *more* vCPU, not fewer |
 
 ## Deployment
@@ -433,13 +455,28 @@ compute a max-based demand figure from. What the Screen does do is flag the one 
 history at all: `UPSIZE`, where committed bytes exceed 90% of allocation, meaning the host is
 leaning on its pagefile at the moment of measurement.
 
+`UPSIZE` fires on either of two independent triggers, and the verdict names which one:
+
+* **committed bytes exceed allocation** — more is committed than physical RAM exists, so the
+  pagefile is definitely carrying some of it; or
+* **available memory under 1GB** — the OS is genuinely short of memory right now. This is the same
+  metric and threshold Component 2 uses for `MEM-PRESSURE`, so the two components can't disagree
+  about what "under memory pressure" means.
+
+**The commit ratio alone is not evidence of memory pressure**, which is why it isn't used that way.
+Committed bytes counts reservations the pagefile can back, so a host can sit near or even above its
+allocation with plenty of available memory and no performance consequence — an earlier
+ratio-only rule flagged a host at 93% of allocation that was holding 35% of its memory available.
+Equally, the ratio on its own misses hosts that are genuinely out of memory below 100%: a DC on 3GB
+(already under its own 4GB role floor) with 0.4GB available read `NO HEADROOM`.
+
 `UPSIZE` deliberately **outranks both the uptime gate and the role exclusions**. Neither guard
-applies to it: over-commitment is an observable fact rather than a sizing claim, and a host
-over-committed 8 hours after boot is genuinely over-committed. This matters because those guards
-were actively hiding it — on a 73-device estate, 12 hosts sat at or over their allocation while
-reading `NO HEADROOM` or `EXCLUDED`, among them one at **237% of allocation** (9.46GB committed on
-4GB) that the exclusions had silenced completely. The exclusions exist to stop commit being used to
-size a host *down*; they were never meant to conceal a host that's out of memory.
+applies to it: it's an observable fact rather than a sizing claim, and a host out of memory 8 hours
+after boot is genuinely out of memory. This matters because those guards were actively hiding it —
+on a 73-device estate, 12 hosts sat at or over their allocation while reading `NO HEADROOM` or
+`EXCLUDED`, among them one at **238% of allocation** (9.51GB committed on 4GB) that the exclusions
+had silenced completely. The exclusions exist to stop commit being used to size a host *down*; they
+were never meant to conceal a host that's out of memory.
 
 ### Provisional analysis before 14 days (conservative mode)
 

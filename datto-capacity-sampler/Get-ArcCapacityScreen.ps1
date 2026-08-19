@@ -35,10 +35,25 @@
       Target  = max( RoleFloor , Basis x 1.4 )
       Flag only where reclaim exceeds BOTH 40% of allocation and 8GB.
 
+    Over-commitment outranks all of the above, including the uptime gate and the
+    role exclusions - see the UPSIZE block. It is an observable fact rather than
+    a sizing claim, so neither guard applies to it.
+
     Component input variables (all optional):
               usrScreenUdfBase Integer  default 70    First UDF index, uses 4 fields
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
+
+    Version : 1.4  -  19/08/2026  (three fixes from a 73-device estate export.
+              SQL exclusion now requires the engine to be a MATERIAL memory consumer
+              rather than merely present - presence-only excluded 21 of 73 devices,
+              including RD gateways, a VPN host and file servers carrying a bundled
+              Express or Veeam instance, throwing away real reclaim. Added the UPSIZE
+              verdict: 12 hosts sat at or over their allocation while reading NO
+              HEADROOM or EXCLUDED. Added CPU-PRESSURE: the screen previously had no
+              high-CPU path at all, so a host averaging 95.1% over 104 days produced
+              no signal whatsoever. ScreenStatus values are unchanged on purpose -
+              see the note at the result block)
 
     Version : 1.3  -  18/08/2026  (header updated: now fetched by Invoke-ArcCapacityScreen.ps1
               rather than pasted into Datto directly; removed the company-name header credit
@@ -91,9 +106,12 @@ $RamFloor         = @{ DomainController = 4; RDSH = 8; FileServer = 8; SQLServer
 $RamExcludedRoles = @('SQLServer', 'Exchange', 'BackupInfra')
 
 function Get-ServerRole {
-    $flags = New-Object System.Collections.Generic.List[string]
-    $role  = 'Generic'
-    $svc   = @{}
+    param([double]$AllocatedGB = 0)
+
+    $flags   = New-Object System.Collections.Generic.List[string]
+    $role    = 'Generic'
+    $sqlWsGB = $null
+    $svc     = @{}
     try { foreach ($s in (Get-Service -ErrorAction SilentlyContinue)) { $svc[$s.Name] = $true } } catch { }
 
     $hasSvc = {
@@ -108,8 +126,51 @@ function Get-ServerRole {
     } catch { }
 
     if ((& $hasSvc 'MSExchange*')) { $role = 'Exchange'; $flags.Add('EXCH') }
+
+    # SQL presence alone is NOT enough to exclude a host from sizing.
+    #
+    # The exclusion exists for one reason: on a host where SQL dominates memory,
+    # guest committed bytes reports the configured 'max server memory' rather
+    # than the requirement, so commit is not a safe sizing basis. That reasoning
+    # only holds while SQL is actually a material consumer.
+    #
+    # Presence-only matching excluded 21 of 73 devices on a real estate,
+    # including RD gateways, a VPN host and plain file servers. None were
+    # mis-matched: they genuinely carry a bundled instance (MSSQL$SQLEXPRESS
+    # from an RDS Connection Broker deployment, MSSQL$VEEAMSQL* from Veeam, or
+    # an LOB app's Express instance). A capped Express instance idling at a few
+    # hundred MB on a 12GB gateway does not distort that host's commit figure,
+    # and excluding it threw away real, safe reclaim.
+    #
+    # So gate on the engine's actual footprint, which is measurable on the spot
+    # with no history: material means sqlservr holds at least a quarter of
+    # allocated RAM AND at least 2GB. Both conditions, deliberately - the ratio
+    # alone over-fires on small hosts (25% of 4GB is reachable by Express,
+    # whose buffer pool caps at ~1.4GB), and the absolute alone under-fires on
+    # large ones. Below the bar the host is flagged SQL-MINOR and screened
+    # normally, so the SQL is still visible without silently suppressing sizing.
     if (($svc.ContainsKey('MSSQLSERVER')) -or (& $hasSvc 'MSSQL$*')) {
-        if ($role -eq 'Generic') { $role = 'SQLServer' }; $flags.Add('SQL')
+        $sqlWsGB = 0.0
+        try {
+            $sqlProcs = @(Get-Process -Name 'sqlservr' -ErrorAction SilentlyContinue)
+            if ($sqlProcs.Count -gt 0) {
+                $sqlWsGB = [math]::Round((($sqlProcs | Measure-Object -Property WorkingSet64 -Sum).Sum) / 1GB, 2)
+            }
+        } catch { }
+
+        # $AllocatedGB is passed in by the caller, which has already read
+        # Win32_OperatingSystem - no second CIM query. A 0 (caller could not
+        # determine it) degrades to the absolute-only test rather than
+        # mis-classifying the host in either direction.
+        $sqlIsMaterial = ($sqlWsGB -ge 2) -and
+                         (($AllocatedGB -le 0) -or ($sqlWsGB -ge ($AllocatedGB * 0.25)))
+
+        if ($sqlIsMaterial) {
+            if ($role -eq 'Generic') { $role = 'SQLServer' }
+            $flags.Add('SQL')
+        } else {
+            $flags.Add('SQL-MINOR')
+        }
     }
     if ((& $hasSvc 'Veeam*')) { $flags.Add('VEEAM'); if ($role -eq 'Generic') { $role = 'BackupInfra' } }
 
@@ -133,7 +194,7 @@ function Get-ServerRole {
         }
     } catch { }
 
-    [PSCustomObject]@{ Role = $role; Flags = $flags }
+    [PSCustomObject]@{ Role = $role; Flags = $flags; SqlWsGB = $sqlWsGB }
 }
 
 try {
@@ -148,9 +209,10 @@ try {
     $uptimeHrs   = [math]::Round($uptime.TotalHours, 1)
     $uptimeText  = if ($uptime.TotalDays -ge 1) { '{0}d' -f [int]$uptime.TotalDays } else { '{0}h' -f [int]$uptime.TotalHours }
 
-    $roleInfo = Get-ServerRole
+    $roleInfo = Get-ServerRole -AllocatedGB $allocatedGB
     $role     = $roleInfo.Role
     $flags    = $roleInfo.Flags
+    $sqlWsGB  = $roleInfo.SqlWsGB
 
     # -----------------------------------------------------------------------
     # Current memory position
@@ -216,12 +278,42 @@ try {
     $reclaimGB = 0
     $verdict   = ''
 
-    if ($uptimeHrs -lt $MinUptimeHrs) {
+    # Over-commitment outranks every other verdict, including the uptime gate
+    # and the role exclusions.
+    #
+    # Committed bytes above allocated RAM means the host is leaning on its
+    # pagefile right now. That is an instantaneous, observable fact - it needs
+    # no history, so the uptime gate has no bearing on it (a host over-committed
+    # 8 hours after boot is genuinely over-committed), and it is not a sizing
+    # claim, so the SQL/Exchange/Veeam exclusions do not apply either. Those
+    # exclusions exist because commit is an unreliable basis for *sizing down*;
+    # they were never meant to hide a host that is out of memory, which is
+    # exactly what they were doing - 12 hosts on a real estate sat over
+    # allocation while reading NO HEADROOM or EXCLUDED.
+    #
+    # 0.9 rather than 1.0 catches hosts on the edge before they tip over.
+    # Reported, never sized: the screen says "look at this", and Component 2's
+    # growth-sizing produces the actual number from a real window.
+    $overCommitted = ($allocatedGB -gt 0) -and ($committedGB -gt ($allocatedGB * 0.9))
+
+    if ($overCommitted) {
+        $flags.Add('UPSIZE')
+        $pctOfAlloc  = [math]::Round(100 * $committedGB / $allocatedGB, 0)
+        $roleContext = if ($RamExcludedRoles -contains $role) { " | $role - confirm against the platform-specific metrics" } else { '' }
+        $verdict = "UPSIZE - commit ${committedGB}GB is ${pctOfAlloc}% of ${allocatedGB}GB allocated, no reclaim headroom${roleContext}"
+    }
+    elseif ($uptimeHrs -lt $MinUptimeHrs) {
         $flags.Add('LOW-UPTIME')
         $verdict = "NO SCREEN - uptime ${uptimeText}, peak working sets not yet representative"
     }
     elseif ($RamExcludedRoles -contains $role) {
-        $verdict = "EXCLUDED ($role) - size from the platform-specific metrics, not guest commit"
+        # Cite the footprint that justified a SQL exclusion, so the decision is
+        # auditable from the UDF rather than being an unexplained suppression -
+        # same principle as the DIT-derived floor detail in Component 2.
+        $exclDetail = if ($role -eq 'SQLServer' -and $null -ne $sqlWsGB -and $sqlWsGB -gt 0) {
+            " (sqlservr holding ${sqlWsGB}GB)"
+        } else { '' }
+        $verdict = "EXCLUDED ($role)$exclDetail - size from the platform-specific metrics, not guest commit"
     }
     elseif ($basisGB -le 0) {
         $verdict = 'NO SCREEN - could not establish a memory demand basis'
@@ -249,10 +341,33 @@ try {
         }
     }
 
-    # CPU is reported, never sized, from an average
+    # CPU is reported, never sized, from an average.
+    #
+    # Two thresholds, deliberately asymmetric:
+    #
+    #   CPU-REVIEW (low)   - suspiciously idle, worth a look for reduction. Gated
+    #                        on 8+ vCPU because trimming a 2-4 vCPU host is not
+    #                        worth a change window.
+    #   CPU-PRESSURE (high)- sustained saturation. Previously ABSENT ENTIRELY:
+    #                        the screen only ever looked for idle hosts, so a
+    #                        real host averaging 95.1% over 104 days (7.61 of 8
+    #                        cores) produced no signal of any kind. An average
+    #                        this high is a floor, not a peak - since averaging
+    #                        flattens spikes, 70% sustained implies peaks well
+    #                        above it. Applies at any vCPU count: a saturated
+    #                        2 vCPU host is as stuck as a saturated 16 vCPU one.
+    #
+    # Name matches Component 2's flag vocabulary so one filter catches both.
     $cpuNote = if ($null -ne $avgCpuPct) {
         $n = "Avg since boot ${avgCpuPct}% over ${uptimeText} = ${effCores} cores of $vCPU"
-        if ($avgCpuPct -lt 5 -and $vCPU -ge 8) { $flags.Add('CPU-REVIEW'); $n += ' | REVIEW' }
+        if ($avgCpuPct -ge 70) {
+            $flags.Add('CPU-PRESSURE')
+            $n += ' | PRESSURE - sustained saturation, needs more vCPU not fewer'
+        }
+        elseif ($avgCpuPct -lt 5 -and $vCPU -ge 8) {
+            $flags.Add('CPU-REVIEW')
+            $n += ' | REVIEW'
+        }
         $n
     } else { 'Average CPU unavailable' }
 
@@ -291,6 +406,8 @@ try {
                 BasisGB       = $basisGB
                 AvailableGB   = $availableGB
                 ScreenReclaim = $reclaimGB
+                OverCommitted = $(if ($overCommitted) { 1 } else { 0 })
+                SqlWsGB       = $sqlWsGB
                 Verdict       = $verdict
                 vCPU          = $vCPU
                 AvgCpuPct     = $avgCpuPct
@@ -316,10 +433,20 @@ try {
     Write-Output '      since boot is not a vCPU sizing basis. Confirm against Component 2.'
     Write-Output ''
     Write-Output '<-Start Result->'
+    # ScreenStatus MUST stay within the set Invoke-ArcCapacityScreen.ps1
+    # whitelists - CANDIDATE / LOW_UPTIME / NO_ACTION - because that stub fails
+    # closed on any value it does not recognise. UPSIZE is deliberately NOT a
+    # status for that reason: the stub is pasted into Datto's console, so a new
+    # status value could not reach devices without a re-paste, and until every
+    # device had been re-pasted each over-committed host would report its job as
+    # FAILED. It travels as its own field instead, which the stub ignores, so
+    # this stays a git-only change that works against any pasted stub version.
     Write-Output ('ScreenStatus=' + $(if ($flags -contains 'CANDIDATE') { 'CANDIDATE' } elseif ($flags -contains 'LOW-UPTIME') { 'LOW_UPTIME' } else { 'NO_ACTION' }))
     Write-Output "ScreenReclaimGB=$reclaimGB"
     Write-Output "AllocatedGB=$allocatedGB"
     Write-Output "BasisGB=$basisGB"
+    Write-Output ('ScreenUpsize=' + $(if ($overCommitted) { '1' } else { '0' }))
+    Write-Output ('ScreenCpuPressure=' + $(if ($flags -contains 'CPU-PRESSURE') { '1' } else { '0' }))
     Write-Output '<-End Result->'
     exit 0
 }

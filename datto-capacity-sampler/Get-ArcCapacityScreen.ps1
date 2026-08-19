@@ -48,6 +48,12 @@
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
 
+    Version : 1.7  -  19/08/2026  (Veeam exclusion narrowed to backup INFRASTRUCTURE - matching
+              any Veeam* service treated every backed-up machine as backup infra, discarding a
+              file server's reclaim; agent/installer-only hosts are now VEEAM-MINOR and screened.
+              Added a Hyper-V host guard: guest-side demand cannot describe a host whose memory
+              is consumed by its VMs, so those return NO SCREEN rather than misleading figures)
+
     Version : 1.6  -  19/08/2026  (UPSIZE no longer fires on the commit ratio alone - that
               produced false positives on the first real run, flagging a host at 93% of
               allocation that had 35% of its memory available. Now triggers on commit
@@ -191,7 +197,46 @@ function Get-ServerRole {
             $flags.Add('SQL-MINOR')
         }
     }
-    if ((& $hasSvc 'Veeam*')) { $flags.Add('VEEAM'); if ($role -eq 'Generic') { $role = 'BackupInfra' } }
+    # Veeam: distinguish backup INFRASTRUCTURE from a backup TARGET.
+    #
+    # Matching any Veeam* service is the same over-broad mistake the SQL predicate
+    # made. Veeam installs its Installer/Deployment service on every managed
+    # server it backs up, and its agent on protected endpoints - so a plain file
+    # server being backed up looked like backup infrastructure and had its reclaim
+    # discarded (on a real estate, a 12GB file server with 8.58GB committed).
+    #
+    # The exclusion exists because proxy and repository demand peaks inside the
+    # job window and a p95 across 14 days flattens it. That argument applies to
+    # something that moves or stores backup data, not to a machine that is merely
+    # a backup source. So match the services that indicate a data-mover or
+    # control role, by prefix so version suffixes don't break the match.
+    #
+    # Fail-open direction is deliberate but worth knowing: an unrecognised future
+    # service name falls through to VEEAM-MINOR and the host gets screened. The
+    # gross-over-allocation gate still has to clear 40% of allocation and 8GB
+    # before anything is recommended, which keeps that failure mode cheap.
+    if ((& $hasSvc 'Veeam*')) {
+        $veeamInfraPatterns = @(
+            'VeeamBackup*',        # B&R server
+            'VeeamTransport*',     # data mover - proxy and repository
+            'VeeamNFS*',           # vPower NFS
+            'VeeamCatalog*',       # guest file catalog
+            'VeeamBroker*',        # broker
+            'VeeamMount*',         # mount server
+            'VeeamHvIntegration*'  # Hyper-V off-host data mover
+        )
+        $hasVeeamInfra = $false
+        foreach ($p in $veeamInfraPatterns) {
+            if (& $hasSvc $p) { $hasVeeamInfra = $true; break }
+        }
+
+        if ($hasVeeamInfra) {
+            $flags.Add('VEEAM')
+            if ($role -eq 'Generic') { $role = 'BackupInfra' }
+        } else {
+            $flags.Add('VEEAM-MINOR')
+        }
+    }
 
     $isRdsh = $false
     try {
@@ -212,6 +257,24 @@ function Get-ServerRole {
             }
         }
     } catch { }
+
+    # Hyper-V host. Genuinely last, and unconditional, so it overrides every other
+    # role rather than relying on the '-eq Generic' guards above staying in place:
+    # a hypervisor running a Veeam data mover, or with the RDSH role bolted on, is
+    # still a hypervisor, and that is the fact that decides whether this tool has
+    # anything useful to say.
+    #
+    # It doesn't, which is the point. This tool measures guest-side demand, and
+    # that is meaningless on a host whose memory is consumed by its VMs - a 127GB
+    # cluster node reporting 51GB committed and 78% sustained CPU is describing its
+    # guests, not itself, and neither figure supports a right-sizing decision.
+    # Better to say so explicitly than to emit numbers that look actionable.
+    #
+    # vmms exists only where the Hyper-V role is actually installed, not merely
+    # available. Other hypervisors are not detected: an ESXi host never runs this
+    # script (no Windows guest OS), so Hyper-V is the case that can actually reach
+    # a Datto device filter.
+    if ($svc.ContainsKey('vmms')) { $role = 'Hypervisor'; $flags.Add('HYPER-V') }
 
     [PSCustomObject]@{ Role = $role; Flags = $flags; SqlWsGB = $sqlWsGB }
 }
@@ -372,6 +435,13 @@ try {
             $reasons.Add("only ${availableGB}GB available")
         }
         $verdict = "UPSIZE - $($reasons -join '; ') - no reclaim headroom${roleContext}"
+    }
+    elseif ($role -eq 'Hypervisor') {
+        # Placed after UPSIZE deliberately: a hypervisor that is itself out of
+        # memory is still worth surfacing, and that check is role-independent.
+        # Everything below this point is guest-side right-sizing, which does not
+        # apply here, so stop rather than emit a figure that looks actionable.
+        $verdict = 'NO SCREEN - Hyper-V host, guest-side demand does not describe it (memory is consumed by its VMs); size from the hypervisor''s own reporting'
     }
     elseif ($uptimeHrs -lt $MinUptimeHrs) {
         # Now a sanity floor, not a warm-up period. The gate originally existed

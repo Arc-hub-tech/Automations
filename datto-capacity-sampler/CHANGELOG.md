@@ -9,6 +9,28 @@ script versions independently — see its own header comment for its current ver
 _Work in progress on the `develop` branch._
 
 ### Fixed
+- **The Veeam exclusion matched any `Veeam*` service, treating every backed-up machine as backup
+  infrastructure** (`Get-ArcCapacityScreen.ps1` v1.7) — the same over-broad mistake the SQL predicate
+  made, found in the same estate export. Veeam installs its Installer/Deployment service on every
+  managed server and its agent on protected endpoints, so a 12GB file server with 8.58GB committed
+  was classed `BackupInfra` and had its reclaim discarded. The exclusion's rationale — proxy and
+  repository demand peaking inside the job window — describes something that moves or stores backup
+  data, not a backup source. Now matches only data-mover and control services (`VeeamBackup*`,
+  `VeeamTransport*`, `VeeamNFS*`, `VeeamCatalog*`, `VeeamBroker*`, `VeeamMount*`,
+  `VeeamHvIntegration*`, by prefix so version suffixes survive); agent- or installer-only hosts are
+  flagged `VEEAM-MINOR` and screened normally. Fail-open by design: an unrecognised future service
+  name lands in `VEEAM-MINOR`, and the gross-over-allocation gate still has to clear before anything
+  is recommended.
+- **Hyper-V hosts were being screened as though they were guests.** Three 127GB, 20 vCPU cluster
+  nodes appeared in the estate reporting guest-side figures and `CPU-PRESSURE` at 77–79% — but a
+  hypervisor's memory is consumed by its VMs and sustained high CPU is normal for a busy host, so
+  neither figure supports a right-sizing decision. Added a `vmms`-based guard returning a distinct
+  `NO SCREEN` verdict, applied **unconditionally and last** so it overrides every other role rather
+  than depending on the `-eq 'Generic'` guards elsewhere staying in place: a hypervisor running a
+  Veeam data mover, or with RDSH bolted on, is still a hypervisor. Placed after `UPSIZE` in the
+  verdict chain so a hypervisor that is itself out of memory still surfaces. Verified across 13 role
+  scenarios including Hyper-V combined with Veeam infra, Veeam agent, RDSH, file server and material
+  SQL.
 - **`UPSIZE` fired on the commit ratio alone, which produced false positives on its first real run**
   (`Get-ArcCapacityScreen.ps1` v1.6). Committed bytes counts reservations the pagefile can back, so
   a high ratio is not by itself evidence of memory pressure: `SFP-RDS-1` was flagged at 93% of

@@ -8,6 +8,22 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Fixed
+- **`UPSIZE` fired on the commit ratio alone, which produced false positives on its first real run**
+  (`Get-ArcCapacityScreen.ps1` v1.6). Committed bytes counts reservations the pagefile can back, so
+  a high ratio is not by itself evidence of memory pressure: `SFP-RDS-1` was flagged at 93% of
+  allocation while holding **33.46GB (35%) available**, and `SC-AM-RDS05` at 93% with 19% available.
+  Neither host was short of memory. The ratio also missed hosts that genuinely were, below 100% —
+  `S2D-DC02` (a DC on 3GB, already under its own 4GB role floor, with 0.4GB available),
+  `LASERMECH-DC1` (0.91GB), `SC-NOA-DC02` (0.86GB) and `SC-PUR-GW01` (0.8GB) all read `NO HEADROOM`.
+  Now two independent triggers: **committed bytes exceeding allocation**, or **available memory
+  under 1GB** — the latter deliberately the same metric and threshold Component 2 uses for
+  `MEM-PRESSURE` (`availMin < 1.0`), so the two components cannot disagree about what "under memory
+  pressure" means. The verdict names which trigger fired, since one means "the pagefile is carrying
+  commit" and the other means "the OS is out of memory now"; reporting only a percentage made the
+  second case look like the first, or on a sub-100% host look like a mistake. Verified against the
+  87-device export: 22 hosts flagged, the two false positives dropped, the four missed hosts caught.
+
 ### Changed
 - **The Screen's sizing basis moved off peak-working-set sum onto committed bytes**
   (`Get-ArcCapacityScreen.ps1` v1.5). It was `max(committed, peakSum)`, which in practice meant the

@@ -48,6 +48,13 @@
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
 
+    Version : 1.6  -  19/08/2026  (UPSIZE no longer fires on the commit ratio alone - that
+              produced false positives on the first real run, flagging a host at 93% of
+              allocation that had 35% of its memory available. Now triggers on commit
+              exceeding allocation OR available memory under 1GB, the latter being the same
+              metric and threshold Component 2 uses for MEM-PRESSURE. The verdict names
+              which trigger fired)
+
     Version : 1.5  -  19/08/2026  (basis moved off peak-working-set sum onto committed
               bytes - the old max(committed, peakSum) exceeded allocated RAM on 20 of 73
               real devices, which cannot support a verdict either way. Gross-over-allocation
@@ -321,16 +328,50 @@ try {
     # exactly what they were doing - 12 hosts on a real estate sat over
     # allocation while reading NO HEADROOM or EXCLUDED.
     #
-    # 0.9 rather than 1.0 catches hosts on the edge before they tip over.
+    # Two independent triggers, because the commit ratio ALONE is not evidence of
+    # memory pressure and using it that way produced false positives on the first
+    # real run: SFP-RDS-1 was flagged at 93% of allocation while holding 33.46GB
+    # (35%) available, and SC-AM-RDS05 at 93% with 19% available. Neither host is
+    # short of memory. Committed bytes counts reservations the pagefile can back,
+    # so a host can sit near or above its allocation with plenty of available
+    # memory and no performance consequence.
+    #
+    #   commit > allocation  - more committed than physical RAM exists, so the
+    #                          pagefile is definitely carrying some of it.
+    #   available < 1GB      - the OS is genuinely short of memory right now.
+    #                          Deliberately the same threshold and metric
+    #                          Component 2 uses for MEM-PRESSURE
+    #                          (Read-ArcCapacityBuffer.ps1: availMin < 1.0), so
+    #                          the two components cannot disagree about what
+    #                          "under memory pressure" means.
+    #
+    # The available-memory test is what catches the cases the ratio misses
+    # entirely: S2D-DC02 (a DC on 3GB, below its own 4GB role floor, with 0.4GB
+    # available) read NO HEADROOM under the ratio-only rule.
+    #
     # Reported, never sized: the screen says "look at this", and Component 2's
     # growth-sizing produces the actual number from a real window.
-    $overCommitted = ($allocatedGB -gt 0) -and ($committedGB -gt ($allocatedGB * 0.9))
+    $overCommitted = (($allocatedGB -gt 0) -and ($committedGB -gt $allocatedGB)) -or
+                     ($availableGB -lt 1.0)
 
     if ($overCommitted) {
         $flags.Add('UPSIZE')
-        $pctOfAlloc  = [math]::Round(100 * $committedGB / $allocatedGB, 0)
+        $pctOfAlloc  = if ($allocatedGB -gt 0) { [math]::Round(100 * $committedGB / $allocatedGB, 0) } else { 0 }
         $roleContext = if ($RamExcludedRoles -contains $role) { " | $role - confirm against the platform-specific metrics" } else { '' }
-        $verdict = "UPSIZE - commit ${committedGB}GB is ${pctOfAlloc}% of ${allocatedGB}GB allocated, no reclaim headroom${roleContext}"
+
+        # Name the trigger. A host can reach UPSIZE on either condition alone, and
+        # the two mean different things to whoever reads the UDF: one is "the
+        # pagefile is carrying commit", the other is "the OS is out of memory
+        # now". Reporting only the commit percentage made the second case look
+        # like the first, or - on a host under 100% - look like a mistake.
+        $reasons = New-Object System.Collections.Generic.List[string]
+        if (($allocatedGB -gt 0) -and ($committedGB -gt $allocatedGB)) {
+            $reasons.Add("commit ${committedGB}GB exceeds ${allocatedGB}GB allocated (${pctOfAlloc}%)")
+        }
+        if ($availableGB -lt 1.0) {
+            $reasons.Add("only ${availableGB}GB available")
+        }
+        $verdict = "UPSIZE - $($reasons -join '; ') - no reclaim headroom${roleContext}"
     }
     elseif ($uptimeHrs -lt $MinUptimeHrs) {
         # Now a sanity floor, not a warm-up period. The gate originally existed

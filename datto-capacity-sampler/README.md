@@ -179,6 +179,26 @@ reports the configured memory cap, not the requirement, in either direction — 
 figure and minimum PLE are reported instead (UDF 66), enough to triage which instances justify a
 `max server memory` review.
 
+**The Veeam exclusion applies to backup *infrastructure*, not to machines being backed up.** That
+timing argument is about something which moves or stores backup data — it says nothing about a
+server that is merely a backup source. Matching any `Veeam*` service was the same over-broad mistake
+the SQL predicate made: Veeam installs its Installer/Deployment service on every managed server and
+its agent on protected endpoints, so on a real estate a 12GB file server with 8.58GB committed was
+classed as backup infrastructure and had its reclaim discarded. The Screen now matches only
+data-mover and control services (`VeeamBackup*`, `VeeamTransport*`, `VeeamNFS*`, `VeeamCatalog*`,
+`VeeamBroker*`, `VeeamMount*`, `VeeamHvIntegration*`, by prefix so version suffixes don't break the
+match). Agent- or installer-only hosts are flagged `VEEAM-MINOR` and screened normally. An
+unrecognised future service name falls through to `VEEAM-MINOR` — the gross-over-allocation gate
+still has to clear before anything is recommended, which keeps that failure mode cheap.
+
+**Hyper-V hosts return `NO SCREEN` regardless of every other role.** This tool measures guest-side
+demand, which can't describe a host whose memory is consumed by its VMs: a 127GB cluster node
+reporting 51GB committed and 78% sustained CPU is describing its guests, not itself, and neither
+figure supports a right-sizing decision. Detected via the `vmms` service, which exists only where
+the role is actually installed. Other hypervisors aren't detected because they never run this script
+— an ESXi host has no Windows guest OS — so Hyper-V is the only case that can reach a device filter.
+Size these from your hypervisor's own reporting instead.
+
 **The SQL exclusion requires the engine to be a *material* memory consumer, not merely present.**
 That reasoning above only holds while SQL actually dominates memory on the host. Presence-only
 matching excluded 21 of 73 devices on a real estate — including RD gateways, a VPN host and plain
@@ -287,6 +307,8 @@ Analyse values are not.
 | `CANDIDATE` | Screen only — cleared the gross over-allocation test |
 | `UPSIZE` | Screen only — committed bytes exceed allocation, **or** available memory is under 1GB. Two independent triggers, and the verdict names which fired. The 1GB test is the same metric and threshold Component 2 uses for `MEM-PRESSURE`, so the two can't disagree. Outranks the uptime gate **and** the role exclusions (it's an observable fact, not a sizing claim). Reported, never sized — Component 2's growth-sizing produces the number |
 | `SQL-MINOR` | Screen only — a SQL instance is present but the engine isn't a material memory consumer (under 2GB, or under 25% of allocation), so the host is screened normally instead of excluded. Typically a bundled Express instance from an RDS Connection Broker, Veeam, or an LOB app |
+| `VEEAM-MINOR` | Screen only — Veeam is installed but only as an agent or installer service, i.e. this host is a backup *target*, not backup infrastructure. Screened normally instead of excluded |
+| `HYPER-V` | Screen only — the Hyper-V role is installed. Returns `NO SCREEN` regardless of every other role: guest-side demand can't describe a host whose memory is consumed by its VMs |
 | `CPU-PRESSURE` | Screen only (also a Component 2 flag) — average CPU since boot at or above 70%. Because averaging flattens spikes, a sustained average this high implies peaks well above it: this host needs *more* vCPU, not fewer |
 
 ## Deployment

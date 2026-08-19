@@ -42,6 +42,11 @@
                                                         usrUninstall=true. Set explicitly
                                                         to 0 to disable the marker
 
+    Version : 1.6  -  19/08/2026  (enrollment marker now always logs the resolved UDF index
+              and where it came from, and says so explicitly when disabled - the silent
+              disabled path made a switched-off marker indistinguishable in the job log from
+              a pre-1.5 component still being pasted in)
+
     Version : 1.5  -  18/08/2026  (added usrEnrollUdf, default 79, so enrollment can drive
               a self-maintaining Device Filter instead of a hand-managed device group)
 #>
@@ -127,6 +132,16 @@ function Add-Detail { param([string]$m) $details.Add($m); Write-Output $m }
 # actual sampler deploy, which is the job that matters.
 $UdfMax = 300
 $EnrollUdfValid = $false
+
+# Always echo what was resolved and from where. Without this, the disabled
+# (usrEnrollUdf=0) path produced no output at all, making a job log from a
+# device with the marker switched off byte-identical to one still running a
+# pre-1.5 component - two completely different problems that need opposite
+# fixes. Every other suppression in this toolset announces itself; this one
+# didn't, and that cost a live rollout's worth of diagnosis.
+$enrollSource = if ([string]::IsNullOrWhiteSpace($EnrollUdfRaw)) { 'script default' }
+                else { "usrEnrollUdf=$($EnrollUdfRaw.Trim())" }
+
 if ($EnrollUdf -gt 0) {
     if ($EnrollUdf -gt $UdfMax) {
         $status = 'WARNING'
@@ -136,7 +151,10 @@ if ($EnrollUdf -gt 0) {
             Add-Detail 'WARNING: UDF 1 is reserved by Datto Ransomware Detection for isolation notices and will be overwritten by usrEnrollUdf.'
         }
         $EnrollUdfValid = $true
+        Add-Detail "Enrollment marker target: Custom$EnrollUdf ($enrollSource)"
     }
+} else {
+    Add-Detail "Enrollment marker disabled ($enrollSource) - no UDF written or cleared this run"
 }
 
 function Set-DeployUdf {

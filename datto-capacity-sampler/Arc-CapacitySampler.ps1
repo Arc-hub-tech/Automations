@@ -25,6 +25,11 @@
               rather than repeat a write error every 15 minutes. Datto's own
               low-disk-space monitor is the actual alert for that condition.
 
+    Version : 1.6  -  19/08/2026  (ring buffer now actually trims - the row count driving the
+              trim test used Get-Content -ReadCount 0, which returns the file as a single
+              array object, so the count was permanently 0 and retention was never enforced.
+              Recommendations were unaffected; the buffer just grew without bound)
+
     Version : 1.5  -  18/08/2026  (directory creation now fails clean instead of throwing
               on a critically-low first install; SQL counter cache no longer locks in a
               total resolution failure for 30 days; disk guard skips UNC/non-drive paths
@@ -352,8 +357,16 @@ try {
         $sample | Export-Csv -LiteralPath $BufferPath -NoTypeInformation -Encoding UTF8
     }
 
-    # Trim only when meaningfully over, to avoid a full read/write every 15 minutes
-    $lineCount = @(Get-Content -LiteralPath $BufferPath -ReadCount 0).Count - 1
+    # Trim only when meaningfully over, to avoid a full read/write every 15 minutes.
+    #
+    # Deliberately NOT -ReadCount 0: that emits the entire file as one array
+    # object, so @(...).Count returns 1 regardless of how many rows the file
+    # holds, and subtracting the header pinned $lineCount at 0 forever. The
+    # comparison below was therefore always false and the ring never trimmed -
+    # retention silently went unenforced and the buffer grew without bound.
+    # Analysis was unaffected (Read-ArcCapacityBuffer.ps1 filters by timestamp
+    # cutoff, not by buffer length), so this cost disk, not correctness.
+    $lineCount = @(Get-Content -LiteralPath $BufferPath).Count - 1
     if ($lineCount -gt ($ringSize + 24)) {
         $rows = @(Import-Csv -LiteralPath $BufferPath | Select-Object -Last $ringSize)
         $tmp  = "$BufferPath.tmp"

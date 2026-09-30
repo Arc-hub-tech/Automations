@@ -1,0 +1,73 @@
+{
+  "ClusterName": "<CLUSTER_NAME>",
+  "PeerNode": "<EXISTING_NODE_FQDN>",
+
+  "Switch": {
+    "Name": "SET-Converged",
+    "LoadBalancingAlgorithm": "HyperVPort",
+    "DefaultFlowWeight": 50,
+    "JumboPacket": null
+  },
+
+  "HostNetworks": [
+    { "Role": "Management",    "VlanId": 0, "PrefixLength": 24, "Weight": 10, "Gateway": "<GATEWAY_IP>", "DnsServers": ["<DNS1_IP>", "<DNS2_IP>"], "RegisterInDns": true,  "Jumbo": false, "ClusterRole": "ClusterAndClient" },
+    { "Role": "LiveMigration", "VlanId": 0, "PrefixLength": 24, "Weight": 30, "Gateway": null, "DnsServers": null, "RegisterInDns": false, "Jumbo": true,  "ClusterRole": "Cluster" },
+    { "Role": "Cluster",       "VlanId": 0, "PrefixLength": 24, "Weight": 10, "Gateway": null, "DnsServers": null, "RegisterInDns": false, "Jumbo": false, "ClusterRole": "Cluster" }
+  ],
+
+  "Nodes": {
+    "<HOSTNAME>": {
+      "AdapterMacs": ["<MAC_1>", "<MAC_2>", "<MAC_3>", "<MAC_4>"],
+      "IPs": { "Management": "<MGMT_IP>", "LiveMigration": "<LM_IP>", "Cluster": "<CLUSTER_IP>" }
+    }
+  },
+
+  "Hpe": {
+    "SppIsoPath": "\\\\<SERVER>\\<SHARE>\\HyperVOnboard\\SPP\\<SPP_VERSION>.iso",
+    "IloRestMsiPath": "\\\\<SERVER>\\<SHARE>\\HyperVOnboard\\HPE\\ilorest-<VERSION>.msi",
+    "WorkloadProfile": "Virtualization-MaxPerformance"
+  },
+
+  "Storage": {
+    "MpioVendorId": "3PARdata",
+    "MpioProductId": "VV",
+    "LoadBalancePolicy": null,
+    "MpioSettings": null
+  },
+
+  "HyperV": {
+    "VirtualMachinePath": null,
+    "VirtualHardDiskPath": null,
+    "MaxVMMigrations": 2,
+    "MaxStorageMigrations": 2,
+    "MigrationPerformance": "Compression",
+    "NumaSpanningEnabled": null
+  },
+
+  "Security": {
+    "Apply": true,
+    "DisableLegacyTls": true,
+    "RequireSmbSigning": true,
+    "DisablePrintSpooler": true,
+    "InactivityTimeoutSecs": 900,
+    "LockoutThreshold": 10,
+    "CredentialGuard": false,
+    "Hvci": false
+  },
+
+  "Optimisation": {
+    "Apply": true
+  },
+
+  "Cluster": {
+    "LiveMigrationNetworks": ["LiveMigration", "Cluster"],
+    "DrainOnShutdown": true,
+    "BlockCacheSizeMB": null,
+    "SecurityLevel": null
+  },
+
+  "Agents": {
+    "Datto":    { "Platform": "<pinotage|merlot>", "SiteID": "<SITE_ID>" },
+    "Sentinel": { "MsiPath": "\\\\<SERVER>\\<SHARE>\\HyperVOnboard\\SentinelOne\\SentinelInstaller-<VERSION>.msi", "RemoveDefender": true }
+  }
+}

@@ -2,3 +2,7 @@
 *.log
 *.LOG
 NetSetup.LOG
+
+# Hyper-V onboarding: real per-cluster configs hold hostnames/IPs/site IDs - only the example is committed
+hyperv-cluster/*.json
+!hyperv-cluster/cluster.example.json

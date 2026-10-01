@@ -23,8 +23,8 @@
   },
 
   "Hpe": {
-    "SppIsoPath": "\\\\<SERVER>\\<SHARE>\\HyperVOnboard\\SPP\\<SPP_VERSION>.iso",
-    "IloRestMsiPath": "\\\\<SERVER>\\<SHARE>\\HyperVOnboard\\HPE\\ilorest-<VERSION>.msi",
+    "SppIsoPath": "SPP\\<SPP_VERSION>.iso",
+    "IloRestMsiPath": "HPE\\ilorest-<VERSION>.msi",
     "WorkloadProfile": "Virtualization-MaxPerformance"
   },
 
@@ -68,6 +68,6 @@
 
   "Agents": {
     "Datto":    { "Platform": "<pinotage|merlot>", "SiteID": "<SITE_ID>" },
-    "Sentinel": { "MsiPath": "\\\\<SERVER>\\<SHARE>\\HyperVOnboard\\SentinelOne\\SentinelInstaller-<VERSION>.msi", "RemoveDefender": true }
+    "Sentinel": { "MsiPath": "SentinelOne\\SentinelInstaller-<VERSION>.msi", "SiteToken": "<SENTINEL_SITE_TOKEN>", "RemoveDefender": true }
   }
 }

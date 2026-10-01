@@ -6,10 +6,14 @@
     has rights to change the cluster / add nodes.
  2. Open an elevated PowerShell prompt and DOWNLOAD-THEN-RUN (single line):
 
-       $p="$env:SystemDrive\ArcLogs\HyperVClusterOnboard\ArcHyperVCluster.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-cluster/ArcHyperVCluster.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Capture
+       $p="$env:SystemDrive\ArcLogs\HyperVClusterOnboard\ArcHyperVCluster.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-cluster/ArcHyperVCluster.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Capture -SettingsShare \\<SERVER>\<SHARE>\<DEPLOYMENT>
 
- 3. The config file this script uses holds hostnames, IPs, VLANs, share paths
-    and the Datto site ID - customer data. Keep it OUTSIDE this repo (public).
+ 3. Settings live in ONE cluster.json per cluster, on that deployment's share next
+    to the SPP ISO and MSIs (installer paths in it are relative to its folder).
+    Give -SettingsShare once; later phases on the host remember it and keep a
+    local copy under C:\ArcLogs\HyperVClusterOnboard. The file holds hostnames,
+    IPs, VLANs and the Datto site ID - customer data. Keep it on the share,
+    restricted to engineers, and OUTSIDE this repo (public).
 
  EXISTING CLUSTER - define the standard and bring every node up to it:
 
@@ -23,6 +27,12 @@
 
        PreFlight -> Hpe -> PreFlight -> Base -> Network -> Storage -> Agents
        -> Baseline -> Join -> HyperV -> Report
+
+ EASIEST: just run -Phase Next (attended automation). It works out where this
+ host is, runs phases back to back, STOPS at the human gates (add MACs/IPs,
+ iLO console for Network, FC zoning, Sentinel connected, JOIN), ASKS before
+ every reboot, and carries on by itself when you next log on. On an existing
+ node it does Baseline, then Resume after the reboot.
 
     The Network phase MUST be run from the iLO remote console (not RDP) -
     building the SET vSwitch moves the management IP off the physical NIC and
@@ -41,8 +51,10 @@
     setting alone). PreFlight/Report diff a node against the peer to show drift.
 
     Phases (every phase is safe to re-run):
-      Capture          Reads this node + the cluster (every node's NICs/IPs, vNIC roles,
-                       MPIO, Hyper-V, BIOS profile) and writes a config JSON. No -ConfigPath.
+      Next             Attended automation - runs the right next phase(s) for this host,
+                       stops at human gates, confirms reboots, resumes at next logon.
+      Capture         Reads this node + the cluster (every node's NICs/IPs, vNIC roles,
+                       MPIO, Hyper-V, BIOS profile) and writes <SettingsShare>\cluster.json.
       Baseline         Security defaults + Hyper-V host optimisations + BIOS profile + MPIO
                        + Hyper-V host settings from the config. Shows the change plan and
                        asks first. On a cluster member it health-checks the cluster and
@@ -75,14 +87,18 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Capture', 'Baseline', 'Resume', 'ClusterBaseline',
+    [ValidateSet('Next', 'Capture', 'Baseline', 'Resume', 'ClusterBaseline',
                  'PreFlight', 'Hpe', 'Base', 'Network', 'Storage', 'Agents', 'Join', 'HyperV', 'Report')]
     [string]$Phase,
 
-    # Required for every phase except Capture.
+    # The deployment's share/folder holding cluster.json next to the SPP ISO and MSIs.
+    # Give it once; later phases on this host remember it (state.json).
+    [string]$SettingsShare,
+
+    # Alternative to -SettingsShare: an explicit config file (testing / one-offs).
     [string]$ConfigPath,
 
-    # Capture only: where to write the config. Defaults to C:\ArcLogs\HyperVClusterOnboard\<cluster>.json.
+    # Capture only: write the config here instead of <SettingsShare>\cluster.json.
     [string]$OutPath,
 
     # Credential for WinRM to the peer/other nodes if the logged-on account isn't enough.
@@ -96,7 +112,7 @@ param(
 
 # Version of this script, surfaced in the banner/transcript. Independent of the
 # gold-image version; '-dev' suffix while work accumulates under [Unreleased].
-$ScriptVersion = '0.2.0-dev'
+$ScriptVersion = '0.3.0-dev'
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
@@ -223,15 +239,83 @@ function Resolve-Setting {
 # ---------------------------------------------------------------------------
 
 # Called inside the main try so a bad config stops the transcript cleanly.
+$SettingsFileName = 'cluster.json'
+$SettingsCache    = Join-Path $LogRoot 'settings-last.json'
+$RedactedToken    = '<stored on the deployment share - not copied locally>'
+
+# A usable Sentinel site token: set, and not a placeholder or redaction marker.
+function Test-ArcSiteToken { param($Token) return (-not [string]::IsNullOrWhiteSpace("$Token")) -and ("$Token" -notlike '<*') }
+
+# Where the settings come from: -ConfigPath, else <SettingsShare>\cluster.json, else
+# whatever this host used last time (remembered in state.json).
+function Resolve-ArcSettingsPath {
+    if ($ConfigPath)    { return $ConfigPath }
+    if ($SettingsShare) { return (Join-Path $SettingsShare $SettingsFileName) }
+    $s = Get-State
+    if ($s.PSObject.Properties['SettingsPath'] -and $s.SettingsPath) {
+        Write-Host "  Settings: $($s.SettingsPath) (remembered from an earlier phase)"
+        return $s.SettingsPath
+    }
+    return $null
+}
+
+function Save-ArcSettingsPath {
+    param([string]$Path)
+    $s = Get-State
+    $s | Add-Member -NotePropertyName SettingsPath -NotePropertyValue $Path -Force
+    $s | ConvertTo-Json -Depth 5 | Set-Content -Path $StatePath -Encoding UTF8
+}
+
+# Installer paths in the config may be relative to the config file's folder
+# (e.g. "SPP\<version>.iso"), so one share folder holds everything.
+function Resolve-ArcRelativePath {
+    param([string]$Path, [string]$Base)
+    if (-not $Path -or $Path -like '*<*' -or [System.IO.Path]::IsPathRooted($Path)) { return $Path }
+    return (Join-Path $Base $Path)
+}
+
 function Import-ArcConfig {
     $script:PeerParams = $null
     if ($Phase -eq 'Capture') { return }   # Capture creates the config
-    if (-not $ConfigPath) { throw "-ConfigPath is required for -Phase $Phase." }
-    if (-not (Test-Path $ConfigPath)) { throw "Config file not found: $ConfigPath" }
-    $script:Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+    $src = Resolve-ArcSettingsPath
+    if (-not $src) { throw "No settings found. Pass -SettingsShare <folder holding $SettingsFileName> once (or -ConfigPath <file>); later phases on this host remember it." }
+
+    $raw = $null
+    $from = $src
+    try { $raw = Get-Content $src -Raw -ErrorAction Stop }
+    catch {
+        # The share can be briefly unreachable (e.g. right after the Network phase
+        # rebuilt the NICs). Offer the last local copy rather than stopping cold.
+        if (-not (Test-Path $SettingsCache)) { throw "Cannot read settings from ${src}: $($_.Exception.Message)" }
+        Write-Warning "Cannot read $src ($($_.Exception.Message))."
+        Write-Host "  Last local copy: $SettingsCache (saved $((Get-Item $SettingsCache).LastWriteTime))"
+        if (-not (Confirm-Action 'Use the last local copy of the settings')) { throw 'Stopped - settings unavailable.' }
+        $raw = Get-Content $SettingsCache -Raw
+        $from = "$SettingsCache (local copy of $src)"
+    }
+    $script:Config = $raw | ConvertFrom-Json
+    Save-ArcSettingsPath $src
+    # Local record of exactly what this run used, plus the fallback copy above. The
+    # Sentinel site token stays on the share only - local copies get a redaction
+    # marker, so a run from the local copy falls back to the prompt.
+    $local = $raw | ConvertFrom-Json
+    if ($local.Agents -and $local.Agents.Sentinel -and $local.Agents.Sentinel.PSObject.Properties['SiteToken'] -and (Test-ArcSiteToken $local.Agents.Sentinel.SiteToken)) {
+        $local.Agents.Sentinel.SiteToken = $RedactedToken
+    }
+    $localJson = $local | ConvertTo-Json -Depth 10
+    Set-Content -Path $SettingsCache -Value $localJson -Encoding UTF8
+    Set-Content -Path (Join-Path $LogRoot "settings-used-$Phase-$Stamp.json") -Value $localJson -Encoding UTF8
+    Write-Host "  Settings loaded from $from."
+
+    $base = Split-Path $src -Parent
+    foreach ($ref in @(@($Config.Hpe, 'SppIsoPath'), @($Config.Hpe, 'IloRestMsiPath'), @($Config.Agents.Sentinel, 'MsiPath'))) {
+        $obj = $ref[0]; $prop = $ref[1]
+        if ($obj -and $obj.PSObject.Properties[$prop]) { $obj.$prop = Resolve-ArcRelativePath $obj.$prop $base }
+    }
+
     $script:NodeConfig = if ($Config.Nodes -and $Config.Nodes.PSObject.Properties[$env:COMPUTERNAME]) { $Config.Nodes.PSObject.Properties[$env:COMPUTERNAME].Value } else { $null }
     if (-not $NodeConfig -and $Phase -in 'Network', 'Storage', 'Agents', 'Join', 'HyperV') {
-        throw "No entry for '$env:COMPUTERNAME' under Nodes in $ConfigPath."
+        throw "No entry for '$env:COMPUTERNAME' under Nodes in $src - add this host (MACs from -Phase PreFlight, IPs) to the file."
     }
     if (-not $Config.ClusterName -or $Config.ClusterName -like '<*>') { throw "Config value 'ClusterName' is missing or still a placeholder." }
 
@@ -922,8 +1006,8 @@ function Invoke-Base {
 
 function Invoke-Network {
     Assert-PriorPhase 'Base'
-    if ($env:SESSIONNAME -ne 'Console' -and -not $AllowRemoteSession) {
-        throw "This session is '$env:SESSIONNAME', not the console. Building the SET vSwitch drops remote sessions - run this from the iLO remote console, or pass -AllowRemoteSession if you have other out-of-band access."
+    if (-not (Test-ArcConsoleSession) -and -not $AllowRemoteSession) {
+        throw "This is not the console session. Building the SET vSwitch drops remote sessions - run this from the iLO remote console, or pass -AllowRemoteSession if you have other out-of-band access."
     }
     if (-not (Get-Command New-VMSwitch -ErrorAction SilentlyContinue)) { throw 'Hyper-V module not available - run -Phase Base and reboot first.' }
 
@@ -1088,6 +1172,7 @@ function Invoke-Storage {
     $localIds = @(Get-Disk | ForEach-Object UniqueId)
     if (-not $peerLuns) { Write-Warning 'The peer reported no clustered disks - cannot compare.' }
     $missing = @($peerLuns | Where-Object { $_.UniqueId -notin $localIds })
+    $script:StorageMissing = if ($peerLuns) { $missing.Count } else { -1 }   # -1 = peer had none to compare
     foreach ($l in $peerLuns) {
         $seen = $l.UniqueId -in $localIds
         Write-Host ("  {0,-8} {1,6} GB  {2}  {3}" -f $(if ($seen) { 'VISIBLE' } else { 'MISSING' }), $l.SizeGB, $l.UniqueId, $l.FriendlyName) -ForegroundColor $(if ($seen) { 'Green' } else { 'Red' })
@@ -1136,7 +1221,7 @@ function Test-SentinelInstalled {
 
 # Returns $true if a reboot is needed.
 function Install-ArcSentinelAgent {
-    param([Parameter(Mandatory)][string]$MsiPath)
+    param([Parameter(Mandatory)][string]$MsiPath, [string]$StoredToken)
     if (Test-SentinelInstalled) { Write-Host '  SentinelOne already installed - skipping install.' -ForegroundColor Green; return $false }
     if (-not (Test-Path $MsiPath)) { throw "Sentinel MSI not found: $MsiPath" }
 
@@ -1149,9 +1234,17 @@ function Install-ArcSentinelAgent {
         if ($sig.Status -ne 'Valid') { throw "Sentinel MSI signature is '$($sig.Status)' - refusing to run it." }
         Write-Host "  MSI signed by: $($sig.SignerCertificate.Subject)"
 
-        $token = Read-Host '  SentinelOne site token (input hidden)' -AsSecureString
-        $bstr  = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($token)
-        $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        # Site token from cluster.json on the share if it's there; otherwise (not set,
+        # placeholder, or this run is using the redacted local copy) prompt for it.
+        if (Test-ArcSiteToken $StoredToken) {
+            $plain = $StoredToken
+            Write-Host '  Using the SentinelOne site token from the deployment settings (not shown).'
+        } else {
+            if ($StoredToken -eq $RedactedToken) { Write-Host '  Settings came from the local copy, which does not hold the site token.' -ForegroundColor Yellow }
+            $token = Read-Host '  SentinelOne site token (input hidden)' -AsSecureString
+            $bstr  = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($token)
+            $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        }
         if ([string]::IsNullOrWhiteSpace($plain)) { throw 'No site token entered.' }
 
         # The token is an MSI property, so it is on msiexec's command line while it runs
@@ -1209,7 +1302,8 @@ function Invoke-Agents {
 
     Write-Step 'SentinelOne agent'
     if ($ag.Sentinel -and $ag.Sentinel.MsiPath -and $ag.Sentinel.MsiPath -notlike '*<*') {
-        if (Install-ArcSentinelAgent -MsiPath $ag.Sentinel.MsiPath) { $reboot = $true }
+        $stored = if ($ag.Sentinel.PSObject.Properties['SiteToken']) { $ag.Sentinel.SiteToken } else { $null }
+        if (Install-ArcSentinelAgent -MsiPath $ag.Sentinel.MsiPath -StoredToken $stored) { $reboot = $true }
     } elseif (-not (Test-SentinelInstalled)) { Write-Warning 'Agents.Sentinel.MsiPath not configured and Sentinel is not installed - skipping.' }
 
     if (Test-SentinelInstalled) {
@@ -1399,8 +1493,8 @@ function Invoke-Capture {
         HostNetworks = $hostNetworks
         Nodes        = $nodesCfg
         Hpe = [ordered]@{
-            SppIsoPath      = '\\<SERVER>\<SHARE>\HyperVOnboard\SPP\<SPP_VERSION>.iso'
-            IloRestMsiPath  = '\\<SERVER>\<SHARE>\HyperVOnboard\HPE\ilorest-<VERSION>.msi'
+            SppIsoPath      = 'SPP\<SPP_VERSION>.iso'          # relative to this file's folder
+            IloRestMsiPath  = 'HPE\ilorest-<VERSION>.msi'
             WorkloadProfile = 'Virtualization-MaxPerformance'
         }
         Storage = [ordered]@{
@@ -1430,14 +1524,31 @@ function Invoke-Capture {
         }
         Agents = [ordered]@{
             Datto    = [ordered]@{ Platform = '<pinotage|merlot>'; SiteID = '<SITE_ID>' }
-            Sentinel = [ordered]@{ MsiPath = '\\<SERVER>\<SHARE>\HyperVOnboard\SentinelOne\SentinelInstaller-<VERSION>.msi'; RemoveDefender = $true }
+            Sentinel = [ordered]@{ MsiPath = 'SentinelOne\SentinelInstaller-<VERSION>.msi'; SiteToken = '<SENTINEL_SITE_TOKEN>'; RemoveDefender = $true }
         }
     }
 
-    $out = if ($OutPath) { $OutPath } else { Join-Path $LogRoot "$($cluster.Name).json" }
-    if ((Test-Path $out) -and -not (Confirm-Action "$out exists. Overwrite it?")) { throw 'Stopped - config not written.' }
-    $cfg | ConvertTo-Json -Depth 8 | Set-Content -Path $out -Encoding UTF8
-    Write-Host "`n  Config written: $out" -ForegroundColor Green
+    $out = if ($OutPath) { $OutPath } elseif ($SettingsShare) { Join-Path $SettingsShare $SettingsFileName } else { Join-Path $LogRoot $SettingsFileName }
+    if (Test-Path $out) {
+        if (-not (Confirm-Action "$out exists - re-capturing replaces the captured values (and any edits to them). Agents (Datto, Sentinel token) and the Hpe installer paths are kept. Overwrite?")) { throw 'Stopped - config not written.' }
+        # Keep the hand-entered sections, so a re-capture doesn't lose the site token / Site ID.
+        try {
+            $old = Get-Content $out -Raw | ConvertFrom-Json
+            if ($old.Agents) { $cfg.Agents = $old.Agents; Write-Host '  Kept Agents from the existing file.' }
+            if ($old.Hpe) {
+                foreach ($k in 'SppIsoPath', 'IloRestMsiPath') { if ($old.Hpe.$k) { $cfg.Hpe[$k] = $old.Hpe.$k } }
+                Write-Host '  Kept Hpe installer paths from the existing file.'
+            }
+        } catch { Write-Warning "Could not read the existing $out ($($_.Exception.Message)) - Agents/Hpe paths reset to placeholders." }
+    }
+    $json = $cfg | ConvertTo-Json -Depth 10
+    $json | Set-Content -Path $out -Encoding UTF8
+    $localCopy = $json | ConvertFrom-Json
+    if ($localCopy.Agents.Sentinel -and (Test-ArcSiteToken $localCopy.Agents.Sentinel.SiteToken)) { $localCopy.Agents.Sentinel.SiteToken = $RedactedToken }
+    $localCopy | ConvertTo-Json -Depth 10 | Set-Content -Path (Join-Path $LogRoot "settings-captured-$Stamp.json") -Encoding UTF8
+    Save-ArcSettingsPath $out
+    Write-Host "`n  Config written: $out (local copy in $LogRoot)" -ForegroundColor Green
+    if (-not $SettingsShare -and -not $OutPath) { Write-Host "  Move it to the deployment share next to the SPP ISO and MSIs, then run later phases with -SettingsShare <that folder>." -ForegroundColor Yellow }
 
     Write-Step 'Captured values that differ from the recommended baseline - review before applying'
     $bios = $local.Compare['HPE.Bios.WorkloadProfile']
@@ -1927,6 +2038,138 @@ function Invoke-ClusterBaseline {
 }
 
 # ---------------------------------------------------------------------------
+# Phase: Next - attended automation. Works out where this host is from
+# state.json, runs phases back to back, stops at the human gates, asks before
+# every reboot, and resumes at the engineer's next logon (no auto-logon, no
+# stored password).
+# ---------------------------------------------------------------------------
+
+$NextTaskName = 'ArcHyperVClusterNext'
+
+# Is this process in the physical/iLO console session? $env:SESSIONNAME isn't
+# reliable when launched from a scheduled task, so compare session IDs.
+function Test-ArcConsoleSession {
+    if ($env:SESSIONNAME -like 'RDP-*') { return $false }
+    $mine = (Get-Process -Id $PID).SessionId
+    $ErrorActionPreference = 'Continue'
+    $q = qwinsta 2>&1 | ForEach-Object { "$_" } | Out-String
+    if ($q -match '(?m)^\s*>?console\s+(?:\S+\s+)?(\d+)\s') { return ([int]$Matches[1] -eq $mine) }
+    return ($env:SESSIONNAME -eq 'Console')
+}
+
+function Request-ArcReboot {
+    param([string]$Reason = 'The last phase needs a reboot.')
+    Write-Host "`n$Reason" -ForegroundColor Yellow
+    $scriptPath = $PSCommandPath
+    if ($scriptPath -and (Test-Path $scriptPath)) {
+        $user = "$env:USERDOMAIN\$env:USERNAME"
+        $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -NoExit -File `"$scriptPath`" -Phase Next"
+        $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $user
+        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
+        Register-ScheduledTask -TaskName $NextTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        Write-Host "  After the reboot, log on as $user - the next phase starts by itself (one-shot task '$NextTaskName')." -ForegroundColor Cyan
+    } else {
+        Write-Host '  (No script file on disk - after the reboot, run -Phase Next yourself.)' -ForegroundColor Yellow
+    }
+    if (Confirm-Action 'Reboot now') {
+        Write-Host '  Rebooting...'
+        Stop-Transcript | Out-Null
+        Restart-Computer -Force
+        exit 0
+    }
+    Write-Host '  Not rebooting now - reboot when ready; the next phase picks up at your next logon.' -ForegroundColor Yellow
+}
+
+function Stop-Next {
+    param([string]$Message)
+    Write-Host "`n>> ACTION NEEDED: $Message" -ForegroundColor Yellow
+    Write-Host '>> Then run:  -Phase Next' -ForegroundColor Yellow
+}
+
+function Invoke-Next {
+    Unregister-ScheduledTask -TaskName $NextTaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    # A reboot was asked for and declined last time - don't carry on as if it happened.
+    $state = Get-State
+    if ($state.RebootPending -and $state.PSObject.Properties['RebootRequestedAt'] -and $state.RebootRequestedAt) {
+        if ((Get-CimInstance Win32_OperatingSystem).LastBootUpTime -lt [datetime]$state.RebootRequestedAt) {
+            Request-ArcReboot "A reboot requested at $($state.RebootRequestedAt) hasn't happened yet."
+            return
+        }
+    }
+
+    # Existing cluster node (not one this script joined): Baseline -> reboot -> Resume.
+    $state = Get-State
+    $joinedHere = [bool]$state.Phases.PSObject.Properties['Join']
+    if ((Test-ArcClusterMember) -and -not $joinedHere) {
+        Write-Step "$env:COMPUTERNAME is an existing cluster node - baseline workflow"
+        if ($state.PSObject.Properties['Drained'] -and $state.Drained -eq $true) {
+            Invoke-Resume
+            Write-Host "`nThis node is done. Next: -Phase Next on the next node; -Phase ClusterBaseline once, after all nodes." -ForegroundColor Green
+        } else {
+            Invoke-Baseline
+            $s = Get-State
+            if ($s.PSObject.Properties['Drained'] -and $s.Drained -eq $true -and $s.RebootPending) { Request-ArcReboot 'Baseline applied; the node is drained and needs a reboot. Resume runs after it.' }
+        }
+        return
+    }
+
+    # New node: the onboarding sequence. Keys are phase records in state.json.
+    if (-not $PeerParams) { throw "PeerNode must be set in the settings for the new-node workflow." }
+    $steps = 'PreFlight', 'Hpe', 'PreFlightPostHpe', 'Base', 'Network', 'StorageVerified', 'AgentsVerified', 'Baseline', 'Join', 'HyperV', 'Report'
+    while ($true) {
+        $state = Get-State
+        $step = $steps | Where-Object { -not $state.Phases.PSObject.Properties[$_] } | Select-Object -First 1
+        if (-not $step) { Write-Host "`nOnboarding complete for $env:COMPUTERNAME - all phases recorded." -ForegroundColor Green; return }
+        Write-Host "`n################ Next: $step ################" -ForegroundColor Magenta
+        $script:Results.Clear()
+
+        switch ($step) {
+            'PreFlight' {
+                Invoke-PreFlight
+                if (-not $NodeConfig) { Stop-Next "Add $env:COMPUTERNAME to Nodes in the settings file: AdapterMacs (from the NIC list above) and an IP per role."; return }
+                if (@($script:Results | Where-Object Status -eq 'FAIL').Count) { Stop-Next 'Fix the FAIL items above.'; return }
+                Save-PhaseComplete 'PreFlight'
+            }
+            'Hpe' { Invoke-Hpe }
+            'PreFlightPostHpe' {
+                Invoke-PreFlight
+                if (@($script:Results | Where-Object Status -eq 'FAIL').Count) { Stop-Next 'Fix the FAIL items above (post-SPP check).'; return }
+                Write-Host "`n  Review any firmware/driver WARNs above - continuing in 10 seconds (Ctrl+C to stop)." -ForegroundColor Yellow
+                Start-Sleep -Seconds 10
+                Save-PhaseComplete 'PreFlightPostHpe'
+            }
+            'Base' { Invoke-Base }
+            'Network' {
+                if (-not $NodeConfig) { Stop-Next "Add $env:COMPUTERNAME to Nodes in the settings file."; return }
+                if (-not (Test-ArcConsoleSession) -and -not $AllowRemoteSession) { Stop-Next 'Log on at the iLO remote console (not RDP) - building the vSwitch drops remote sessions.'; return }
+                Invoke-Network
+            }
+            'StorageVerified' {
+                Invoke-Storage
+                if ((Get-State).RebootPending) { break }
+                if ($script:StorageMissing -gt 0) { Stop-Next "Zone the WWPNs above and present the cluster LUNs to this host on the 3PAR/Primera (persona 15) - $($script:StorageMissing) LUN(s) not visible yet."; return }
+                Save-PhaseComplete 'StorageVerified'
+            }
+            'AgentsVerified' {
+                Invoke-Agents
+                if ((Get-State).RebootPending) { break }
+                $wantRemoved = $Config.Agents.Sentinel.RemoveDefender -ne $false
+                if ($wantRemoved -and (Get-WindowsFeature Windows-Defender).Installed) { Stop-Next 'Defender is still installed - confirm the host shows as connected in the SentinelOne console and answer yes to the removal.'; return }
+                Save-PhaseComplete 'AgentsVerified'
+            }
+            'Baseline' { Invoke-Baseline }
+            'Join'     { Invoke-Join }
+            'HyperV'   { Invoke-HyperV }
+            'Report'   { Invoke-Report; Save-PhaseComplete 'Report' }
+        }
+
+        if ((Get-State).RebootPending) { Request-ArcReboot; return }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Phase: Report
 # ---------------------------------------------------------------------------
 
@@ -1966,6 +2209,7 @@ function Invoke-Report {
 try {
     Import-ArcConfig
     switch ($Phase) {
+        'Next'            { Invoke-Next }
         'Capture'         { Invoke-Capture }
         'Baseline'        { Invoke-Baseline }
         'Resume'          { Invoke-Resume }

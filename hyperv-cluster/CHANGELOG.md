@@ -4,9 +4,25 @@ All notable changes to `ArcHyperVCluster.ps1` (originally `Add-ArcHyperVClusterN
 
 ## [Unreleased]
 
-_Work in progress on the `develop` branch. `$ScriptVersion` is `0.2.0-dev`; the download one-liner points at `/develop/`._
+_Work in progress on the `develop` branch. `$ScriptVersion` is `0.3.0-dev`; the download one-liner points at `/develop/`._
 
 ### Added
+- **`-Phase Next`: attended automation (0.3.0-dev).** This works out where the host is from `state.json`.
+  - **New node:** runs the onboarding phases back to back, with automatic re-checks: PreFlight after the SPP, Storage until every LUN is visible, Agents until Defender is removed, Base if VT-x was off.
+  - **It stops at the human gates** with an `ACTION NEEDED` line: add MACs/IPs, iLO console for Network, FC zoning/array, Sentinel connected, `JOIN`.
+  - **It asks before every reboot** and registers a one-shot logon task (`ArcHyperVClusterNext`), so the next phase starts when the engineer logs back on. There's no auto-logon and no stored password. A declined reboot is asked for again rather than skipped.
+  - **Existing cluster node:** Baseline (drain, apply), the reboot prompt, then Resume after logon.
+  - **Console detection** now compares the process's session ID with the console session from `qwinsta`. `$env:SESSIONNAME` isn't reliable when launched from a scheduled task. The Network phase uses the same check.
+  - The sequencing (step order, gates, re-runs, reboots) was exercised with mocked phases. Console detection was tested on a real console session and against RDP-style `qwinsta` output.
+- **Settings on the deployment share (0.3.0-dev).** Each cluster's settings now live in one `cluster.json` on that deployment's share, next to the SPP ISO and MSIs, so every node in the cluster uses the same settings and Datto site.
+  - **`-SettingsShare <folder>`:** give it once per host. `state.json` remembers it, so later phases need only `-Phase <Name>`, and `-ConfigPath` is no longer needed on each run.
+  - **`Capture`** writes `<SettingsShare>\cluster.json`, after a confirmation that warns an overwrite replaces any edits. `-OutPath` still overrides the location.
+  - **Local copy on every run:** `settings-last.json`, plus `settings-used-<phase>-<time>.json` as the record of what each run applied. If the share can't be read (e.g. just after the Network phase rebuilds the NICs), the script offers to continue from the last local copy and says so in the log.
+  - **Relative installer paths:** `Hpe.SppIsoPath`, `Hpe.IloRestMsiPath` and `Agents.Sentinel.MsiPath` may be relative to the file's folder (`SPP\<version>.iso`). Capture and the example now write them that way.
+  - **Sentinel site token on the share:** `Agents.Sentinel.SiteToken` in `cluster.json` is used when set. Otherwise (not set, still a placeholder, or the run is using the local copy) the hidden prompt is used as before.
+    - The token is **never copied to node disks**: `settings-last`, `settings-used` and `settings-captured` hold a redaction marker instead. It is never printed.
+  - **Re-running `Capture` keeps the hand-entered sections** (`Agents`, including the Datto Site ID and Sentinel token, and the Hpe installer paths) from the existing `cluster.json`, rather than resetting them to placeholders.
+  - The loading, remembering, relative-path resolution, local-copy fallback and token redaction were exercised locally against a simulated share. A dummy token appeared in none of the local files.
 - **Existing-cluster standard (0.2.0-dev).** The script now defines and applies a best-practice standard to a built cluster, as well as onboarding new nodes. It was renamed to `ArcHyperVCluster.ps1` to match. **The config file is now the authority.** The peer node only fills `null` values and serves as the drift check for new nodes.
   - **`Capture`** reads the node it runs on and every Up node over WinRM, then writes the config (outside the repo, `C:\ArcLogs\HyperVClusterOnboard\<cluster>.json` by default). It includes:
     - host networks from the real vNIC names (VLAN, prefix, weight, gateway, DNS, jumbo, cluster role)

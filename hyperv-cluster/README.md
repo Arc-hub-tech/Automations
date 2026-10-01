@@ -17,19 +17,45 @@ An engineer runs it interactively. It is not a Datto component.
 
 **Existing cluster: set the standard and bring every node up to it**
 
-1. `Capture` on any node. It writes `C:\ArcLogs\HyperVClusterOnboard\<cluster>.json`, lists captured values that differ from best practice, and shows drift between nodes.
-2. Edit the config: agents, share paths, and anything Capture flagged (e.g. VM paths not on a CSV).
+1. `Capture -SettingsShare \\<SERVER>\<SHARE>\<DEPLOYMENT>` on any node. It writes `cluster.json` to the share (and a local copy), lists captured values that differ from best practice, and shows drift between nodes.
+2. Edit `cluster.json` on the share: the Datto site ID and platform, installer file names, and anything Capture flagged (e.g. VM paths not on a CSV).
 3. `Baseline` on each node **one at a time**. It shows the plan, then health check, drain, apply, and stop.
 4. Reboot if Baseline says so, then `Resume` (you choose whether VMs move back).
 5. `ClusterBaseline` once, from any node.
 
 **New node:** `PreFlight` → `Hpe` → `PreFlight` → `Base` → `Network` (console) → `Storage` → `Agents` → **`Baseline`** → `Join` → `HyperV` → `Report`
 
+### Attended automation: `-Phase Next`
+
+Once `cluster.json` is set up, an engineer only needs to run **`-Phase Next`**. It reads `state.json` to see where the host is, then:
+
+- **Runs phases back to back.** Re-checks are automatic: PreFlight runs again after the SPP, Storage repeats until every LUN is visible, Agents repeats until Defender is gone, and Base repeats if VT-x was off.
+- **Stops at the human gates** with an `ACTION NEEDED` line. You do the step, then run `-Phase Next` again.
+- **Asks before every reboot** (`Reboot now? [y/N]`). It registers a one-shot logon task, so the next phase **starts by itself when you log back on**. There's no auto-logon and no stored password. If you say no, the next `-Phase Next` asks again rather than carrying on un-rebooted.
+
+| Stop | What you do |
+|---|---|
+| After the first PreFlight | Add this host's `AdapterMacs` (from the NIC list) and IPs to `Nodes` in `cluster.json`; fix any FAIL items |
+| Before Network | Log on at the **iLO remote console**. The task launched at your logon then runs Network. |
+| Storage | FC zoning, plus the 3PAR/Primera host object (persona 15) with the printed WWPNs |
+| Agents | Confirm the host shows as connected in the SentinelOne console, and answer yes to removing Defender |
+| Join | Review the validation report and type `JOIN` |
+
+A new node typically takes about **six starts**:
+1. PreFlight → stop: add MACs and IPs.
+2. Hpe → reboot → PreFlight → Base → reboot → stop: iLO console.
+3. Network → Storage → stop: zoning.
+4. Storage → Agents → stop: Sentinel.
+5. Defender removal → reboot → Baseline (→ reboot) → Join (`JOIN`).
+6. HyperV → Report → done.
+
+**On an existing cluster node**, `-Phase Next` runs `Baseline` (health check, drain, apply), asks to reboot, then runs `Resume` after you log back on. Then move to the next node. Run `ClusterBaseline` once by hand after all the nodes are done.
+
 ## Phases
 
 | Phase | What it does | Reboot |
 |---|---|---|
-| `Capture` | Reads this node and every Up node in the cluster over WinRM. Writes the config: host networks from the real vNIC names (VLAN, prefix, weight, gateway, DNS, jumbo), each node's SET member MACs and IPs, switch settings, MPIO claim/policy/timers, Hyper-V settings, BIOS profile target, and live migration network order. Security and optimisation are set to the recommended defaults. Agents and share paths are left as placeholders. No `-ConfigPath`; `-OutPath` is optional. | - |
+| `Capture` | Reads this node and every Up node in the cluster over WinRM. Writes the config: host networks from the real vNIC names (VLAN, prefix, weight, gateway, DNS, jumbo), each node's SET member MACs and IPs, switch settings, MPIO claim/policy/timers, Hyper-V settings, BIOS profile target, and live migration network order. Security and optimisation are set to the recommended defaults. Agents and share paths are left as placeholders. Writes `<SettingsShare>\cluster.json` (`-OutPath` to write elsewhere) and a local copy. | - |
 | `Baseline` | Applies [security defaults](#security-defaults) and [Hyper-V host optimisations](#hyper-v-host-optimisations), plus the BIOS workload profile, MPIO claim/policy/timers and Hyper-V host settings. Only changes what differs. On a cluster member: health check, drain, apply, stop. | If an item needs it |
 | `Resume` | After a Baseline reboot: checks the reboot happened, resumes the node (VMs moved back or not, your choice), and lists anything still different. | - |
 | `ClusterBaseline` | Cluster networks named and roled by subnet (Management = ClusterAndClient, others = Cluster; **never None**, which would stop heartbeats). Live migration network order and exclusions. DrainOnShutdown on. Optional: CSV block cache, intra-cluster SecurityLevel. **Report only:** quorum witness (warns if there's none, critical on 2 nodes), CAU role, node states. | - |
@@ -86,9 +112,15 @@ Switched with `Optimisation.Apply`.
 
 ## Inputs
 
-### 1. Config file (one per cluster, kept outside this repo)
+### 1. `cluster.json`: one per cluster, on the deployment share
 
-For an existing cluster, generate it with `Capture`. For reference, the layout is [`cluster.example.json`](cluster.example.json). **Keep the real file outside this repo.** It holds hostnames, IPs, VLANs, share paths and the Datto site ID, which count as customer and infrastructure data, and this repo is public. `hyperv-cluster/*.json` other than the example is gitignored as a backstop.
+Each cluster has its own deployment share. One `cluster.json` sits there next to the SPP ISO and MSIs (see [the share layout](#3-deployment-share)), so every node in that cluster uses the same settings and the same Datto site. For an existing cluster, `Capture` writes it. The layout is in [`cluster.example.json`](cluster.example.json).
+
+- **Give `-SettingsShare <folder>` once per host.** That host's `state.json` remembers it, so later phases need only `-Phase <Name>`.
+- **A local copy is kept on every run.** It is written to `C:\ArcLogs\HyperVClusterOnboard\settings-last.json`, plus `settings-used-<phase>-<time>.json` as the record of exactly what each run applied. If the share can't be reached, for example just after the Network phase rebuilds the NICs, the script offers to carry on from the last local copy.
+- **Installer paths are relative to the file's folder** (`SPP\<version>.iso`). The same file works wherever the share is mounted. Full paths still work.
+- `-ConfigPath <file>` points at one specific file instead, for testing or one-offs.
+- **Keep it off GitHub, and keep share access to engineers.** It holds hostnames, IPs, VLANs and the Datto site ID, which count as customer and infrastructure data. `hyperv-cluster/*.json` other than the example is gitignored as a backstop.
 
 | Section | Values |
 |---|---|
@@ -102,12 +134,12 @@ For an existing cluster, generate it with `Capture`. For reference, the layout i
 | `Security` | `Apply`, `DisableLegacyTls`, `RequireSmbSigning`, `DisablePrintSpooler`, `InactivityTimeoutSecs`, `LockoutThreshold`, `CredentialGuard` (opt-in), `Hvci` (opt-in). See [Security defaults](#security-defaults). |
 | `Optimisation` | `Apply`. See [Hyper-V host optimisations](#hyper-v-host-optimisations). |
 | `Cluster` | `LiveMigrationNetworks` (roles in preference order; everything else is excluded from live migration), `DrainOnShutdown`, `BlockCacheSizeMB` and `SecurityLevel` (`null` = leave alone) |
-| `Agents` | Datto `Platform` (`pinotage` or `merlot`; prompted if left as the placeholder) and `SiteID`; Sentinel `MsiPath` and `RemoveDefender` |
+| `Agents` | Datto `Platform` (`pinotage` or `merlot`; prompted if left as the placeholder) and `SiteID`; Sentinel `MsiPath`, `SiteToken` (optional, see below) and `RemoveDefender` |
 
 ### 2. Entered at runtime (never stored)
 
 - **Datto platform**: Pinotage or Merlot, prompted in `Agents` only if the config doesn't set it.
-- **SentinelOne site token**: prompted hidden in `Agents`. Take it from the customer's site in the S1 console.
+- **SentinelOne site token**: only if `Agents.Sentinel.SiteToken` isn't set in `cluster.json`, or this run is using the local copy (which never holds it). Prompted hidden. Take it from the customer's site in the S1 console.
 - **iLO credentials**: only if in-band iLO access is refused ("Require Host Authentication" is on).
 - **Confirmations**:
   - running SUM
@@ -118,16 +150,19 @@ For an existing cluster, generate it with `Capture`. For reference, the layout i
   - applying ClusterBaseline changes
   - typing `JOIN` after reviewing the validation report
 
-### 3. SMB share
+### 3. Deployment share
+
+One per cluster:
 
 ```
-\\<SERVER>\<SHARE>\HyperVOnboard\
+\\<SERVER>\<SHARE>\<DEPLOYMENT>\
+    cluster.json
     SPP\<SPP_VERSION>.iso
     HPE\ilorest-<VERSION>.msi
     SentinelOne\SentinelInstaller-<VERSION>.msi
 ```
 
-- The engineer's account needs read access. The phases run as that account, not as SYSTEM.
+- The engineer's account needs read access, plus **write** access for `Capture` to write `cluster.json`. The phases run as that account, not as SYSTEM.
 - The SPP ISO is mounted straight from the share. If mounting in place fails, it is copied locally first (about 10 GB).
 - **Use the SPP release the existing nodes run,** or plan to bring the whole cluster up to it. SUM installs everything newer, so a newer SPP leaves the new node ahead of its peers. Also check the SPP lists Windows Server 2025 support for your Gen10 models.
 - Put the version in each filename, so the transcripts record what was installed.
@@ -153,10 +188,10 @@ For an existing cluster, generate it with `Capture`. For reference, the layout i
 Download-then-run, elevated:
 
 ```powershell
-$p="$env:SystemDrive\ArcLogs\HyperVClusterOnboard\ArcHyperVCluster.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-cluster/ArcHyperVCluster.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Capture
+$p="$env:SystemDrive\ArcLogs\HyperVClusterOnboard\ArcHyperVCluster.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-cluster/ArcHyperVCluster.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Capture -SettingsShare \\<SERVER>\<SHARE>\<DEPLOYMENT>
 ```
 
-Then run `& $p -Phase <Name> -ConfigPath <config>.json` for each step of the [workflow](#workflows). Run `Network` **from the iLO remote console**, and reboot whenever a phase asks you to.
+Then run `& $p -Phase Next` (see [attended automation](#attended-automation--phase-next)), or `& $p -Phase <Name>` for any single step of the [workflow](#workflows). On a host's first run, add `-SettingsShare \\<SERVER>\<SHARE>\<DEPLOYMENT>`; after that the host remembers it. Run `Network` **from the iLO remote console**, and reboot whenever a phase asks you to.
 
 ## Config notes
 
@@ -168,7 +203,7 @@ Then run `& $p -Phase <Name> -ConfigPath <config>.json` for each step of the [wo
 
 ## Security notes
 
-- The **Sentinel site token** is prompted as a SecureString and is never written to config, logs or the transcript. It is still visible on `msiexec`'s command line while the install runs (to process auditing and EDR telemetry), because the MSI only accepts it as a property. That can't be avoided. No verbose MSI log is written, because `/lv*` would record the token on disk.
+- The **Sentinel site token** can be stored in `cluster.json` on the deployment share (`Agents.Sentinel.SiteToken`), which saves entering it on every node. It is **never copied to node disks**: the `settings-last` / `settings-used` / `settings-captured` local copies hold a redaction marker instead, so a run from the local copy prompts for it. It is never printed to the console or transcript. If it isn't stored, it's prompted as a SecureString. Either way, it's visible on `msiexec`'s command line while the install runs (process auditing, EDR telemetry), because the MSI only accepts it as a property; that can't be avoided. No verbose MSI log is written, because `/lv*` would record it on disk. The token only lets an agent enrol into that S1 site (no console or API access). If it leaks, regenerate it in the S1 console and update `cluster.json`.
 - If in-band `ilorest` login is refused, the script can prompt for iLO credentials. `ilorest` only accepts the password as an argument, so it is briefly visible on that process's command line.
 
 ## Not automated (deliberately)

@@ -321,7 +321,7 @@ Each customer gets two clouds:
 4. Create the customer's working cloud at the primary site and DR cloud at the secondary site, with quotas.
 5. Create the customer's user role, scoped to their clouds and VM networks.
 6. Deploy a test VM in the working cloud, check it reaches only the customer's networks, and remove it.
-7. Set up replication for the customer's VMs to the secondary site and confirm the replicas appear in the DR cloud, powered off.
+7. Set up the customer's Veeam backup job, replication job and failover plan (see Veeam), and confirm the replicas appear in the DR cloud, powered off.
 
 ### Offboarding a customer
 
@@ -341,31 +341,11 @@ Stop replication and remove their replicas, then their VMs (after the agreed dat
 | The order is written down | A failover runbook says what starts first and how it is checked |
 | It is tested | Failover tests run on a schedule, into an isolated network, without touching production |
 
-### Replication with Veeam
+### Replication
 
-Replication uses Veeam Backup and Replication, as on the current platform.
+Replication uses Veeam Backup and Replication: one replication job and one failover plan per customer, hourly, targeting the secondary cluster, with replicas kept powered off in the customer's DR cloud. The Veeam section sets out the full standard, including where Veeam runs so that a failover never depends on the lost site.
 
-| Item | Arc baseline |
-|---|---|
-| Jobs | One replication job per customer (or per customer and recovery tier), so each customer's schedule, retention and failover plan stand alone |
-| Target | The secondary cluster. Replicas are registered as highly available VMs on the cluster and appear in SCVMM |
-| Replica naming | A consistent suffix (for example `_replica`) so replicas are never confused with originals in SCVMM or Veeam |
-| DR cloud | After Veeam creates a replica, assign it to the customer's DR cloud in SCVMM, so quotas and access cover it. Script this as part of the job's post-job activity or the daily checks |
-| Network mapping | The same VLANs exist at both sites, so each replica maps to the matching customer VM network at the secondary site. No re-IP rules |
-| Restore points | Enough replica restore points to step back past a problem (for example ransomware) that has already replicated; agree the number per customer |
-| Failover plans | One Veeam failover plan per customer, starting the customer's VMs in tiers with delays (see Failover order) |
-| Testing | Veeam SureReplica in a virtual lab at the secondary site, which is isolated from production by design |
-| Failback | Veeam's failback to the primary site, planned as a change |
-
-Where Veeam itself runs matters. A failover must not depend on anything at the lost site:
-
-→ The Veeam backup server, or a fully ready standby of it with its configuration backup, runs at the secondary site, so failover plans can be started when the primary site is down.
-
-→ Veeam failover does not depend on SCVMM. SCVMM is brought up first to manage the platform afterwards, not to perform the failover.
-
-→ Replicas are never edited or started by hand outside a failover plan, because that breaks replication.
-
-How the replicas are kept up to date, and what recovery point that achieves, is covered in Recovery point performance below.
+Replicas are never edited or started by hand outside a failover plan, because that breaks replication.
 ### Capacity
 
 The platform is designed for full failover: the secondary cluster must be able to run every replica at once. It is idle day to day, so it is easy to let it fall behind the primary without noticing.
@@ -434,6 +414,116 @@ The current 3PAR and Primera storage snapshots stay as a local rollback capabili
 
 → Record the time taken against the customer's recovery time objective, and fix anything that slowed the test.
 
+## Veeam
+
+Veeam Backup and Replication protects every customer workload on the platform: backups for restores at the primary site, and replicas for failover to the secondary site. This section is the Arc standard for how it is built and run. Confirm version-specific behaviour against Veeam's documentation for the release in use.
+
+### Infrastructure
+
+| Component | Where | Arc baseline |
+|---|---|---|
+| Veeam backup server | Secondary site | The server that runs the jobs and failover plans. It lives at the secondary site so failover plans can be started when the primary site is lost. Its configuration database (PostgreSQL by default on current releases) is on the same server or a dedicated database VM at the same site |
+| Configuration backup | Both sites | Veeam's configuration backup runs daily, encrypted, to a repository at each site, so the backup server can be rebuilt from either |
+| SCVMM connection | Added in Veeam | SCVMM is added to Veeam as a managed server, so Veeam sees both clusters through it. Jobs still protect VMs directly on the clusters, so a failover does not depend on SCVMM |
+| Backup proxies, primary | On the primary hosts (on-host processing) | The Hyper-V hosts read the changed blocks for backup and replication jobs. Move to off-host proxies if the load thresholds in Recovery point performance are crossed |
+| Backup proxies, secondary | On the secondary hosts | The secondary hosts receive replica data and write it to the replicas |
+| Primary repository | Primary site | Fast local restores. A hardened Linux repository with immutable backups |
+| Secondary repository | Secondary site | Backup copies of every customer's backups, on a hardened Linux repository with immutability. Survives the loss of the primary site |
+| Offsite copy | Outside both sites | A further immutable copy, for example object storage with object lock, so one copy survives anything that affects both sites |
+| Console | Arc management jump hosts | Never installed on the hypervisors or engineer laptops |
+
+The baseline follows the 3-2-1-1-0 approach: three copies of the data, on two kinds of media, one off site, one immutable, and zero errors in restore testing.
+
+### Accounts and security
+
+Veeam can restore, delete or replace any customer's data, so it is protected at least as strongly as SCVMM.
+
+→ The Veeam backup server and repositories are not joined to the Arc infrastructure domain or any customer domain. They run in a workgroup or a dedicated management domain, so a compromised domain cannot reach the backups.
+
+→ The Veeam console uses multi-factor authentication. Engineers sign in from the management jump hosts only.
+
+→ Four-eyes authorisation is enabled, so deleting backups or changing critical settings needs a second engineer to approve.
+
+→ Hardened repositories use single-use credentials during setup, then have no remote shell access, and are patched on their own schedule.
+
+→ Backups and backup copies are encrypted. The encryption passwords are kept in the Arc vault, and the vault entry is tested as part of the restore tests.
+
+→ The Hyper-V host access account Veeam uses is a dedicated Run As style account, separate from SCVMM's, and recorded in the vault.
+
+→ Veeam's malware detection is enabled on backups, and alerts go to the service desk.
+
+### Customer separation in Veeam
+
+→ One backup job and one replication job per customer, named with the customer code: `BK-<CUSTOMER>` and `RP-<CUSTOMER>`. Larger customers can have a job per tier.
+
+→ One failover plan per customer: `FP-<CUSTOMER>`.
+
+→ Customer VMs are selected for jobs by SCVMM cloud or by a customer tag, never by hand-picked lists, so a new VM in a customer's cloud is protected automatically.
+
+→ Guest processing (application-aware backups of databases and domain controllers) uses credentials for the customer's own domain, stored in Veeam per customer. A customer's credentials are only used in that customer's jobs.
+
+### Backup jobs
+
+| Setting | Arc baseline |
+|---|---|
+| Schedule | Daily, outside the customer's business hours, staggered across customers |
+| Retention | From the customer's contract. The platform default is 14 daily restore points at the primary repository |
+| Backup copies | Every backup copied to the secondary repository, and then off site, with the retention the contract sets |
+| Changed block tracking | Hyper-V resilient change tracking, used by default on Windows Server 2025 |
+| Application-aware processing | On for domain controllers, SQL Server and Exchange, with log handling agreed per customer |
+| Immutability | On at every repository that supports it |
+
+### Replication jobs
+
+| Setting | Arc baseline |
+|---|---|
+| Schedule | Hourly, to meet the 1 hour recovery point objective. Customers staggered across the hour so checkpoints do not all land at once |
+| Target | The secondary cluster, registered as highly available VMs |
+| Replica naming | A consistent suffix, for example `_replica`, so replicas are never confused with originals |
+| Restore points | Enough to step back past a problem that has already replicated, for example 24 hourly points; agree per customer |
+| Network mapping | Each customer VLAN maps to the matching VM network at the secondary site. The VLANs are the same at both sites, so no re-IP rules |
+| Seeding | Large VMs seeded from a backup at the secondary repository, so the first replication run does not cross the inter-site link in full |
+| Post-job | Each new replica assigned to the customer's DR cloud in SCVMM (scripted), so quotas and access cover it |
+
+### Failover plans
+
+Each customer's failover plan starts their replicas in tiers, with a delay and a check between tiers:
+
+1. The customer's virtual firewall, so routing is in place first.
+2. Domain controllers and DNS.
+3. Database servers.
+4. Application and other servers.
+
+Plans are run in order of contracted recovery time objective during a disaster: 2-hour customers first, 48-hour customers last. The runbook in DR and replicas sets the order around them.
+
+### Testing
+
+| Test | How | How often |
+|---|---|---|
+| Backup restore | SureBackup in a virtual lab, booting VMs from backup and checking they respond | Monthly, for every customer's critical VMs |
+| Replica failover | SureReplica in a virtual lab at the secondary site, isolated from production | At least twice a year per customer, and after major changes |
+| Full failover plan | Run the customer's failover plan into the virtual lab, timed against their recovery time objective | Once a year per customer, or as the contract requires |
+| File and item restore | A sample restore from a customer backup | Quarterly |
+
+The virtual lab never connects to the stretched production VLANs, so a test copy cannot meet a live VM.
+
+### Monitoring
+
+→ Job results, replication lag and repository capacity reported to Datto. A failed or warning job raises a ticket.
+
+→ Every VM in a customer cloud checked daily for a current backup and a current replica. A VM with neither is the most serious finding, because it is unprotected.
+
+→ Job duration and CSV latency tracked against the Recovery point performance thresholds.
+
+### Operations
+
+| Task | Arc baseline |
+|---|---|
+| Veeam updates | Applied within a month of release after a lab test, at the same time on the backup server, proxies and repositories |
+| Capacity | Repository capacity and growth reviewed monthly alongside the cluster capacity review |
+| Licensing | Every protected VM licensed under Arc's Veeam service provider agreement |
+| Onboarding a customer | Create the customer's guest credentials, backup job, replication job and failover plan as part of the customer onboarding steps, then run a test restore and a SureReplica test |
+| Offboarding a customer | Stop the jobs, then remove backups and replicas in line with the contract's data retention, and record it |
 ## VM baseline
 
 ### Templates and profiles
@@ -517,7 +607,13 @@ Use this when the platform's SCVMM is first built, after any major fabric change
 
 → Database backup running to the secondary site and a restore tested.
 
-→ Every production VM replicated, with its replica powered off in the customer's DR cloud.
+→ Veeam backup server at the secondary site, outside the Arc and customer domains, with multi-factor authentication and four-eyes authorisation on.
+
+→ Hardened, immutable repositories at both sites and an offsite immutable copy, all encrypted.
+
+→ Every VM in a customer cloud has a current backup and a current replica, with its replica powered off in the customer's DR cloud.
+
+→ A SureBackup restore test passed for each customer's critical VMs.
 
 → A failover test completed into the isolated test network, within the recovery time objective.
 
@@ -545,6 +641,8 @@ Use this when the platform's SCVMM is first built, after any major fabric change
 | SCVMM IP pools for customer networks | SCVMM assigns customer VM addresses, or the customer's own DHCP and static addressing | The customer's own addressing |
 | Service account type | Domain account, or a group managed service account | Group managed service account where supported |
 | Array management from SCVMM | SMI-S provider for 3PAR or Primera, or not | Not used |
+| Veeam backup server membership | A workgroup, or a dedicated management domain | A dedicated management domain if Arc runs one, otherwise a workgroup |
+| Offsite immutable copy | Object storage with object lock, or a Veeam Cloud Connect provider | To be decided |
 | Shorter recovery points for individual customers | Hyper-V Replica or a dedicated replication job for that customer's VMs, rather than shortening the interval for the whole platform | Only if a contract needs better than 1 hour |
 | Secondary host network ports | Keep 2 x 10GbE per host, or match the primary's 4 x 10GbE for full failover | To be confirmed against peak load |
 | Where management VMs run | Primary site with replicas at the secondary site, or split across both sites | Primary site, replicated and backed up to the secondary site |

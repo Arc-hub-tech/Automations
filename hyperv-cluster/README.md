@@ -192,7 +192,7 @@ One per cluster:
 | Before the VMM handoff | Switch ports trunked with the host and VM VLANs, no LACP; MTU end to end if using jumbo frames. In SCVMM: a logical switch whose host vNICs match `HostNetworks`. |
 | During `Storage` | FC zoning of the WWPNs the script prints. On the 3PAR/Primera, a host object with those WWPNs (persona 15 / WindowsServer) in the cluster's host set. |
 | Before `Agents` | A SentinelOne group or policy for Hyper-V hosts with the cluster exclusions (VM config/VHDX paths, `C:\ClusterStorage`, `vmms.exe`, `vmwp.exe`, `vmcompute.exe`, `%SystemRoot%\Cluster`). |
-| VMM handoff | Add the host to its host group, apply the logical switch, add the host to the cluster; set VM placement paths and live migration settings in the host's VMM properties. |
+| VMM handoff | Add the host to its host group, apply the logical switch, add the host to the cluster; set the live migration settings in the host's VMM properties (SCVMM manages VM placement paths on a cluster from its CSVs). |
 | After `Report` | Add the host to backups, and check the Datto site and monitoring policy. |
 
 ## Running it

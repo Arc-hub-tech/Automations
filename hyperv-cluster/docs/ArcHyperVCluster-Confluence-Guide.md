@@ -20,7 +20,7 @@
 | Operating system | Windows Server 2025 Datacenter |
 | Storage | HPE 3PAR or Primera over Fibre Channel, Microsoft multipath (MPIO) |
 | Networking | Plain 10GbE, no RDMA. Production: 4 ports per host. DR: 2 ports per host |
-| Clusters | Production and DR are separate clusters, each with its own share and `cluster.json` |
+| Clusters | One cluster at the primary site (all running workloads) and one at the secondary site (cold replicas only), each with its own share and `cluster.json` |
 | Management | SCVMM owns host networking, cluster membership and all workloads; this script prepares and checks the hosts |
 | Run by | An engineer, interactively. This is not a Datto component |
 
@@ -41,6 +41,8 @@
 | VM networks, templates, placement and all workloads | SCVMM |
 
 The script still checks what SCVMM builds. The final report fails a node whose host adapters do not match the agreed design in `cluster.json`, so a logical switch that drifts from the design is caught.
+
+One SCVMM manages the whole Arc platform: one cluster per site, with each customer's workloads in their own SCVMM cloud. Every workload runs at the primary site; the secondary site holds powered-off replicas only, ready to start in a disaster. Both clusters are built and checked with this script in the same way. How SCVMM itself is built and configured (management servers, host groups, networking fabric, customer clouds, host settings, VM templates, access and operations) is in the separate SCVMM baseline guide.
 
 ## Before you start
 
@@ -106,6 +108,8 @@ Each cluster has its own deployment share. Everything a build needs sits in one 
 
 Each host uses a converged design: all of its Ethernet ports join one virtual switch, and both host traffic and VM traffic run over it, kept apart by VLANs and protected by bandwidth weights. Storage does not use Ethernet at all; it runs over Fibre Channel.
 
+SCVMM builds and owns this networking through a logical switch. The script does not create switches or adapters; it checks that what SCVMM built matches the agreed design in HostNetworks in `cluster.json`.
+
 ### The layout on a production host
 
 ```
@@ -115,13 +119,13 @@ Each host uses a converged design: all of its Ethernet ports join one virtual sw
           NIC 1       NIC 2                   NIC 3       NIC 4        4 x 10GbE, no LACP
              \___________\_______________________/___________/
                                      |
-                     SET vSwitch (Switch Embedded Teaming)
-                          HyperVPort load balancing
+          SET vSwitch, built by the SCVMM logical switch
+          (embedded team, Hyper-V Port load balancing, weight mode)
                                      |
      +---------------+---------------+---------------+-----------------------+
      |               |               |               |                       |
  vEthernet       vEthernet       vEthernet        VM network adapters     more VMs
- (Management)    (LiveMigration) (Cluster)        each on its own VLAN
+ (Management)    (LiveMigration) (Cluster)        on SCVMM VM networks
  VLAN a          VLAN b          VLAN c           VLAN x, y, z
  weight 10       weight 30       weight 10        share weight 50
  gateway + DNS   no gateway      no gateway
@@ -137,17 +141,19 @@ DR hosts are identical with 2 ports instead of 4. The weights shown are the exam
 
 → All of a host's ports join one SET team and one vSwitch. There are no separate switches per traffic type.
 
-→ SET is switch-independent: the physical switch ports are plain trunks, with no LACP and no port-channel.
+→ SET is switch-independent: the physical switch ports are plain trunks, with no LACP and no port-channel. In SCVMM this is the uplink port profile's teaming mode.
 
 ### Host traffic: several vEthernet adapters on one vSwitch
 
-A vSwitch can carry many host network adapters. Each one is a separate virtual NIC that Windows shows as `vEthernet (name)`, with its own IP address, VLAN, DNS settings and bandwidth weight. The host has three:
+A vSwitch can carry many host network adapters. Each one is a separate virtual NIC that Windows shows as `vEthernet (name)`, with its own IP address, VLAN, DNS settings and bandwidth weight. SCVMM creates three when it applies the logical switch:
 
 | Host adapter | Carries | IP settings | Cluster role |
 |---|---|---|---|
-| Management | RDP, domain, DNS, backups, Datto, SentinelOne, WinRM. The cluster name and IP live here | IP, default gateway, DNS, registers in DNS | Cluster and client |
+| Management | RDP, domain, DNS, backups, Datto, SentinelOne, WinRM, the SCVMM agent. The cluster name and IP live here | IP, default gateway, DNS, registers in DNS | Cluster and client |
 | LiveMigration | Live migration, compressed | IP only: no gateway, not registered in DNS | Cluster only |
 | Cluster | Heartbeats between nodes, and CSV traffic if a node has to reach storage through another node | IP only: no gateway, not registered in DNS | Cluster only |
+
+→ The adapter names must match the Role names in HostNetworks exactly. The script's checks, and the cluster network names ClusterBaseline sets, match on these names.
 
 → Only Management has a default gateway. A gateway on more than one adapter makes routing unpredictable.
 
@@ -157,13 +163,37 @@ A vSwitch can carry many host network adapters. Each one is a separate virtual N
 
 ### VM traffic
 
-Each VM's network adapter connects to the same vSwitch and is tagged with that VM's VLAN. VM VLANs are set per VM in Hyper-V or Failover Cluster Manager as they are today; the script does not set them. VMs cannot see the host's Management, LiveMigration or Cluster VLANs unless a VM is deliberately placed on one.
+VMs connect to the same vSwitch through SCVMM VM networks. Each VM network maps to a VLAN, so engineers pick a VM network by name when creating or moving a VM instead of typing a VLAN ID. VMs cannot see the host's Management, LiveMigration or Cluster VLANs unless a VM is deliberately placed on one of those VM networks.
+
+### How the design maps to SCVMM
+
+| Part of the design | SCVMM object | Settings |
+|---|---|---|
+| Each host network (Management, LiveMigration, Cluster) | A logical network with a network site per location, scoped to the cluster's host group | The VLAN and subnet from HostNetworks |
+| Host adapter IP addresses | A static IP pool on each host network site | Management pool includes the gateway and DNS servers. LiveMigration and Cluster pools have no gateway and no DNS |
+| VM VLANs | A logical network and network sites for VM traffic, with a VM network per VLAN | VLAN-based VM networks |
+| Teaming | Uplink port profile | Switch independent, Hyper-V Port load balancing, every host and VM network site included |
+| Bandwidth weights | A port classification and virtual port profile per host role, plus one for VM traffic | Minimum bandwidth weight from HostNetworks (example: 10, 30, 10) and 50 for VMs. VMQ enabled |
+| The vSwitch | Logical switch | Uplink mode Embedded Team (SET). Minimum bandwidth mode Weight, which is fixed when the logical switch is created |
+| The host adapters | Virtual network adapters defined when the logical switch is applied to a host | Names exactly as the HostNetworks roles, each on its VM network and VLAN, with its port classification and an IP from its pool. Management is marked for host management and inherits the physical adapter's settings |
+
+The physical NICs, VLANs, IP pools and port classifications need setting up once per cluster in SCVMM. After that, every node gets identical networking by applying the same logical switch.
+
+### Applying the logical switch to a host
+
+→ Select all the host's 10GbE ports as the logical switch uplinks. PreFlight lists them with their MAC addresses and slots.
+
+→ Add the three host adapters with the exact role names. Mark Management as the host management adapter so it takes over the host's existing management IP; the connection may drop briefly while it moves.
+
+→ Once it completes, the script's final report checks the result: the switch is SET in weight mode, every role's adapter exists with the right VLAN and an IP on the same subnet as the other nodes, and there are no unexpected extra adapters.
+
+→ On an existing node, bringing its current switch under the logical switch, or rebuilding it, changes live networking. Drain the node first and do one node at a time.
 
 ### How bandwidth is shared
 
 Bandwidth weights are minimum guarantees, not limits. When the links are quiet, any traffic can use everything available to it. When a link is busy, each type is guaranteed at least its share: VMs 50%, live migration 30%, Management 10% and Cluster 10% in the example. A large live migration therefore cannot starve VM traffic or the cluster heartbeat; a starved heartbeat is what causes false failovers.
 
-Weights only work when the vSwitch is created in weight mode, and that mode can only be chosen when the switch is built. The script builds new hosts this way. On an existing host built differently, the script reports the difference but does not change it; changing the mode means a planned rebuild of that host's switch.
+Weights only work when the vSwitch is built in weight mode, and in SCVMM that is chosen when the logical switch is created. Create the logical switch in weight mode from the start; changing it later means a new logical switch and a planned rebuild of every host's switch. The script's checks warn about any host whose switch is not in weight mode.
 
 ### How traffic spreads across the ports
 
@@ -175,11 +205,9 @@ Weights only work when the vSwitch is created in weight mode, and that mode can 
 
 ### Live migration
 
-→ Uses the LiveMigration network first, then Cluster. Management is excluded, so migrations never compete with RDP, backups or the cluster name.
+→ Uses the LiveMigration network first, then Cluster. Management is excluded, so migrations never compete with RDP, backups or the cluster name. ClusterBaseline sets this order on the cluster.
 
-→ Uses compression rather than SMB Direct, because the design has no RDMA. It spends some CPU to send less data, which suits 10GbE.
-
-→ Runs at most two migrations at a time per host, so draining a node does not swamp the network.
+→ Uses compression rather than SMB Direct, because the design has no RDMA. It spends some CPU to send less data, which suits 10GbE. This and the number of simultaneous migrations (two per host) are set in each host's SCVMM migration settings.
 
 ### Storage traffic
 
@@ -189,21 +217,21 @@ VM disks reach the 3PAR or Primera over Fibre Channel, completely separate from 
 
 | Item | Requirement |
 |---|---|
-| Port mode | Trunk on every host port, carrying the Management, LiveMigration and Cluster VLANs plus every VM VLAN |
+| Port mode | Trunk on every host port, carrying the Management, LiveMigration and Cluster VLANs plus every VM VLAN that SCVMM's VM networks use |
 | Teaming | No LACP and no port-channel; SET does the teaming on the host. Configure the ports as edge (portfast) ports |
 | Resilience | Split each host's ports across two physical switches, for example NIC 1 and 2 to switch A and NIC 3 and 4 to switch B |
-| Consistency | The same VLANs on every host's ports, and the LiveMigration and Cluster subnets identical on every node. A mismatched subnet makes the cluster create an extra network when a node joins; the pre-flight check catches this |
-| MTU | Standard 1500 unless jumbo frames are agreed. Jumbo frames must be set end to end on every switch in the path; the script then tests them with a do-not-fragment ping |
+| Consistency | The same VLANs on every host's ports, and the LiveMigration and Cluster subnets identical on every node. A mismatched subnet makes the cluster create an extra network; the script's final report catches it |
+| MTU | Standard 1500 unless jumbo frames are agreed. Jumbo frames must be set end to end on every switch in the path, and on the host adapters through SCVMM |
+| New VLANs | Agree them with the SCVMM team, so the trunk and the SCVMM network site are updated together |
 
 ### Who builds the networking
 
 | Situation | What happens |
 |---|---|
 | New node | Before SCVMM the host needs only its management IP on one physical adapter. SCVMM applies the logical switch, which builds the SET vSwitch and the host adapters; its management adapter takes over the management IP. The script's final report then checks the result against HostNetworks |
-| Existing node | The script never changes the vSwitch, host adapters or IP addresses. Capture records them, and differences are reported for fixing in SCVMM |
+| Existing node | The script never changes the vSwitch, host adapters or IP addresses. Capture records them, and differences are fixed in SCVMM |
 | Whole cluster | ClusterBaseline names the cluster networks after their roles, sets which networks carry client traffic, and sets the live migration order |
-| Adding a host network | Add it to the SCVMM logical switch and to HostNetworks in `cluster.json`, so the checks expect it |
-
+| Adding a host network | Add it to SCVMM (logical network, IP pool, port classification, logical switch) and to HostNetworks in `cluster.json`, so the checks expect it |
 ## Getting the script
 
 On the host, open an elevated PowerShell prompt and paste this as a single line. Replace the share path with the deployment's share. Use `-Phase Capture` on an existing node or `-Phase Next` on a new one.
@@ -413,7 +441,7 @@ When the script reports the host as VMM-ready, in SCVMM:
 
 → Apply the logical switch. SCVMM builds the SET vSwitch and the Management, LiveMigration and Cluster host adapters, assigns their IP addresses, and moves the management IP from the physical adapter to the management host adapter. The connection may drop briefly.
 
-→ Set the host's VM placement paths (on a cluster shared volume) and live migration settings (compression, two simultaneous migrations).
+→ Set the host's live migration settings (compression, two simultaneous migrations). Do not set VM placement paths by hand on a clustered host; SCVMM manages them from the cluster shared volumes.
 
 → Add the host to the cluster. SCVMM runs cluster validation as part of this.
 

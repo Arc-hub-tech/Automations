@@ -36,11 +36,6 @@
   },
 
   "HyperV": {
-    "VirtualMachinePath": null,
-    "VirtualHardDiskPath": null,
-    "MaxVMMigrations": 2,
-    "MaxStorageMigrations": 2,
-    "MigrationPerformance": "Compression",
     "NumaSpanningEnabled": null
   },
 

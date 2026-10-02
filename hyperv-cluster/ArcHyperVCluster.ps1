@@ -3,7 +3,7 @@
  BEFORE YOU RUN THIS SCRIPT
 ================================================================
  1. Log on with an account that is a local admin on every cluster node and
-    has rights to change the cluster / add nodes.
+    has rights to change the cluster.
  2. Open an elevated PowerShell prompt and DOWNLOAD-THEN-RUN (single line):
 
        $p="$env:SystemDrive\ArcLogs\HyperVClusterOnboard\ArcHyperVCluster.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-cluster/ArcHyperVCluster.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Capture -SettingsShare \\<SERVER>\<SHARE>\<DEPLOYMENT>
@@ -23,26 +23,30 @@
        -> reboot if it says so, then Resume
        ClusterBaseline  (once, from any node)
 
- NEW NODE - join it to the standard:
+ NEW NODE - get it VMM-ready, hand over to SCVMM, then verify:
 
-       PreFlight -> Hpe -> PreFlight -> Base -> Network -> Storage -> Agents
-       -> Baseline -> Join -> HyperV -> Report
+       PreFlight -> Hpe -> PreFlight -> Base -> Storage -> Agents -> Baseline
+       -> [SCVMM: add host, apply logical switch, add to cluster]
+       -> Baseline (post-VMM) -> Report
+
+ SCVMM owns the host networking (logical switch: SET + host vNICs), cluster
+ join, VM placement paths, live migration host settings and all workloads.
+ This script owns HPE firmware/BIOS, roles, FC/MPIO, agents, the security and
+ optimisation baseline, NUMA spanning, cluster network roles/LM order, and the
+ drift checks that prove VMM built what HostNetworks says.
 
  EASIEST: just run -Phase Next (attended automation). It works out where this
- host is, runs phases back to back, STOPS at the human gates (add MACs/IPs,
- iLO console for Network, FC zoning, Sentinel connected, JOIN), ASKS before
- every reboot, and carries on by itself when you next log on. On an existing
- node it does Baseline, then Resume after the reboot.
-
-    The Network phase MUST be run from the iLO remote console (not RDP) -
-    building the SET vSwitch moves the management IP off the physical NIC and
-    drops any remote session.
+ host is, runs phases back to back, STOPS at the human gates (FC zoning,
+ Sentinel connected, the VMM handoff), ASKS before every reboot, and carries on
+ by itself when you next log on. On an existing node it does Baseline, then
+ Resume after the reboot.
 ================================================================
 
 .SYNOPSIS
     Defines, applies and checks a best-practice standard for HPE ProLiant Gen10 /
     Windows Server 2025 Datacenter Hyper-V failover clusters on 3PAR/Primera FC
-    storage and plain (non-RDMA) Ethernet, and onboards new nodes to it.
+    storage and plain (non-RDMA) Ethernet, managed by SCVMM, and prepares new
+    nodes to the point where SCVMM can onboard them.
 
 .DESCRIPTION
     The CONFIG FILE is the standard. Capture writes it from a live node; you edit
@@ -53,28 +57,26 @@
     Phases (every phase is safe to re-run):
       Next             Attended automation - runs the right next phase(s) for this host,
                        stops at human gates, confirms reboots, resumes at next logon.
-      Capture         Reads this node + the cluster (every node's NICs/IPs, vNIC roles,
-                       MPIO, Hyper-V, BIOS profile) and writes <SettingsShare>\cluster.json.
+      Capture          Reads this node + the cluster (every node's NICs/IPs, vNIC roles,
+                       MPIO, NUMA, BIOS profile) and writes <SettingsShare>\cluster.json.
       Baseline         Security defaults + Hyper-V host optimisations + BIOS profile + MPIO
-                       + Hyper-V host settings from the config. Shows the change plan and
-                       asks first. On a cluster member it health-checks the cluster and
-                       DRAINS the node before changing anything, then stops - reboot if it
-                       says so and run Resume. Never touches the vSwitch, vNICs or IPs.
+                       + NUMA spanning from the config. Shows the change plan and asks
+                       first. On a cluster member it health-checks the cluster and DRAINS
+                       the node before changing anything, then stops - reboot if it says
+                       so and run Resume. Never touches the vSwitch, vNICs or IPs.
       Resume           After a Baseline reboot: checks the node, resumes it into the cluster.
       ClusterBaseline  Cluster-wide: names/roles of cluster networks by subnet, live
                        migration network order, DrainOnShutdown; optional CSV cache and
                        cluster security level. Reports quorum witness and CAU.
       PreFlight        Read-only. Checks this host and diffs it against the peer. Lists NICs
-                       and FC WWPNs.
+                       (for the VMM uplinks) and FC WWPNs.
       Hpe              SPP via SUM unattended from an ISO on the share; CHIF/AMS check;
                        ilorest from its MSI; boot volume report.
       Base             BIOS workload profile, then Hyper-V/Failover Clustering/MPIO.
-      Network          SET vSwitch + host vNICs (new node only). Console only.
       Storage          WWPNs, MPIO claim/policy/timers, LUN visibility vs the peer.
       Agents           Datto RMM, SentinelOne, then Defender removal.
-      Join             Test-Cluster (no storage tests), engineer JOIN gate, Add-ClusterNode.
-      HyperV           Hyper-V host settings once the CSV paths exist (after Join).
-      Report           Final peer diff + checks, exported to CSV.
+      Report           Final peer diff + checks, including that the VMM-built host
+                       networking matches HostNetworks. Exported to CSV.
 
 .NOTES
     Version is independent of the gold-image scripts. Full run logged to
@@ -88,7 +90,7 @@
 param(
     [Parameter(Mandatory)]
     [ValidateSet('Next', 'Capture', 'Baseline', 'Resume', 'ClusterBaseline',
-                 'PreFlight', 'Hpe', 'Base', 'Network', 'Storage', 'Agents', 'Join', 'HyperV', 'Report')]
+                 'PreFlight', 'Hpe', 'Base', 'Storage', 'Agents', 'Report')]
     [string]$Phase,
 
     # The deployment's share/folder holding cluster.json next to the SPP ISO and MSIs.
@@ -103,16 +105,12 @@ param(
 
     # Credential for WinRM to the peer/other nodes if the logged-on account isn't enough.
     # (The cluster cmdlets always run as the logged-on account.)
-    [pscredential]$PeerCredential,
-
-    # Network phase only: run even though this is not a console session. Only use
-    # this if you have out-of-band access that survives losing the management IP.
-    [switch]$AllowRemoteSession
+    [pscredential]$PeerCredential
 )
 
 # Version of this script, surfaced in the banner/transcript. Independent of the
 # gold-image version; '-dev' suffix while work accumulates under [Unreleased].
-$ScriptVersion = '0.3.0-dev'
+$ScriptVersion = '0.4.0-dev'
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
@@ -313,10 +311,9 @@ function Import-ArcConfig {
         if ($obj -and $obj.PSObject.Properties[$prop]) { $obj.$prop = Resolve-ArcRelativePath $obj.$prop $base }
     }
 
+    # Nodes entries are optional: VMM builds the host networking (logical switch, IP
+    # pools), so a new node needs no MACs/IPs in the file. Capture records existing ones.
     $script:NodeConfig = if ($Config.Nodes -and $Config.Nodes.PSObject.Properties[$env:COMPUTERNAME]) { $Config.Nodes.PSObject.Properties[$env:COMPUTERNAME].Value } else { $null }
-    if (-not $NodeConfig -and $Phase -in 'Network', 'Storage', 'Agents', 'Join', 'HyperV') {
-        throw "No entry for '$env:COMPUTERNAME' under Nodes in $src - add this host (MACs from -Phase PreFlight, IPs) to the file."
-    }
     if (-not $Config.ClusterName -or $Config.ClusterName -like '<*>') { throw "Config value 'ClusterName' is missing or still a placeholder." }
 
     # PeerNode: required for the new-node diff phases, optional elsewhere (no peer =
@@ -325,7 +322,7 @@ function Import-ArcConfig {
     if ($peerSet) {
         $script:PeerParams = @{ ComputerName = $Config.PeerNode }
         if ($PeerCredential) { $PeerParams.Credential = $PeerCredential }
-    } elseif ($Phase -in 'PreFlight', 'Network', 'Storage', 'HyperV', 'Report') {
+    } elseif ($Phase -in 'PreFlight', 'Storage', 'Report') {
         throw "Config value 'PeerNode' must name another existing cluster node for -Phase $Phase."
     }
 }
@@ -666,6 +663,42 @@ function Get-Peer {
     return $null
 }
 
+# Checks the host networking that the VMM logical switch built against the
+# agreed design in HostNetworks (and the peer). Before VMM has run (no host vNICs
+# yet) it reports INFO; with -Required (after VMM) a missing or wrong item is a FAIL.
+function Test-ArcHostNetworks {
+    param([Parameter(Mandatory)]$Fp, $Peer, [switch]$Required)
+    $c = $Fp.Compare
+    $vnicRoles = @($c.Keys | Where-Object { $_ -like 'VNic.*.Vlan' } | ForEach-Object { $_.Substring(5, $_.Length - 10) })
+    if (-not $vnicRoles -and -not $Required) {
+        Add-Result INFO 'Host networking' 'No host vNICs yet - the VMM logical switch creates them'
+        return
+    }
+    $sw = @($c.Keys | Where-Object { $_ -like 'Switch.*.EmbeddedTeaming' })
+    if (-not $sw) { Add-Result $(if ($Required) { 'FAIL' } else { 'INFO' }) 'vSwitch' 'No external vSwitch on this host' }
+    foreach ($k in $sw) {
+        $name = $k.Substring(7, $k.Length - 23)
+        if ($c[$k] -eq 'True') { Add-Result PASS "vSwitch $name" 'SET (embedded teaming)' } else { Add-Result FAIL "vSwitch $name" 'Not a SET switch - check the VMM uplink port profile' }
+        if ($c["Switch.$name.BandwidthMode"] -ne 'Weight') { Add-Result WARN "vSwitch $name bandwidth mode" "$($c["Switch.$name.BandwidthMode"]) - the logical switch should use weight mode" }
+    }
+    $sev = if ($Required) { 'FAIL' } else { 'WARN' }
+    foreach ($net in $Config.HostNetworks) {
+        $role = $net.Role
+        if ($role -notin $vnicRoles) { Add-Result $sev "Host vNIC $role" "Missing - the VMM logical switch must create a host adapter named '$role'"; continue }
+        $vl = $c["VNic.$role.Vlan"]
+        $wantVl = if ([int]$net.VlanId -gt 0) { "$($net.VlanId)" } else { 'Untagged' }
+        if ($vl -ne $wantVl) { Add-Result $sev "VLAN for $role" "$vl, expected $wantVl" } else { Add-Result PASS "VLAN for $role" $vl }
+        $mine = $c["VNic.$role.Subnet"]
+        $peerS = if ($Peer) { $Peer.Compare["VNic.$role.Subnet"] } else { $null }
+        if (-not $mine) { Add-Result $sev "Subnet for $role" 'No IPv4 address - check the VMM IP pool / static IP for this adapter' }
+        elseif ($peerS -and $peerS -ne $mine) { Add-Result FAIL "Subnet for $role" "$mine vs peer $peerS - would create a new cluster network" }
+        else { Add-Result PASS "Subnet for $role" $mine }
+    }
+    foreach ($r in $vnicRoles | Where-Object { $_ -notin @($Config.HostNetworks.Role) }) {
+        Add-Result WARN "Host vNIC $r" 'Not in HostNetworks - a test or extra adapter? Remove it, or add the role to cluster.json'
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Phase: PreFlight (read-only)
 # ---------------------------------------------------------------------------
@@ -715,20 +748,17 @@ function Invoke-PreFlight {
     if ($local.Compare['Service.HPE-AMS'] -eq 'Present') { Add-Result PASS 'HPE Agentless Management Service' }
     else { Add-Result $missSev 'HPE Agentless Management Service' "Not installed - $missNote" }
 
-    Write-Step 'Physical NICs (fill Nodes.<hostname>.AdapterMacs from this)'
+    Write-Step 'Physical NICs (for the VMM logical switch uplinks)'
     $local.Detail.Adapters | Format-Table Name, MacAddress, LinkSpeed, Status, PciLocation, Description -AutoSize | Out-String -Width 220 | Write-Host
-
-    if ($NodeConfig) {
-        $want = @($NodeConfig.AdapterMacs | ForEach-Object { ConvertTo-MacKey $_ })
-        foreach ($m in $want) {
+    $fast = @($local.Detail.Adapters | Where-Object { $_.LinkSpeed -match '^\d{2,} Gbps$' })
+    $fastUp = @($fast | Where-Object { $_.Status -eq 'Up' })
+    if ($fastUp.Count -ge 2) { Add-Result PASS '10GbE ports up' "$($fastUp.Count) port(s): $($fastUp.Name -join ', ')" }
+    else { Add-Result WARN '10GbE ports up' "$($fastUp.Count) port(s) at 10 Gbps or more are up - expected 4 (production) or 2 (DR). Check cabling and switch ports before VMM applies the logical switch" }
+    if ($NodeConfig -and $NodeConfig.AdapterMacs) {
+        foreach ($m in @($NodeConfig.AdapterMacs | ForEach-Object { ConvertTo-MacKey $_ })) {
             $a = $local.Detail.Adapters | Where-Object { (ConvertTo-MacKey $_.MacAddress) -eq $m }
-            if (-not $a) { Add-Result FAIL "Adapter $m" 'Not found on this host' ; continue }
-            if ($a.Status -ne 'Up') { Add-Result FAIL "Adapter $m ($($a.Name))" "Link is $($a.Status)" }
-            elseif ($a.LinkSpeed -notmatch '^10 Gbps$|^\d{2,} Gbps$') { Add-Result WARN "Adapter $m ($($a.Name))" "Link speed $($a.LinkSpeed) - expected 10 Gbps" }
-            else { Add-Result PASS "Adapter $m ($($a.Name))" $a.LinkSpeed }
+            if (-not $a) { Add-Result WARN "Adapter $m" 'Listed in Nodes but not found on this host' }
         }
-    } else {
-        Add-Result WARN 'Node config' "No Nodes entry for $env:COMPUTERNAME yet - add one using the NIC list above"
     }
 
     Write-Step 'FC initiator ports (WWPNs for zoning)'
@@ -760,22 +790,8 @@ function Invoke-PreFlight {
     $missingKb = @($peer.Compare.Keys | Where-Object { $_ -like 'Hotfix.*' -and -not $local.Compare.ContainsKey($_) } | ForEach-Object { $_.Substring(7) })
     if ($missingKb.Count) { Add-Result WARN 'Hotfixes on peer but not here' ($missingKb -join ', ') } else { Add-Result PASS 'No hotfixes missing vs peer' }
 
-    # Host network subnets must match the peer's per role, or the join creates new cluster networks
-    if ($NodeConfig) {
-        foreach ($net in $Config.HostNetworks) {
-            $ip = $NodeConfig.IPs.PSObject.Properties[$net.Role].Value
-            if (-not $ip) { Add-Result FAIL "IP for $($net.Role)" "No Nodes.$env:COMPUTERNAME.IPs.$($net.Role) in config"; continue }
-            $mine  = Get-SubnetKey $ip ([int]$net.PrefixLength)
-            $peerS = $peer.Compare["VNic.$($net.Role).Subnet"]
-            if (-not $peerS) { Add-Result WARN "Subnet for $($net.Role)" "Peer has no host vNIC named '$($net.Role)' - check the role names match the peer's vNIC names" }
-            elseif ($peerS -eq $mine) { Add-Result PASS "Subnet for $($net.Role)" $mine }
-            else { Add-Result FAIL "Subnet for $($net.Role)" "$mine vs peer $peerS - would create a new cluster network" }
-            $peerVlan = $peer.Compare["VNic.$($net.Role).Vlan"]
-            if ($peerVlan -and $peerVlan -ne "$($net.VlanId)" -and -not ($peerVlan -eq 'Untagged' -and [int]$net.VlanId -eq 0)) {
-                Add-Result WARN "VLAN for $($net.Role)" "Config $($net.VlanId) vs peer $peerVlan"
-            }
-        }
-    }
+    # Host networking is built later by the VMM logical switch - informational here.
+    Test-ArcHostNetworks -Fp $local -Peer $peer
 
     $diff = Compare-Fingerprint -Peer $peer -Local $local
     if ($local.Compare['HPE.ilorest'] -eq 'Not installed' -and -not $hpeDone) {
@@ -996,113 +1012,8 @@ function Invoke-Base {
         return
     }
     Save-PhaseComplete 'Base' $reboot
-    if ($reboot) { Write-Host "`nREBOOT REQUIRED. After the reboot, run -Phase Network from the iLO remote console." -ForegroundColor Yellow }
-    else { Write-Host "`nNext: -Phase Network (from the iLO remote console)." -ForegroundColor Green }
-}
-
-# ---------------------------------------------------------------------------
-# Phase: Network (console only)
-# ---------------------------------------------------------------------------
-
-function Invoke-Network {
-    Assert-PriorPhase 'Base'
-    if (-not (Test-ArcConsoleSession) -and -not $AllowRemoteSession) {
-        throw "This is not the console session. Building the SET vSwitch drops remote sessions - run this from the iLO remote console, or pass -AllowRemoteSession if you have other out-of-band access."
-    }
-    if (-not (Get-Command New-VMSwitch -ErrorAction SilentlyContinue)) { throw 'Hyper-V module not available - run -Phase Base and reboot first.' }
-
-    $sw = $Config.Switch
-    $macs = @($NodeConfig.AdapterMacs | ForEach-Object { ConvertTo-MacKey $_ })
-    $adapters = @(Get-NetAdapter -Physical | Where-Object { (ConvertTo-MacKey $_.MacAddress) -in $macs })
-    if ($adapters.Count -ne $macs.Count) {
-        throw "Found $($adapters.Count) of $($macs.Count) configured adapters by MAC. Run -Phase PreFlight to list this host's NICs."
-    }
-    Write-Step "SET vSwitch '$($sw.Name)'"
-    Write-Host "  Members: $(($adapters | ForEach-Object { "$($_.Name) [$($_.MacAddress)]" }) -join ', ')"
-
-    $existing = Get-VMSwitch -Name $sw.Name -ErrorAction SilentlyContinue
-    if ($existing) {
-        # Bandwidth mode can only be chosen at creation - never try to fix it in place.
-        if (-not $existing.EmbeddedTeamingEnabled) { throw "Switch '$($sw.Name)' exists but is not a SET switch. Remove it by hand and re-run." }
-        if ("$($existing.BandwidthReservationMode)" -ne 'Weight') { throw "Switch '$($sw.Name)' exists with bandwidth mode '$($existing.BandwidthReservationMode)', not Weight. That can only be set at creation - remove it by hand and re-run." }
-        $members = @((Get-VMSwitchTeam -Name $sw.Name).NetAdapterInterfaceDescription)
-        $wanted  = @($adapters.InterfaceDescription)
-        if (Compare-Object ($members | Sort-Object) ($wanted | Sort-Object)) { throw "Switch '$($sw.Name)' exists with different team members ($($members -join ', ')). Fix by hand." }
-        Write-Host '  Switch already exists with the right members and mode.' -ForegroundColor Green
-    } else {
-        if (-not (Confirm-Action "Create SET switch '$($sw.Name)' on $($adapters.Count) NICs? Any IP on those NICs will be removed")) { throw 'Stopped by engineer.' }
-        New-VMSwitch -Name $sw.Name -NetAdapterName $adapters.Name -EnableEmbeddedTeaming $true -AllowManagementOS $false -MinimumBandwidthMode Weight | Out-Null
-        Write-Host '  Switch created.' -ForegroundColor Green
-    }
-    $lb = if ($sw.LoadBalancingAlgorithm) { $sw.LoadBalancingAlgorithm } else { 'HyperVPort' }
-    Set-VMSwitchTeam -Name $sw.Name -LoadBalancingAlgorithm $lb
-    if ($null -ne $sw.DefaultFlowWeight) { Set-VMSwitch -Name $sw.Name -DefaultFlowMinimumBandwidthWeight ([int]$sw.DefaultFlowWeight) }
-
-    Write-Step 'Physical NIC tuning'
-    foreach ($a in $adapters) {
-        try { Disable-NetAdapterPowerManagement -Name $a.Name -NoRestart -ErrorAction Stop; Write-Host "  Power management off: $($a.Name)" }
-        catch { Write-Warning "Power management on $($a.Name): $($_.Exception.Message)" }
-        if ($sw.JumboPacket) {
-            try { Set-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword '*JumboPacket' -RegistryValue ([string]$sw.JumboPacket) -NoRestart -ErrorAction Stop; Write-Host "  Jumbo $($sw.JumboPacket): $($a.Name)" }
-            catch { Write-Warning "Jumbo frames on $($a.Name): $($_.Exception.Message)" }
-        }
-    }
-
-    Write-Step 'Host vNICs'
-    foreach ($net in $Config.HostNetworks) {
-        $role = $net.Role
-        $alias = "vEthernet ($role)"
-        $ip = $NodeConfig.IPs.PSObject.Properties[$role].Value
-        if (-not $ip) { throw "No Nodes.$env:COMPUTERNAME.IPs.$role in config." }
-
-        if (-not (Get-VMNetworkAdapter -ManagementOS -Name $role -ErrorAction SilentlyContinue)) {
-            Add-VMNetworkAdapter -ManagementOS -SwitchName $sw.Name -Name $role
-            Write-Host "  Added vNIC $role"
-        }
-        if ([int]$net.VlanId -gt 0) { Set-VMNetworkAdapterVlan -ManagementOS -VMNetworkAdapterName $role -Access -VlanId ([int]$net.VlanId) }
-        else { Set-VMNetworkAdapterVlan -ManagementOS -VMNetworkAdapterName $role -Untagged }
-        if ($null -ne $net.Weight) { Set-VMNetworkAdapter -ManagementOS -Name $role -MinimumBandwidthWeight ([int]$net.Weight) }
-
-        # The vNIC's NIC object can take a few seconds to appear after creation
-        $deadline = (Get-Date).AddSeconds(30)
-        while (-not (Get-NetAdapter -Name $alias -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
-
-        Set-NetIPInterface -InterfaceAlias $alias -AddressFamily IPv4 -Dhcp Disabled
-        $current = Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -ne 'WellKnown' }
-        $ok = $current | Where-Object { $_.IPAddress -eq $ip -and $_.PrefixLength -eq [int]$net.PrefixLength }
-        if (-not $ok) {
-            $current | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-            Get-NetRoute -InterfaceAlias $alias -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-            $ipArgs = @{ InterfaceAlias = $alias; IPAddress = $ip; PrefixLength = [int]$net.PrefixLength }
-            if ($net.Gateway) { $ipArgs.DefaultGateway = $net.Gateway }
-            New-NetIPAddress @ipArgs | Out-Null
-        }
-        if ($net.DnsServers) { Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses @($net.DnsServers) }
-        else { Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses }
-        Set-DnsClient -InterfaceAlias $alias -RegisterThisConnectionsAddress ([bool]$net.RegisterInDns)
-        if ($sw.JumboPacket -and $net.Jumbo) {
-            try { Set-NetAdapterAdvancedProperty -Name $alias -RegistryKeyword '*JumboPacket' -RegistryValue ([string]$sw.JumboPacket) -ErrorAction Stop } catch { Write-Warning "Jumbo on ${alias}: $($_.Exception.Message)" }
-        }
-        Write-Host "  $role : $ip/$($net.PrefixLength) VLAN $($net.VlanId) weight $($net.Weight) DNS-register $([bool]$net.RegisterInDns)" -ForegroundColor Green
-    }
-
-    Write-Step 'Connectivity to the peer on each network'
-    Start-Sleep -Seconds 5
-    try {
-        $peer = Get-PeerFingerprint
-        foreach ($v in $peer.Detail.HostVNics) {
-            $ok = Test-Connection -ComputerName $v.IPAddress -Count 2 -Quiet
-            Write-Host ("  {0,-15} {1,-16} {2}" -f $v.Name, $v.IPAddress, $(if ($ok) { 'OK' } else { 'NO REPLY' })) -ForegroundColor $(if ($ok) { 'Green' } else { 'Red' })
-            if ($ok -and $sw.JumboPacket -and ($Config.HostNetworks | Where-Object { $_.Role -eq $v.Name -and $_.Jumbo })) {
-                $size = [int]$sw.JumboPacket - 42
-                $j = ping.exe -n 2 -f -l $size $v.IPAddress | Out-String
-                Write-Host "    jumbo ($size bytes, DF): $(if ($j -match 'TTL=') { 'OK' } else { 'FAILED - check switch MTU' })"
-            }
-        }
-    } catch { Write-Warning "Could not test against the peer: $($_.Exception.Message)" }
-
-    Save-PhaseComplete 'Network'
-    Write-Host "`nNext: -Phase Storage." -ForegroundColor Green
+    if ($reboot) { Write-Host "`nREBOOT REQUIRED. After the reboot, run -Phase Storage." -ForegroundColor Yellow }
+    else { Write-Host "`nNext: -Phase Storage." -ForegroundColor Green }
 }
 
 # ---------------------------------------------------------------------------
@@ -1184,7 +1095,7 @@ function Invoke-Storage {
 
     Save-PhaseComplete 'Storage' $reboot
     if ($reboot) { Write-Host "`nREBOOT REQUIRED for the MPIO changes. Then re-run -Phase Storage to confirm LUNs and paths, then -Phase Agents." -ForegroundColor Yellow }
-    elseif ($missing) { Write-Host "`nResolve the missing LUNs before -Phase Join." -ForegroundColor Yellow }
+    elseif ($missing) { Write-Host "`nResolve the missing LUNs before onboarding the host in VMM." -ForegroundColor Yellow }
     else { Write-Host "`nNext: -Phase Agents." -ForegroundColor Green }
 }
 
@@ -1273,10 +1184,11 @@ function Show-SentinelStatus {
     $svc = Get-Service SentinelAgent -ErrorAction SilentlyContinue
     Write-Host "  SentinelAgent service: $(if ($svc) { $svc.Status } else { 'not present' })"
     $ctl = Get-ChildItem "$env:ProgramFiles\SentinelOne\Sentinel Agent*\SentinelCtl.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
-    $ErrorActionPreference = 'Continue'
-    if ($ctl) { & $ctl.FullName status 2>&1 | ForEach-Object { "$_" } | Out-String | Write-Host }
-    $ErrorActionPreference = 'Stop'
-    else { Write-Warning 'SentinelCtl.exe not found.' }
+    if ($ctl) {
+        $ErrorActionPreference = 'Continue'   # SentinelCtl writes to stderr; must not throw
+        & $ctl.FullName status 2>&1 | ForEach-Object { "$_" } | Out-String | Write-Host
+        $ErrorActionPreference = 'Stop'
+    } else { Write-Warning 'SentinelCtl.exe not found.' }
     return ($svc -and $svc.Status -eq 'Running')
 }
 
@@ -1325,98 +1237,7 @@ function Invoke-Agents {
     }
 
     Save-PhaseComplete 'Agents' $reboot
-    if ($reboot) { Write-Host "`nREBOOT REQUIRED. Then -Phase Baseline (security + optimisation), then -Phase Join." -ForegroundColor Yellow } else { Write-Host "`nNext: -Phase Baseline, then -Phase Join." -ForegroundColor Green }
-}
-
-# ---------------------------------------------------------------------------
-# Phase: Join
-# ---------------------------------------------------------------------------
-
-function Invoke-Join {
-    Assert-PriorPhase 'Network', 'Storage', 'Agents', 'Baseline'
-    Import-Module FailoverClusters
-    $cluster = $Config.ClusterName
-
-    $nodes = @(Get-ClusterNode -Cluster $cluster)
-    if ($nodes.Name -contains $env:COMPUTERNAME) { Write-Host "  $env:COMPUTERNAME is already a member of $cluster." -ForegroundColor Green }
-    else {
-        $down = @($nodes | Where-Object State -ne 'Up')
-        if ($down) { Write-Warning "Cluster nodes not Up: $($down.Name -join ', ')" }
-        $netsBefore = @(Get-ClusterNetwork -Cluster $cluster)
-
-        Write-Step "Test-Cluster ($($nodes.Name -join ', ') + $env:COMPUTERNAME)"
-        # Storage tests are excluded: on a live cluster they take the disks under test offline.
-        $report = Join-Path $LogRoot "Test-Cluster-$Stamp"
-        $tw = $null
-        $result = Test-Cluster -Node (@($nodes.Name) + $env:COMPUTERNAME) -Ignore 'Storage' -ReportName $report -WarningVariable tw -WarningAction SilentlyContinue
-        Write-Host "  Report: $($result.FullName)"
-        if ($tw) { Write-Host "  Validation warnings:" -ForegroundColor Yellow; $tw | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow } }
-        else { Write-Host '  No validation warnings.' -ForegroundColor Green }
-        try { Start-Process $result.FullName } catch { }
-        Write-Host "`n  Review the report. Any FAILED test must be fixed before joining." -ForegroundColor Yellow
-        $answer = Read-Host "  Type JOIN to add $env:COMPUTERNAME to $cluster (anything else stops)"
-        if ($answer -cne 'JOIN') { throw 'Stopped by engineer before Add-ClusterNode.' }
-
-        Write-Step 'Add-ClusterNode'
-        Add-ClusterNode -Cluster $cluster -Name $env:COMPUTERNAME -NoStorage | Out-Null
-        Write-Host "  Added $env:COMPUTERNAME to $cluster." -ForegroundColor Green
-
-        $netsAfter = @(Get-ClusterNetwork -Cluster $cluster)
-        if ($netsAfter.Count -gt $netsBefore.Count) {
-            Write-Warning "New cluster network(s) appeared: $(($netsAfter | Where-Object { $_.Name -notin $netsBefore.Name }).Name -join ', ') - a vNIC subnet does not match the existing networks."
-        }
-    }
-
-    Write-Step 'Post-join checks'
-    Get-ClusterNode -Cluster $cluster | Format-Table Name, State, DynamicWeight -AutoSize | Out-String | Write-Host
-    Get-ClusterNetwork -Cluster $cluster | Format-Table Name, Role, State, Address, AddressMask -AutoSize | Out-String | Write-Host
-    Get-ClusterNetworkInterface -Cluster $cluster -Node $env:COMPUTERNAME | Format-Table Name, Network, State -AutoSize | Out-String | Write-Host
-    try { Get-ClusterSharedVolumeState -Cluster $cluster -Node $env:COMPUTERNAME | Format-Table Name, StateInfo, FileSystemRedirectedIOReason, BlockRedirectedIOReason -AutoSize | Out-String | Write-Host }
-    catch { Write-Warning "CSV state: $($_.Exception.Message)" }
-
-    Save-PhaseComplete 'Join'
-    Write-Host "`nNext: -Phase HyperV." -ForegroundColor Green
-}
-
-# ---------------------------------------------------------------------------
-# Phase: HyperV (after Join - CSV paths only exist on a member node)
-# ---------------------------------------------------------------------------
-
-function Invoke-HyperV {
-    Assert-PriorPhase 'Join'
-    $hv = $Config.HyperV
-    $peer = Get-PeerFingerprint
-
-    Write-Step 'Hyper-V host settings (config overrides, otherwise the peer)'
-    $args_ = @{}
-    $vmPath  = Resolve-Setting $hv.VirtualMachinePath  (Get-Peer $peer 'HyperV.VirtualMachinePath')  'VirtualMachinePath'
-    $vhdPath = Resolve-Setting $hv.VirtualHardDiskPath (Get-Peer $peer 'HyperV.VirtualHardDiskPath') 'VirtualHardDiskPath'
-    foreach ($p in @(@{ n = 'VirtualMachinePath'; v = $vmPath }, @{ n = 'VirtualHardDiskPath'; v = $vhdPath })) {
-        if (-not $p.v) { continue }
-        if ($p.v -like "$env:SystemDrive\*" -and $p.v -notlike "$env:SystemDrive\ClusterStorage\*") { Write-Warning "$($p.n) '$($p.v)' is on the system drive - VMs created here will not be highly available." }
-        if (Test-Path $p.v) { $args_[$p.n] = $p.v } else { Write-Warning "$($p.n) '$($p.v)' does not exist on this node - skipping." }
-    }
-    $m = Resolve-Setting $hv.MaxVMMigrations      (Get-Peer $peer 'HyperV.MaximumVirtualMachineMigrations') 'MaximumVirtualMachineMigrations'
-    if ($m) { $args_.MaximumVirtualMachineMigrations = [int]$m }
-    $s = Resolve-Setting $hv.MaxStorageMigrations (Get-Peer $peer 'HyperV.MaximumStorageMigrations') 'MaximumStorageMigrations'
-    if ($s) { $args_.MaximumStorageMigrations = [int]$s }
-    $perf = Resolve-Setting $hv.MigrationPerformance (Get-Peer $peer 'HyperV.MigrationPerformanceOption') 'VirtualMachineMigrationPerformanceOption'
-    if ($perf) { $args_.VirtualMachineMigrationPerformanceOption = $perf }
-    $numa = Resolve-Setting $hv.NumaSpanningEnabled (Get-Peer $peer 'HyperV.NumaSpanningEnabled') 'NumaSpanningEnabled'
-    if ($numa) { $args_.NumaSpanningEnabled = ("$numa" -eq 'True') }
-    $numaBefore = (Get-VMHost).NumaSpanningEnabled
-    if ($args_.Count) { Set-VMHost @args_; Write-Host '  Hyper-V host settings applied.' -ForegroundColor Green }
-    if ($args_.ContainsKey('NumaSpanningEnabled') -and $args_.NumaSpanningEnabled -ne $numaBefore) {
-        # NUMA spanning only takes effect when VMMS restarts - safe while the node hosts no VMs.
-        if (@(Get-VM).Count -eq 0) { Restart-Service vmms; Write-Host '  NUMA spanning changed - VMMS restarted.' -ForegroundColor Green }
-        else { Write-Warning 'NUMA spanning changed but VMs are on this node - drain it and restart the vmms service for it to take effect.' }
-    }
-
-    if ((Get-Peer $peer 'HyperV.VirtualMachineMigrationEnabled') -eq 'True') { Enable-VMMigration; Write-Host '  Live migration enabled (matches peer).' }
-    Write-Host '  Note: in a cluster, the live migration network is chosen cluster-wide (Failover Cluster Manager > Networks > Live Migration Settings), not per host.'
-
-    Save-PhaseComplete 'HyperV'
-    Write-Host "`nNext: -Phase Report." -ForegroundColor Green
+    if ($reboot) { Write-Host "`nREBOOT REQUIRED. Then -Phase Baseline (security + optimisation), then onboard the host in VMM." -ForegroundColor Yellow } else { Write-Host "`nNext: -Phase Baseline, then onboard the host in VMM." -ForegroundColor Green }
 }
 
 # ---------------------------------------------------------------------------
@@ -1504,11 +1325,6 @@ function Invoke-Capture {
             MpioSettings      = if ($mpioSettings.Count) { $mpioSettings } else { $null }
         }
         HyperV = [ordered]@{
-            VirtualMachinePath   = $local.Compare['HyperV.VirtualMachinePath']
-            VirtualHardDiskPath  = $local.Compare['HyperV.VirtualHardDiskPath']
-            MaxVMMigrations      = & $asInt $local.Compare['HyperV.MaximumVirtualMachineMigrations']
-            MaxStorageMigrations = & $asInt $local.Compare['HyperV.MaximumStorageMigrations']
-            MigrationPerformance = $local.Compare['HyperV.MigrationPerformanceOption']
             NumaSpanningEnabled  = if ($local.Compare['HyperV.NumaSpanningEnabled']) { $local.Compare['HyperV.NumaSpanningEnabled'] -eq 'True' } else { $null }
         }
         Security = [ordered]@{
@@ -1554,8 +1370,8 @@ function Invoke-Capture {
     $bios = $local.Compare['HPE.Bios.WorkloadProfile']
     if ($bios -and $bios -ne 'Virtualization-MaxPerformance') { Write-Host "  BIOS workload profile is '$bios' - config set to Virtualization-MaxPerformance." -ForegroundColor Yellow }
     if ($local.Compare['Power.ActivePlan'] -notmatch '8c5e7fda') { Write-Host "  Power plan is '$($local.Compare['Power.ActivePlan'])' - Baseline sets High performance." -ForegroundColor Yellow }
-    if ($local.Compare['HyperV.MigrationPerformanceOption'] -and $local.Compare['HyperV.MigrationPerformanceOption'] -ne 'Compression') { Write-Host "  Live migration performance is '$($local.Compare['HyperV.MigrationPerformanceOption'])' - Compression is the usual choice without RDMA." -ForegroundColor Yellow }
-    if ($local.Compare['HyperV.VirtualMachinePath'] -notlike '*ClusterStorage*') { Write-Host "  Default VM path '$($local.Compare['HyperV.VirtualMachinePath'])' is not on a CSV - set HyperV.VirtualMachinePath/VirtualHardDiskPath to a CSV folder." -ForegroundColor Yellow }
+    if ($local.Compare['HyperV.MigrationPerformanceOption'] -and $local.Compare['HyperV.MigrationPerformanceOption'] -ne 'Compression') { Write-Host "  For VMM host settings: live migration performance is '$($local.Compare['HyperV.MigrationPerformanceOption'])' - Compression is the usual choice without RDMA." -ForegroundColor Yellow }
+    if ($local.Compare['HyperV.VirtualMachinePath'] -notlike '*ClusterStorage*') { Write-Host "  For VMM host settings: default VM path '$($local.Compare['HyperV.VirtualMachinePath'])' is not on a CSV - set the VM placement paths to a CSV in VMM." -ForegroundColor Yellow }
     $script:Config = $cfg | ConvertTo-Json -Depth 8 | ConvertFrom-Json   # plan builder reads $Config
     $plan = @(Get-BaselinePlan -Fp $local)
     Write-Host "  Security/optimisation: $($plan.Count) item(s) on $env:COMPUTERNAME differ from the baseline (run -Phase Baseline to see them)."
@@ -1685,12 +1501,9 @@ function Get-BaselinePlan {
     # Hyper-V host settings (only once Hyper-V is in; paths only if they exist here)
     if ($c['Feature.Hyper-V'] -eq 'Installed' -and $c.ContainsKey('HyperV.NumaSpanningEnabled')) {
         $hv = $Config.HyperV
+        # VM/VHD paths and live migration settings belong to VMM (host properties) - not
+        # set here, so the two never fight. NUMA spanning is a host hardware setting.
         $hvMap = @(
-            @{ Key = 'VirtualMachinePath';  Peer = 'HyperV.VirtualMachinePath';  Cfg = $hv.VirtualMachinePath;  Param = 'VirtualMachinePath';  Restart = $false; Path = $true }
-            @{ Key = 'VirtualHardDiskPath'; Peer = 'HyperV.VirtualHardDiskPath'; Cfg = $hv.VirtualHardDiskPath; Param = 'VirtualHardDiskPath'; Restart = $false; Path = $true }
-            @{ Key = 'MaxVMMigrations';      Peer = 'HyperV.MaximumVirtualMachineMigrations'; Cfg = $hv.MaxVMMigrations;      Param = 'MaximumVirtualMachineMigrations'; Restart = $false }
-            @{ Key = 'MaxStorageMigrations'; Peer = 'HyperV.MaximumStorageMigrations';        Cfg = $hv.MaxStorageMigrations; Param = 'MaximumStorageMigrations';        Restart = $false }
-            @{ Key = 'MigrationPerformance'; Peer = 'HyperV.MigrationPerformanceOption';      Cfg = $hv.MigrationPerformance; Param = 'VirtualMachineMigrationPerformanceOption'; Restart = $false }
             @{ Key = 'NumaSpanningEnabled';  Peer = 'HyperV.NumaSpanningEnabled';             Cfg = $hv.NumaSpanningEnabled;  Param = 'NumaSpanningEnabled'; Restart = $true }
         )
         foreach ($h in $hvMap) {
@@ -1882,8 +1695,8 @@ function Invoke-Baseline {
         if ($restart) { Write-Host "`nNode is DRAINED. REBOOT it now, then run -Phase Resume to bring it back into the cluster." -ForegroundColor Yellow }
         elseif (Confirm-Action 'No reboot needed. Resume the node into the cluster now') { Invoke-Resume }
         else { Write-Host "`nNode left paused. Run -Phase Resume when ready." -ForegroundColor Yellow }
-    } elseif ($restart) { Write-Host "`nREBOOT REQUIRED (not a cluster member, no drain needed). Then continue with -Phase Join." -ForegroundColor Yellow }
-    else { Write-Host "`nNext: -Phase Join (new node) - or nothing more for this node." -ForegroundColor Green }
+    } elseif ($restart) { Write-Host "`nREBOOT REQUIRED (not a cluster member, no drain needed). Then onboard the host in VMM (add host, logical switch, add to cluster)." -ForegroundColor Yellow }
+    else { Write-Host "`nNext: onboard the host in VMM (new node) - or nothing more for this node." -ForegroundColor Green }
     if ($failed) { Write-Warning "$($failed.Count) item(s) failed - see above. Re-run -Phase Baseline after fixing." }
 }
 
@@ -2046,17 +1859,6 @@ function Invoke-ClusterBaseline {
 
 $NextTaskName = 'ArcHyperVClusterNext'
 
-# Is this process in the physical/iLO console session? $env:SESSIONNAME isn't
-# reliable when launched from a scheduled task, so compare session IDs.
-function Test-ArcConsoleSession {
-    if ($env:SESSIONNAME -like 'RDP-*') { return $false }
-    $mine = (Get-Process -Id $PID).SessionId
-    $ErrorActionPreference = 'Continue'
-    $q = qwinsta 2>&1 | ForEach-Object { "$_" } | Out-String
-    if ($q -match '(?m)^\s*>?console\s+(?:\S+\s+)?(\d+)\s') { return ([int]$Matches[1] -eq $mine) }
-    return ($env:SESSIONNAME -eq 'Console')
-}
-
 function Request-ArcReboot {
     param([string]$Reason = 'The last phase needs a reboot.')
     Write-Host "`n$Reason" -ForegroundColor Yellow
@@ -2099,10 +1901,10 @@ function Invoke-Next {
         }
     }
 
-    # Existing cluster node (not one this script joined): Baseline -> reboot -> Resume.
+    # Existing cluster node (not one this script is onboarding): Baseline -> reboot -> Resume.
     $state = Get-State
-    $joinedHere = [bool]$state.Phases.PSObject.Properties['Join']
-    if ((Test-ArcClusterMember) -and -not $joinedHere) {
+    $onboarding = [bool]$state.PSObject.Properties['NewNode']
+    if ((Test-ArcClusterMember) -and -not $onboarding) {
         Write-Step "$env:COMPUTERNAME is an existing cluster node - baseline workflow"
         if ($state.PSObject.Properties['Drained'] -and $state.Drained -eq $true) {
             Invoke-Resume
@@ -2115,9 +1917,16 @@ function Invoke-Next {
         return
     }
 
-    # New node: the onboarding sequence. Keys are phase records in state.json.
+    # New node: the onboarding sequence up to VMM, then the checks after it. Keys are
+    # phase records in state.json. NewNode marks this host as being onboarded, so it
+    # keeps this workflow once VMM has made it a cluster member.
     if (-not $PeerParams) { throw "PeerNode must be set in the settings for the new-node workflow." }
-    $steps = 'PreFlight', 'Hpe', 'PreFlightPostHpe', 'Base', 'Network', 'StorageVerified', 'AgentsVerified', 'Baseline', 'Join', 'HyperV', 'Report'
+    if (-not $state.PSObject.Properties['NewNode']) {
+        $state | Add-Member -NotePropertyName NewNode -NotePropertyValue $true -Force
+        $state | ConvertTo-Json -Depth 5 | Set-Content -Path $StatePath -Encoding UTF8
+    }
+    $steps = 'PreFlight', 'Hpe', 'PreFlightPostHpe', 'Base', 'StorageVerified', 'AgentsVerified', 'Baseline',
+             'VmmOnboarded', 'BaselinePostVmm', 'ResumePostVmm', 'Report'
     while ($true) {
         $state = Get-State
         $step = $steps | Where-Object { -not $state.Phases.PSObject.Properties[$_] } | Select-Object -First 1
@@ -2128,7 +1937,6 @@ function Invoke-Next {
         switch ($step) {
             'PreFlight' {
                 Invoke-PreFlight
-                if (-not $NodeConfig) { Stop-Next "Add $env:COMPUTERNAME to Nodes in the settings file: AdapterMacs (from the NIC list above) and an IP per role."; return }
                 if (@($script:Results | Where-Object Status -eq 'FAIL').Count) { Stop-Next 'Fix the FAIL items above.'; return }
                 Save-PhaseComplete 'PreFlight'
             }
@@ -2141,11 +1949,6 @@ function Invoke-Next {
                 Save-PhaseComplete 'PreFlightPostHpe'
             }
             'Base' { Invoke-Base }
-            'Network' {
-                if (-not $NodeConfig) { Stop-Next "Add $env:COMPUTERNAME to Nodes in the settings file."; return }
-                if (-not (Test-ArcConsoleSession) -and -not $AllowRemoteSession) { Stop-Next 'Log on at the iLO remote console (not RDP) - building the vSwitch drops remote sessions.'; return }
-                Invoke-Network
-            }
             'StorageVerified' {
                 Invoke-Storage
                 if ((Get-State).RebootPending) { break }
@@ -2160,9 +1963,28 @@ function Invoke-Next {
                 Save-PhaseComplete 'AgentsVerified'
             }
             'Baseline' { Invoke-Baseline }
-            'Join'     { Invoke-Join }
-            'HyperV'   { Invoke-HyperV }
-            'Report'   { Invoke-Report; Save-PhaseComplete 'Report' }
+            'VmmOnboarded' {
+                if (-not (Test-ArcClusterMember)) {
+                    Write-Host "`n  $env:COMPUTERNAME is VMM-ready: firmware, roles, storage, agents and the security baseline are done." -ForegroundColor Green
+                    Stop-Next ("In SCVMM: (1) add $env:COMPUTERNAME to its host group, (2) apply the logical switch - its management adapter takes over this host's management IP, " +
+                               "(3) add the host to cluster $($Config.ClusterName). VMM also sets the VM placement paths and live migration settings.")
+                    return
+                }
+                Write-Host "  $env:COMPUTERNAME is a member of $($Config.ClusterName) - VMM onboarding done." -ForegroundColor Green
+                Save-PhaseComplete 'VmmOnboarded'
+            }
+            'BaselinePostVmm' {
+                # Re-check now the logical switch exists: NIC power / VMQ on the new SET members.
+                Invoke-Baseline
+                $s = Get-State
+                Save-PhaseComplete 'BaselinePostVmm' ([bool]$s.RebootPending)
+            }
+            'ResumePostVmm' {
+                $s = Get-State
+                if ($s.PSObject.Properties['Drained'] -and $s.Drained -eq $true) { Invoke-Resume }
+                Save-PhaseComplete 'ResumePostVmm'
+            }
+            'Report' { Invoke-Report; Save-PhaseComplete 'Report' }
         }
 
         if ((Get-State).RebootPending) { Request-ArcReboot; return }
@@ -2185,6 +2007,9 @@ function Invoke-Report {
         if ($n.State -eq 'Up') { Add-Result PASS 'Cluster node Up' $Config.ClusterName } else { Add-Result FAIL 'Cluster node Up' "$($n.State)" }
     } catch { Add-Result FAIL 'Cluster membership' $_.Exception.Message }
 
+    Write-Step 'Host networking (built by the VMM logical switch) vs HostNetworks'
+    Test-ArcHostNetworks -Fp $local -Peer $peer -Required
+
     if ($local.Compare['Feature.Windows-Defender'] -eq 'Installed' -and $local.Compare['Service.SentinelAgent'] -eq 'Present') { Add-Result WARN 'Defender + Sentinel both installed' 'Remove Defender (-Phase Agents)' }
     if ($local.Compare['Service.SentinelAgent'] -ne 'Present') { Add-Result FAIL 'SentinelOne' 'Not installed' } else { Add-Result PASS 'SentinelOne' 'Installed' }
     if ($local.Compare['Service.DattoCagService'] -ne 'Present') { Add-Result WARN 'Datto RMM agent' 'Not installed' } else { Add-Result PASS 'Datto RMM agent' 'Installed' }
@@ -2193,9 +2018,9 @@ function Invoke-Report {
     $script:PeerFp = $peer
     $left = @(Get-BaselinePlan -Fp $local)
     if ($left) { Add-Result WARN 'Baseline' "$($left.Count) item(s) differ from the config - run -Phase Baseline"; Show-Plan $left }
-    else { Add-Result PASS 'Baseline' 'Security, optimisation, BIOS, MPIO and Hyper-V settings match the config' }
+    else { Add-Result PASS 'Baseline' 'Security, optimisation, BIOS, MPIO and NUMA settings match the config' }
 
-    foreach ($p in 'PreFlight', 'Hpe', 'Base', 'Network', 'Storage', 'Agents', 'Baseline', 'Join', 'HyperV') {
+    foreach ($p in 'PreFlight', 'Hpe', 'Base', 'Storage', 'Agents', 'Baseline') {
         $e = $state.Phases.PSObject.Properties[$p]
         if ($e) { Add-Result INFO "Phase $p" "completed $($e.Value.Completed) (v$($e.Value.Version))" } else { Add-Result WARN "Phase $p" 'not recorded' }
     }
@@ -2217,11 +2042,8 @@ try {
         'PreFlight' { Invoke-PreFlight; Save-PhaseComplete 'PreFlight' }
         'Hpe'       { Invoke-Hpe }
         'Base'      { Invoke-Base }
-        'Network'   { Invoke-Network }
         'Storage'   { Invoke-Storage }
         'Agents'    { Invoke-Agents }
-        'Join'      { Invoke-Join }
-        'HyperV'    { Invoke-HyperV }
         'Report'    { Invoke-Report }
     }
     if ($script:Results.Count) {

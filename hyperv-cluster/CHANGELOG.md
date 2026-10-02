@@ -4,7 +4,21 @@ All notable changes to `ArcHyperVCluster.ps1` (originally `Add-ArcHyperVClusterN
 
 ## [Unreleased]
 
-_Work in progress on the `develop` branch. `$ScriptVersion` is `0.3.0-dev`; the download one-liner points at `/develop/`._
+_Work in progress on the `develop` branch. `$ScriptVersion` is `0.4.0-dev`; the download one-liner points at `/develop/`._
+
+### Changed
+- **SCVMM owns host networking, cluster join and workloads (0.4.0-dev).** The script now stops at "VMM-ready" for a new node and checks what SCVMM builds.
+  - **Removed phases:** `Network` (SET switch and host vNICs, now built by the VMM logical switch), `Join` (SCVMM adds the host to the cluster) and `HyperV` (VM placement paths and live migration host settings are set in SCVMM). The `-AllowRemoteSession` parameter and the console-session check went with Network.
+  - **New-node flow in `-Phase Next`:**
+    1. PreFlight → Hpe → PreFlight → Base → Storage → Agents → Baseline.
+    2. A **VMM handoff gate**: add the host, apply the logical switch, add it to the cluster.
+    3. Post-VMM Baseline (NIC power and VMQ apply once the SET switch exists) → Resume if drained → Report.
+
+    A `NewNode` marker in `state.json` keeps an onboarded host on this flow after SCVMM makes it a cluster member.
+  - **Host networking checks:** a new `Test-ArcHostNetworks` check compares the host vNICs with `HostNetworks`: SET switch in weight mode, each role's vNIC present with the right VLAN, a subnet matching the peer, and stray vNICs flagged. It is INFO in PreFlight (before VMM) and enforced in Report (after VMM).
+  - **Nodes entries are optional:** a new node needs no MACs or IPs in `cluster.json`, because SCVMM assigns host vNIC IPs. PreFlight lists the NICs for the VMM uplinks and checks the 10GbE ports are up.
+  - **Baseline no longer sets VM/VHD paths or live migration host settings**; NUMA spanning stays with the script. Capture records only `HyperV.NumaSpanningEnabled` and prints the VM path and live migration values as notes for the VMM host settings.
+  - The host-network check, the Baseline plan without VMHost items, and the `Next` sequencing through the VMM handoff were exercised with mocked data.
 
 ### Added
 - **`-Phase Next`: attended automation (0.3.0-dev).** This works out where the host is from `state.json`.

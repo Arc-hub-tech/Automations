@@ -139,3 +139,4 @@ The HTML is self-contained, so it opens offline. It's **deliberately unbranded**
 - **Shared helpers are duplicated on purpose.** The block between `start of shared helpers` and `end of shared helpers` is identical in both scripts, so each file stays self-contained for `irm` and USB use. It includes the network build and the whole baseline. Change it in both.
 - **Versioning:** both scripts share one version (`$ScriptVersion`) and one [CHANGELOG](CHANGELOG.md). They follow the repo's `develop` / `main` workflow: the one-liners point at `/develop/` and the version carries `-dev` until release.
 - **Logs:** a transcript per run, the check CSVs and the as-built HTML go to `C:\ArcLogs\HyperVHost\`.
+- **Engineer guide:** [docs/ArcHyperVHost-Confluence-Guide.md](docs/ArcHyperVHost-Confluence-Guide.md) is the source of the Confluence page "Standalone Hyper-V host build" in the Data Center space. Keep the two in step.

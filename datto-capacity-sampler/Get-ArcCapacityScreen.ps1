@@ -48,6 +48,11 @@
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
 
+    Version : 1.14 -  09/10/2026  (MySQL buffer pool sanity check, kept identical to
+              Component 2: a pool that can't explain mysqld's footprint is reported
+              unresolved rather than asserted; also reads the option group named after the
+              Windows service, where WAMP keeps its settings)
+
     Version : 1.13 -  09/10/2026  (HV-MEM threshold no longer rounded to a whole GB:
               [math]::Max(2, x) binds the integer overload in PowerShell, so 5% of 128GB
               read as 6GB rather than 6.4GB. Decimal literals now)
@@ -183,18 +188,24 @@ function ConvertFrom-MySqlSize {
 
 # Server-section options from one option file, keys normalised the way mysqld
 # reads them (dash and underscore interchangeable, 'loose-' prefix ignored).
+# A server running as a Windows service also reads the group named after the
+# service (MySQL docs: "the group that has the same name as the service") -
+# WAMP installs it as wampmysqld64 and puts its settings there, so a parser
+# reading only [mysqld] took the 128M default for a 48G pool on the first real
+# material-MySQL host. $ServiceGroups carries those names.
 # !include / !includedir are not followed - a value set only in an included
 # file reads as the built-in default, which errs toward "buffer pool smaller
 # than it is" and so never inflates a recommendation.
 function Read-MySqlOptionFile {
-    param([string]$Path)
+    param([string]$Path, [string[]]$ServiceGroups = @())
     $opts = @{}
     $inServer = $false
     foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction Stop)) {
         $t = $line.Trim()
         if ($t -eq '' -or $t.StartsWith('#') -or $t.StartsWith(';')) { continue }
         if ($t -match '^\[(.+)\]$') {
-            $inServer = ($Matches[1].Trim() -match '^(mysqld|server|mariadb|mariadbd)(-[\d.]+)?$')
+            $section  = $Matches[1].Trim()
+            $inServer = ($section -match '^(mysqld|server|mariadb|mariadbd)(-[\d.]+)?$') -or ($ServiceGroups -contains $section)
             continue
         }
         if (-not $inServer) { continue }
@@ -214,9 +225,15 @@ function Read-MySqlOptionFile {
 # GB = $null with a Source explaining why whenever the value can't be trusted -
 # never a guess.
 function Get-InnoDbBufferPool {
-    param([string]$PathName)
+    param([string]$PathName, [string]$ServiceName = '')
     try {
         $exe = if ($PathName -match '^\s*"([^"]+)"') { $Matches[1] } elseif ($PathName -match '^\s*(\S+)') { $Matches[1] } else { '' }
+        # The service's own option group: the name mysqld was started with
+        # (the trailing argument on its command line) and the Windows service
+        # name - normally the same, both taken in case they differ.
+        $lastArg = (($PathName.Trim() -split '\s+')[-1]).Trim('"')
+        $groups  = @($ServiceName, $(if ($lastArg -notlike '--*' -and $lastArg -notlike '*.exe') { $lastArg })) |
+                   Where-Object { $_ } | Select-Object -Unique
         $baseDir = if ($exe) { Split-Path -Path (Split-Path -Path $exe -Parent) -Parent } else { '' }
 
         $files = @()
@@ -235,7 +252,7 @@ function Get-InnoDbBufferPool {
         $read = @()
         foreach ($f in $files) {
             if (Test-Path -LiteralPath $f) {
-                $o = Read-MySqlOptionFile -Path $f
+                $o = Read-MySqlOptionFile -Path $f -ServiceGroups $groups
                 foreach ($k in $o.Keys) { $opts[$k] = $o[$k] }
                 $read += (Split-Path -Path $f -Leaf)
             }
@@ -298,9 +315,23 @@ function Get-MySqlInfo {
     $bpGB    = 0.0
     $sources = @()
     foreach ($s in $running) {
-        $bp = Get-InnoDbBufferPool -PathName $s.PathName
+        $bp = Get-InnoDbBufferPool -PathName $s.PathName -ServiceName $s.Name
         $sources += $bp.Source
         if ($null -eq $bp.GB) { $bpGB = $null } elseif ($null -ne $bpGB) { $bpGB += $bp.GB }
+    }
+
+    # Sanity check against what mysqld actually holds. A configured pool
+    # can't explain a footprint many times its size: on the first real
+    # material-MySQL host the option files read as the 128M default while
+    # mysqld held 52.84GB - the effective config was somewhere this didn't
+    # read. Under pressure that wrong figure would have produced "buffer pool
+    # 0.12GB isn't the cause", a confident wrong diagnosis. Allow the pool
+    # x1.5 plus 4GB for per-connection buffers, temp tables and the engine
+    # itself before calling it unresolved; a correctly-read pool sits well
+    # inside that (48GB pool, 52.8GB held passes).
+    if ($null -ne $bpGB -and $privateGB -gt ($bpGB * 1.5 + 4)) {
+        $sources += ('config reads {0}GB but mysqld holds {1}GB - effective config not found' -f [math]::Round($bpGB, 2), $privateGB)
+        $bpGB = $null
     }
 
     [PSCustomObject]@{

@@ -34,6 +34,25 @@ _Work in progress on the `develop` branch._
   host gives `cap SAGE max server memory at 21.5GB`; locked-pages shapes give no split.
 
 ### Fixed
+- **A misread MySQL buffer pool was asserted as fact** (`Read-ArcCapacityBuffer.ps1` v1.14,
+  `Get-ArcCapacityScreen.ps1` v1.14). On the first real material-MySQL host (64GB), the option
+  files read as the 128M default while `mysqld` held **52.84GB**. The effective configuration was
+  somewhere the parser didn't read. That host wasn't under pressure, so its verdict was unaffected.
+  Under pressure, though, the same figure would have produced "buffer pool 0.12GB isn't the cause",
+  a confident wrong diagnosis.
+  - **New sanity check:** a pool can't explain a footprint above pool × 1.5 + 4GB (per-connection
+    buffers, temp tables and the engine itself fit inside that), so past it the figure is reported
+    unresolved, as `config reads XGB but mysqld holds YGB - effective config not found`. The verdict
+    then says to check the pool, not that the pool is fine.
+  - **Cases that still pass:** a correctly read 48GB pool with 52.8GB held, and a 128M default
+    with 1.15GB held.
+  - **Root cause, also fixed:** a server running as a Windows service reads the option group named
+    after its service, as well as `[mysqld]`. WAMP installs the service as `wampmysqld64` and keeps
+    its settings under `[wampmysqld64]`, including that host's `innodb_buffer_pool_size=48G`. The
+    parser accepted only `[mysqld]`/`[server]`/`[mariadb]`/`[mariadbd]`. It now also reads the
+    group named by the Windows service name and by the trailing argument on mysqld's command line.
+    The settings were confirmed by a read-only diagnostic on the host, with no database access.
+    A replay of the host's exact layout now reads 48GB, inside the sanity range for 52.84GB held.
 - **`[math]::Max(0, x)` and similar silently rounded decimals to whole numbers**
   (`Read-ArcCapacityBuffer.ps1` v1.13, `Get-ArcCapacityScreen.ps1` v1.13). With an integer literal
   first, PowerShell binds the `Max(int, int)` overload, so `Max(0, 3.4)` is 3. Affected:

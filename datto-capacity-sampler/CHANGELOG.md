@@ -8,7 +8,64 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Added
+- **SQL Server attention signals** (`Read-ArcCapacityBuffer.ps1` v1.10). SQL hosts were excluded
+  from RAM sizing with nothing else to say. `SqlTargetGB` was sampled but never read, and PLE was
+  reported as a raw minimum against no threshold. The new checks use only counters already in
+  the buffer plus the registry: no sampler change, so no buffer reset, and no database login.
+  Three flags, each with a short reason in `Cap: Growth Verdict`:
+  - `SQL-CAP`: the peak Target leaves the OS under half of Kehayias's recommended reserve, so
+    `max server memory` is unset or set too high. The verdict gives the cap to set.
+  - `SQL-MEM`: either PLE p05 is under 300s per 4GB of buffer pool while the pool sits at Target,
+    or Target p05 is under 80% of its peak (SQL squeezed by memory pressure from outside it).
+  - `SQL-EXPRESS-CAP`: an Express database is at 8GB or more of its 10GB limit, or a host with
+    only Express instances is memory-bound at the ~1.4GB pool cap, where RAM won't help.
+
+  A SQL host under `MEM-PRESSURE` now reads `URGENT` with the likeliest cause first, rather than
+  `EXCLUDED`. That was the same pressure-hiding gap MySQL had; Exchange and Veeam still have it.
+  The CSV export gains `SqlFindings` and `SqlEditions`. Instances are read through the 64-bit
+  registry view so a 32-bit host process can't miss them. Tested against six synthetic buffers
+  (cap unset under pressure, healthy capped, Express at cap with a DB near the limit, squeezed
+  Target, no counters sampled, a worst case with two instances) and a fake registry tree.
+- **The verdict UDFs now trim the RAM text instead of the end** (`Read-ArcCapacityBuffer.ps1`
+  v1.10). `Cap: Verdict` and `Cap: Growth Verdict` are `RAM || CPU || timestamp`. The plain
+  255-character cut took the timestamp and CPU verdict first, and the timestamp is how a stale
+  UDF gets spotted.
+- **MySQL / MariaDB role** (`Read-ArcCapacityBuffer.ps1` v1.9, `Get-ArcCapacityScreen.ps1` v1.9).
+  A 24GB, 4 vCPU MySQL host was read as `Generic`. It got `URGENT +32GB -> 56GB` and a vCPU cut
+  to 2. The +32GB is just commit max 44.4GB × 1.25. On Windows, InnoDB commits its whole buffer
+  pool at startup, so commit on a MySQL host restates the configured `innodb_buffer_pool_size`
+  rather than the demand. A pool sized beyond what the allocation can hold also produces exactly
+  this pattern, and then the fix is lowering the pool, not adding 32GB.
+  - **Detection** is by service binary (`mysqld` / `mariadbd`), since service names vary. A host
+    counts as MySQL only when mysqld's private bytes reach at least 2GB and at least 25% of
+    allocation, the same bar the Screen applies to SQL Server. Otherwise it's flagged
+    `MYSQL-MINOR` and sized normally.
+  - **Floors** are 8GB / 4 vCPU, matching SQL Server.
+  - **RAM** is excluded from commit-based sizing in both directions.
+  - **Under `MEM-PRESSURE`**, Component 2 still reports `URGENT` and flags `GROWTH`, with
+    `Cap: Growth GB` left at `000` (the same convention as the `CPU-GROWTH` queue REVIEW case).
+    Instead of a GB figure it cites the configured buffer pool: over 75% of allocation reads
+    "lower it to N GB or grow RAM to M GB", and under 75% reads "isn't the cause". The pool is
+    read credential-free from the option files mysqld reads: `--defaults-file`, the Windows
+    search order, and a `SET PERSIST` in `mysqld-auto.cnf`. A pool sized by
+    `innodb_dedicated_server` is reported as unresolved, never guessed.
+  - `Cap: RAM Detail` and both CSV exports gain mysqld's footprint and the configured pool.
+  - **`Arc-CapacitySampler.ps1` is deliberately unchanged.** A new buffer column would change the
+    header, which archives `samples.csv` and resets every device's 14-day window. All MySQL facts
+    are read at analysis time.
+
 ### Fixed
+- **vCPU reduction was offered while the host was under memory pressure** (`Read-ArcCapacityBuffer.ps1`
+  v1.9). The same 24GB host was paging hard (0.1GB min available, 66 faults/s) and was recommended
+  4 → 2 vCPU on p95 17%, with a 67% peak that 2 vCPU couldn't carry. Waiting on paging I/O isn't CPU
+  time, so utilisation measured under pressure understates demand once memory is fixed. Reduction
+  is now held under `MEM-PRESSURE` (`NO REDUCTION - memory pressure ... resolve memory first`).
+  Growth is unaffected.
+- **The vCPU role floor was applied after deciding a reduction existed** (`Read-ArcCapacityBuffer.ps1`
+  v1.9). A host at or below its floor could read `REDUCE to 4 vCPU` on 4 vCPU, or a "reduction"
+  upwards on a 2 vCPU host with a floor of 4. The floor is now applied first, and such hosts read
+  `NO CHANGE - demand sizes to N but <role> floor is M vCPU`.
 - **The commit ratio still triggered `UPSIZE` on its own, and still produced false positives**
   (`Get-ArcCapacityScreen.ps1` v1.8). Raising the ratio from 90% to 100% in v1.6 fixed the reported
   case but not the class: on a 155-device run the same 96GB host reappeared at 108% commit while

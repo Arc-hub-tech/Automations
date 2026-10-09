@@ -46,8 +46,10 @@
                           that escalation shows no shortfall, flags REVIEW rather than
                           forcing a number the math doesn't support.
       CPU   EffCores    = (p95 Total% / 100) x vCPU
-            Reduce      = current vCPU minus ceil( EffCores / 0.65 ) [rounded even]
-                          when that's lower than current
+            Reduce      = current vCPU minus max( RoleFloor, ceil( EffCores / 0.65 )
+                          [rounded even] ) when that's lower than current. Held
+                          while MEM-PRESSURE is active - CPU measured on a host
+                          stalled on paging understates its real demand
             Growth      = ceil( EffCores / 0.65 ) [rounded even] minus current vCPU
                           when that's higher than current. Queue-driven CPU pressure
                           that the total%-based model doesn't catch (e.g. many
@@ -61,8 +63,14 @@
       - p95 max-core above 85% while total is near the single-thread ceiling -
         suppresses BOTH reduction and growth, since more vCPU doesn't help a
         workload that can't spread past one core
+      - Memory pressure also holds vCPU reduction (not growth)
+      - SQL Server hosts are never sized, but are checked for attention signals
+        (flags SQL-CAP, SQL-MEM, SQL-EXPRESS-CAP) reported in the growth verdict
       - Role exclusions from RAM sizing (both directions): SQL, Exchange, Veeam
-        proxy/repository
+        proxy/repository, and MySQL/MariaDB where mysqld holds >=2GB and >=25%
+        of allocation (InnoDB commits its whole buffer pool up front). MySQL
+        still reports URGENT under memory pressure, with the configured
+        innodb_buffer_pool_size in place of a commit-derived GB figure
 
     Component input variables (all optional):
               usrUdfBase       Integer  default 60    First UDF index, uses 10 consecutive fields (1-291)
@@ -71,6 +79,23 @@
               usrExportPath    String   default ''    Optional UNC for per-device CSV row
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
+
+    Version : 1.10 -  09/10/2026  (SQL Server attention signals from counters already
+              sampled plus the registry - no sampler change, no login: SQL-CAP (max server
+              memory unset or leaving the OS too little), SQL-MEM (low PLE with the pool at
+              target, or Target squeezed below its peak), SQL-EXPRESS-CAP (Express database
+              near the 10GB limit, or memory-bound at Express's pool cap). PLE now judged as
+              p05 against 300s per 4GB of pool rather than a raw minimum. A SQL host under
+              memory pressure reads URGENT naming the likeliest cause, instead of EXCLUDED.
+              Verdict UDFs trim the RAM text rather than losing the CPU verdict and timestamp)
+
+    Version : 1.9  -  09/10/2026  (MySQL/MariaDB role: detected by service binary,
+              material at >=2GB and >=25% of allocation, floors 8GB/4 vCPU, RAM sized
+              from neither direction of commit since InnoDB commits its buffer pool up
+              front - under memory pressure it still reads URGENT, citing the configured
+              buffer pool instead of a GB figure. vCPU reduction held under MEM-PRESSURE.
+              Role floor now applied before deciding a reduction exists - it could
+              previously emit "REDUCE to 4 vCPU" on a 4 vCPU host)
 
     Version : 1.8  -  18/08/2026  (domain controller RAM floor is now a function of
               actual DIT size where it can be read from the registry, rather than a
@@ -180,6 +205,19 @@ function Set-Udf {
     Set-ItemProperty -LiteralPath $UdfKey -Name "Custom$Index" -Value $Value -Force
 }
 
+# 'RAM: x || CPU: y || timestamp' for the two verdict UDFs. Set-Udf's plain
+# 255-character cut takes from the end, which loses the CPU verdict and the
+# timestamp first - the timestamp being how a stale UDF is spotted. Trim the
+# RAM text instead, so the CPU half and the timestamp always survive.
+function Format-VerdictUdf {
+    param([string]$Ram, [string]$Cpu)
+    $tail = ' || CPU: {0} || {1}' -f $Cpu, (Get-Date -Format 'dd/MM/yyyy HH:mm')
+    $head = 'RAM: ' + $Ram
+    $room = 255 - $tail.Length
+    if ($head.Length -gt $room -and $room -gt 20) { $head = $head.Substring(0, $room - 3) + '...' }
+    $head + $tail
+}
+
 function Get-Floor2   { param([double]$Value) [int]([math]::Floor($Value / 2) * 2) }
 function Get-CeilEven { param([double]$Value) $i = [int][math]::Ceiling($Value); if ($i % 2 -ne 0) { $i++ }; $i }
 
@@ -213,10 +251,225 @@ function Get-DcDitSizeGB {
     }
 }
 
+# --- SQL Server helpers ------------------------------------------------------
+# Installed instances from the registry: edition, and the largest user-database
+# data file in each instance's default data directory. Read through the 64-bit
+# registry view explicitly - from a 32-bit host process, plain HKLM:\SOFTWARE
+# is redirected to WOW6432Node and shows no 64-bit instances at all. Never
+# throws; an instance whose details can't be read is still listed, with blanks.
+# The data-file size is a heuristic: databases kept outside the default data
+# directory, or split across .ndf files, aren't seen.
+function Get-SqlInstanceInfo {
+    # Emits one object per instance (nothing at all when there are none) -
+    # callers wrap the call in @() to get a countable array.
+    $seen = @{}
+    $root = 'SOFTWARE\Microsoft\Microsoft SQL Server'
+    foreach ($view in [Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32) {
+        $base = $null
+        try {
+            $base  = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
+            $names = $base.OpenSubKey("$root\Instance Names\SQL")
+            if (-not $names) { continue }
+            foreach ($name in $names.GetValueNames()) {
+                if ($seen.ContainsKey($name)) { continue }
+                $seen[$name] = $true
+                $id        = [string]$names.GetValue($name)
+                $edition   = ''
+                $largestGB = $null
+                try {
+                    $setup = $base.OpenSubKey("$root\$id\Setup")
+                    if ($setup) { $edition = [string]$setup.GetValue('Edition') }
+                    $srv     = $base.OpenSubKey("$root\$id\MSSQLServer")
+                    $dataDir = if ($srv) { [string]$srv.GetValue('DefaultData') } else { '' }
+                    if (-not $dataDir -and $setup) {
+                        $dataRoot = [string]$setup.GetValue('SQLDataRoot')
+                        if ($dataRoot) { $dataDir = Join-Path $dataRoot 'DATA' }
+                    }
+                    if ($dataDir -and (Test-Path -LiteralPath $dataDir)) {
+                        $mdf = Get-ChildItem -LiteralPath $dataDir -Filter '*.mdf' -File -ErrorAction SilentlyContinue |
+                               Where-Object { $_.BaseName -notmatch '^(master|model|msdb|tempdb|mssqlsystemresource)' } |
+                               Sort-Object Length -Descending | Select-Object -First 1
+                        if ($mdf) { $largestGB = [math]::Round($mdf.Length / 1GB, 2) }
+                    }
+                } catch { }
+                [PSCustomObject]@{
+                    Name         = $name
+                    Edition      = $edition
+                    IsExpress    = ($edition -match 'Express')
+                    LargestMdfGB = $largestGB
+                }
+            }
+        } catch {
+        } finally {
+            if ($base) { $base.Dispose() }
+        }
+    }
+}
+
+# Memory to leave the OS when capping SQL Server: 1GB, plus 1GB per 4GB up to
+# 16GB, plus 1GB per 8GB above that (Jonathan Kehayias's widely used guidance -
+# a 32GB host reserves 7GB, so max server memory 25GB).
+function Get-SqlOsReserveGB {
+    param([double]$AllocatedGB)
+    $r = 1 + ([math]::Min($AllocatedGB, 16) / 4)
+    if ($AllocatedGB -gt 16) { $r += ($AllocatedGB - 16) / 8 }
+    [int][math]::Ceiling($r)
+}
+
+# --- MySQL / MariaDB helpers -------------------------------------------------
+# Kept identical in Get-ArcCapacityScreen.ps1 - change both together.
+#
+# InnoDB commits its whole buffer pool up front on Windows, so on a MySQL host
+# guest committed bytes tracks the configured innodb_buffer_pool_size, not the
+# requirement - the same distortion that excludes SQL Server, but read from an
+# option file rather than a perf counter (MySQL publishes none). Read-only and
+# credential-free: the configured value is what matters here, and nothing in
+# this public repo may carry a database login.
+function ConvertFrom-MySqlSize {
+    param([string]$Value)
+    if ($Value -match '^(\d+(?:\.\d+)?)\s*([KMGT]?)B?$') {
+        $mult = switch ($Matches[2].ToUpper()) { 'K' { 1KB } 'M' { 1MB } 'G' { 1GB } 'T' { 1TB } default { 1 } }
+        return [math]::Round(([double]$Matches[1] * $mult) / 1GB, 2)
+    }
+    $null
+}
+
+# Server-section options from one option file, keys normalised the way mysqld
+# reads them (dash and underscore interchangeable, 'loose-' prefix ignored).
+# !include / !includedir are not followed - a value set only in an included
+# file reads as the built-in default, which errs toward "buffer pool smaller
+# than it is" and so never inflates a recommendation.
+function Read-MySqlOptionFile {
+    param([string]$Path)
+    $opts = @{}
+    $inServer = $false
+    foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        $t = $line.Trim()
+        if ($t -eq '' -or $t.StartsWith('#') -or $t.StartsWith(';')) { continue }
+        if ($t -match '^\[(.+)\]$') {
+            $inServer = ($Matches[1].Trim() -match '^(mysqld|server|mariadb|mariadbd)(-[\d.]+)?$')
+            continue
+        }
+        if (-not $inServer) { continue }
+        if ($t -match '^([A-Za-z0-9_-]+)\s*(?:=\s*(.*))?$') {
+            $key = $Matches[1].ToLower().Replace('-', '_') -replace '^loose_', ''
+            $val = if ($null -ne $Matches[2]) { ($Matches[2] -replace '\s+#.*$', '').Trim().Trim('"', "'") } else { 'ON' }
+            $opts[$key] = $val
+        }
+    }
+    $opts
+}
+
+# Configured innodb_buffer_pool_size for one service, from the same files
+# mysqld itself would read: --defaults-file if the service command line names
+# one, otherwise the standard Windows search order (later files override).
+# A MySQL 8 'SET PERSIST' in <datadir>\mysqld-auto.cnf overrides both. Returns
+# GB = $null with a Source explaining why whenever the value can't be trusted -
+# never a guess.
+function Get-InnoDbBufferPool {
+    param([string]$PathName)
+    try {
+        $exe = if ($PathName -match '^\s*"([^"]+)"') { $Matches[1] } elseif ($PathName -match '^\s*(\S+)') { $Matches[1] } else { '' }
+        $baseDir = if ($exe) { Split-Path -Path (Split-Path -Path $exe -Parent) -Parent } else { '' }
+
+        $files = @()
+        if ($PathName -match '--defaults-file=\s*"?([^"]+?\.(?:ini|cnf))') {
+            $files = @($Matches[1])
+        } elseif ($PathName -match '--defaults-file') {
+            # Named but not in a shape parsed above - mysqld then reads ONLY that
+            # file, so falling back to the search order would read the wrong ones
+            return [PSCustomObject]@{ GB = $null; Source = 'defaults-file not parsed' }
+        } else {
+            $files = @("$env:WINDIR\my.ini", "$env:WINDIR\my.cnf", 'C:\my.ini', 'C:\my.cnf')
+            if ($baseDir) { $files += @("$baseDir\my.ini", "$baseDir\my.cnf") }
+        }
+
+        $opts = @{}
+        $read = @()
+        foreach ($f in $files) {
+            if (Test-Path -LiteralPath $f) {
+                $o = Read-MySqlOptionFile -Path $f
+                foreach ($k in $o.Keys) { $opts[$k] = $o[$k] }
+                $read += (Split-Path -Path $f -Leaf)
+            }
+        }
+        if ($read.Count -eq 0) { return [PSCustomObject]@{ GB = $null; Source = 'no option file found' } }
+
+        $dataDir = if ($opts.ContainsKey('datadir')) { $opts['datadir'] } elseif ($baseDir) { "$baseDir\data" } else { '' }
+        if ($dataDir) {
+            $auto = Join-Path $dataDir 'mysqld-auto.cnf'
+            if (Test-Path -LiteralPath $auto) {
+                $persisted = Get-Content -LiteralPath $auto -Raw | ConvertFrom-Json
+                $p = $persisted.mysql_server.innodb_buffer_pool_size
+                if ($p -and $null -ne $p.Value) {
+                    $gb = ConvertFrom-MySqlSize -Value ([string]$p.Value)
+                    if ($null -ne $gb) { return [PSCustomObject]@{ GB = $gb; Source = 'mysqld-auto.cnf' } }
+                }
+            }
+        }
+
+        if ($opts.ContainsKey('innodb_buffer_pool_size')) {
+            $gb = ConvertFrom-MySqlSize -Value $opts['innodb_buffer_pool_size']
+            if ($null -eq $gb) { return [PSCustomObject]@{ GB = $null; Source = 'unparseable' } }
+            return [PSCustomObject]@{ GB = $gb; Source = ($read -join '+') }
+        }
+        # innodb_dedicated_server sizes the pool from RAM at startup, by a rule
+        # that differs between MySQL releases - report it rather than guess.
+        if ($opts.ContainsKey('innodb_dedicated_server') -and $opts['innodb_dedicated_server'] -match '^(ON|1|TRUE)$') {
+            return [PSCustomObject]@{ GB = $null; Source = 'innodb_dedicated_server' }
+        }
+        [PSCustomObject]@{ GB = (ConvertFrom-MySqlSize -Value '128M'); Source = 'default 128M' }
+    } catch {
+        [PSCustomObject]@{ GB = $null; Source = 'unreadable' }
+    }
+}
+
+# Detected by the service BINARY, not the service name - names vary (MySQL,
+# MySQL80, MariaDB, wampmysqld64...) where the binary doesn't. Returns $null
+# when no MySQL/MariaDB service exists. PrivateGB is mysqld's private bytes:
+# its share of the commit figure, which is exactly the thing in question.
+function Get-MySqlInfo {
+    $svcs = @()
+    try {
+        $svcs = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop `
+                  -Filter "PathName LIKE '%mysqld%' OR PathName LIKE '%mariadbd%'")
+    } catch { }
+    if ($svcs.Count -eq 0) { return $null }
+
+    $privateGB = 0.0
+    try {
+        $procs = @(Get-Process -Name 'mysqld', 'mariadbd' -ErrorAction SilentlyContinue)
+        if ($procs.Count -gt 0) {
+            $privateGB = [math]::Round((($procs | Measure-Object -Property PrivateMemorySize64 -Sum).Sum) / 1GB, 2)
+        }
+    } catch { }
+
+    # Sum across running instances; any unresolved instance makes the total
+    # unresolved rather than silently under-reporting it.
+    $running = @($svcs | Where-Object { $_.State -eq 'Running' })
+    if ($running.Count -eq 0) { $running = @($svcs) }
+    $bpGB    = 0.0
+    $sources = @()
+    foreach ($s in $running) {
+        $bp = Get-InnoDbBufferPool -PathName $s.PathName
+        $sources += $bp.Source
+        if ($null -eq $bp.GB) { $bpGB = $null } elseif ($null -ne $bpGB) { $bpGB += $bp.GB }
+    }
+
+    [PSCustomObject]@{
+        Engine           = $(if (@($svcs | Where-Object { $_.PathName -match 'mariadb' }).Count -gt 0) { 'MariaDB' } else { 'MySQL' })
+        PrivateGB        = $privateGB
+        BufferPoolGB     = $(if ($null -ne $bpGB) { [math]::Round($bpGB, 2) } else { $null })
+        BufferPoolSource = (($sources | Select-Object -Unique) -join ', ')
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Role detection
 # ---------------------------------------------------------------------------
 function Get-ServerRole {
+    param([double]$AllocatedGB = 0)
+
     $flags = New-Object System.Collections.Generic.List[string]
     $role  = 'Generic'
 
@@ -243,6 +496,22 @@ function Get-ServerRole {
     # SQL Server
     $isSql = ($svc.ContainsKey('MSSQLSERVER')) -or (& $hasSvc 'MSSQL$*')
     if ($isSql) { if ($role -eq 'Generic') { $role = 'SQLServer' }; $flags.Add('SQL') }
+
+    # MySQL / MariaDB - same materiality bar the Screen applies to SQL Server:
+    # mysqld must hold at least 2GB AND at least 25% of allocation in private
+    # bytes before it is treated as distorting commit. Below that (an LOB app's
+    # bundled instance) the host is flagged MYSQL-MINOR and sized normally.
+    $mysql = Get-MySqlInfo
+    if ($mysql) {
+        $mysqlIsMaterial = ($mysql.PrivateGB -ge 2) -and
+                           (($AllocatedGB -le 0) -or ($mysql.PrivateGB -ge ($AllocatedGB * 0.25)))
+        if ($mysqlIsMaterial) {
+            if ($role -eq 'Generic') { $role = 'MySQL' }
+            $flags.Add('MYSQL')
+        } else {
+            $flags.Add('MYSQL-MINOR')
+        }
+    }
 
     # Veeam proxy / repository - job windows can fall outside a p95 view
     if ((& $hasSvc 'Veeam*')) { $flags.Add('VEEAM'); if ($role -eq 'Generic') { $role = 'BackupInfra' } }
@@ -275,15 +544,22 @@ function Get-ServerRole {
         }
     } catch { }
 
-    [PSCustomObject]@{ Role = $role; Flags = $flags }
+    [PSCustomObject]@{ Role = $role; Flags = $flags; MySql = $mysql }
 }
 
 # Role floors: minimum sensible allocation, independent of measured demand
-$RamFloor  = @{ DomainController = 4; RDSH = 8; FileServer = 8; SQLServer = 8; Exchange = 16; BackupInfra = 8; Generic = 4 }
-$vCpuFloor = @{ DomainController = 2; RDSH = 4; FileServer = 2; SQLServer = 4; Exchange = 4;  BackupInfra = 4; Generic = 2 }
+$RamFloor  = @{ DomainController = 4; RDSH = 8; FileServer = 8; SQLServer = 8; MySQL = 8; Exchange = 16; BackupInfra = 8; Generic = 4 }
+$vCpuFloor = @{ DomainController = 2; RDSH = 4; FileServer = 2; SQLServer = 4; MySQL = 4; Exchange = 4;  BackupInfra = 4; Generic = 2 }
 
-# Roles where guest-side committed bytes does not represent requirement
+# Roles where guest-side committed bytes does not represent requirement.
+# MySQL is deliberately NOT listed: it has its own branch below so that active
+# memory pressure still surfaces as URGENT instead of reading EXCLUDED.
 $RamExcludedRoles = @('SQLServer', 'Exchange', 'BackupInfra')
+
+# Share of allocation an InnoDB buffer pool can reasonably take on a dedicated
+# database host - the figure MySQL 8.0's own innodb_dedicated_server uses above
+# 4GB. A reasoned working figure, same status as the 1.25 / 1.4 / 65% above.
+$InnoDbPoolShare = 0.75
 
 try {
     # =======================================================================
@@ -303,10 +579,6 @@ try {
     $expected  = [int](($WindowDays * 24 * 60) / $Interval)
     $coverage  = if ($expected -gt 0) { [math]::Round(100 * $rows.Count / $expected, 0) } else { 0 }
     $confident = ($coverage -ge 60)
-
-    $roleInfo = Get-ServerRole
-    $role     = $roleInfo.Role
-    $flags    = $roleInfo.Flags
 
     $modeText   = if ($Conservative) { ' | CONSERVATIVE' } else { '' }
     $windowText = '{0}d | {1}/{2} samples | {3}% coverage{4}' -f $WindowDays, $rows.Count, $expected, $coverage, $modeText
@@ -339,6 +611,19 @@ try {
     $availMin     = if ($availVals.Count)  { [math]::Round(($availVals | Measure-Object -Minimum).Minimum, 2) } else { 0 }
     $faultP95     = if ($faultVals.Count)  { [math]::Round((Get-Percentile -Values $faultVals -P 0.95), 1) } else { 0 }
 
+    # Role detection needs the allocation for the MySQL materiality test, so it
+    # runs here rather than before the no-data exit above (which doesn't use it).
+    $roleInfo = Get-ServerRole -AllocatedGB $allocatedGB
+    $role     = $roleInfo.Role
+    $flags    = $roleInfo.Flags
+    $mysql    = $roleInfo.MySql
+
+    $mysqlDetailSuffix = ''
+    if ($mysql) {
+        $bpText = if ($null -ne $mysql.BufferPoolGB) { "$($mysql.BufferPoolGB)GB" } else { "? ($($mysql.BufferPoolSource))" }
+        $mysqlDetailSuffix = " | mysqld $($mysql.PrivateGB)GB, buffer pool $bpText"
+    }
+
     # =======================================================================
     # CPU statistics
     # =======================================================================
@@ -359,16 +644,119 @@ try {
     $effectiveCores = [math]::Round(($cpuTotalP95 / 100) * $vCPU, 2)
 
     # =======================================================================
-    # SQL supplementary
+    # SQL supplementary - attention signals, not sizing
+    #   Built from the counters the sampler already collects (Total/Target
+    #   Server Memory, PLE) plus the registry, so no sampler change and no
+    #   database login. Each finding sets a flag and adds a short reason;
+    #   none of them produces a number, since a SQL host's RAM is excluded
+    #   from commit-based sizing. Findings are listed most actionable first,
+    #   because the growth verdict UDF can only carry the first few.
+    #
+    #   Only one instance's counters are sampled (the first counter set the
+    #   sampler resolves), so on a multi-instance host the figures describe
+    #   one of them - the note says so.
     # =======================================================================
-    $sqlNote = ''
-    $sqlTotalVals = Get-NumericColumn -Rows $rows -Column 'SqlTotalGB'
-    $pleVals      = Get-NumericColumn -Rows $rows -Column 'SqlPLE'
+    $sqlNote       = ''
+    $sqlFindings   = New-Object System.Collections.Generic.List[string]
+    $sqlTotalVals  = Get-NumericColumn -Rows $rows -Column 'SqlTotalGB'
+    $sqlTargetVals = Get-NumericColumn -Rows $rows -Column 'SqlTargetGB'
+    $pleVals       = Get-NumericColumn -Rows $rows -Column 'SqlPLE'
+    # @() around the whole if: an if statement unrolls its output, so a single
+    # instance would otherwise arrive as a bare object with no usable .Count
+    $sqlInstances  = @(if ($flags -contains 'SQL') { Get-SqlInstanceInfo })
+    $allExpress    = ($sqlInstances.Count -gt 0) -and (@($sqlInstances | Where-Object { -not $_.IsExpress }).Count -eq 0)
+
+    # Express caps every database at 10GB of data, and the engine stops
+    # accepting writes at the limit - the one finding here that's an outage
+    # rather than a slowdown, so it goes first. 8GB gives time to act.
+    foreach ($inst in @($sqlInstances | Where-Object { $_.IsExpress -and $null -ne $_.LargestMdfGB -and $_.LargestMdfGB -ge 8 })) {
+        $sqlFindings.Add("Express DB $($inst.LargestMdfGB)GB of 10GB limit ($($inst.Name))")
+        if (-not ($flags -contains 'SQL-EXPRESS-CAP')) { $flags.Add('SQL-EXPRESS-CAP') }
+    }
+
     if ($sqlTotalVals.Count -gt 0) {
         $sqlTotal = [math]::Round((Get-Percentile -Values $sqlTotalVals -P 0.95), 1)
-        $pleMin   = if ($pleVals.Count) { [int](($pleVals | Measure-Object -Minimum).Minimum) } else { -1 }
-        $sqlNote  = "SQL buffer pool p95 ${sqlTotal}GB"
-        if ($pleMin -ge 0) { $sqlNote += ", min PLE ${pleMin}s" }
+
+        # PLE judged against the pool it describes. The old fixed 300s dates
+        # from 4GB servers; 300s per 4GB of buffer pool is the common modern
+        # scaling. p05 rather than the minimum: PLE always dips briefly during
+        # index maintenance, CHECKDB or a restart, so only a low reading for
+        # 5% of the window (~17 hours over 14 days) counts as sustained.
+        $pleP05   = if ($pleVals.Count) { [int](Get-Percentile -Values $pleVals -P 0.05) } else { -1 }
+        $pleFloor = [int][math]::Max(300, 300 * $sqlTotal / 4)
+
+        $sqlNote = "SQL pool p95 ${sqlTotal}GB"
+
+        if ($sqlTargetVals.Count -gt 0) {
+            $targetMax = [math]::Round(($sqlTargetVals | Measure-Object -Maximum).Maximum, 1)
+            $targetP05 = [math]::Round((Get-Percentile -Values $sqlTargetVals -P 0.05), 1)
+            $targetP50 = [math]::Round((Get-Percentile -Values $sqlTargetVals -P 0.50), 1)
+            $sqlNote  += " of target ${targetP50}GB"
+
+            # Is the pool at the size SQL is allowed to grow to? Total below
+            # Target on its own is NOT a shortage - an instance whose data
+            # fits in less than its cap sits below Target indefinitely - so
+            # this only matters combined with low PLE below. Compared per
+            # sample, since Total and Target are read at the same moment.
+            $ratios = New-Object System.Collections.Generic.List[double]
+            foreach ($r in $rows) {
+                $t = 0.0; $g = 0.0
+                if ([double]::TryParse($r.SqlTotalGB, [ref]$t) -and [double]::TryParse($r.SqlTargetGB, [ref]$g) -and $g -gt 0) {
+                    $ratios.Add($t / $g)
+                }
+            }
+            $poolAtTarget = ($ratios.Count -gt 0) -and ((Get-Percentile -Values $ratios.ToArray() -P 0.50) -ge 0.95)
+        } else {
+            $targetMax = $null; $targetP05 = $null; $poolAtTarget = $false
+        }
+
+        if ($pleP05 -ge 0) { $sqlNote += ", PLE p05 ${pleP05}s (floor ${pleFloor}s)" }
+        if ($sqlInstances.Count -gt 1) { $sqlNote += " | $($sqlInstances.Count) instances, one sampled" }
+
+        if ($confident) {
+            # max server memory unset, or set so high the OS is left short.
+            # Target can't be read as the configured value without a login,
+            # but with no cap it climbs to nearly all of physical memory, so a
+            # Target leaving under half the recommended OS reserve is either
+            # unset or set too high - the same fix either way. Half, not the
+            # whole reserve: a cap a few GB above the guidance is common and
+            # usually fine; this is for the clear cases.
+            if ($null -ne $targetMax -and -not $allExpress) {
+                $reserveGB = Get-SqlOsReserveGB -AllocatedGB $allocatedGB
+                if ($targetMax -gt ($allocatedGB - [math]::Max(1, $reserveGB / 2))) {
+                    $capGB = [int]($allocatedGB - $reserveGB)
+                    $sqlFindings.Add("max server memory unset/too high (target ${targetMax}GB of ${allocatedGB}GB) - cap at ${capGB}GB")
+                    $flags.Add('SQL-CAP')
+                }
+            }
+
+            # Memory-bound: the pool is as large as SQL is allowed to make it
+            # and pages still aren't staying in it. More memory (or a higher
+            # cap, or query/index tuning) is the remedy - unless this is
+            # Express, whose ~1.4GB buffer pool cap no amount of RAM lifts.
+            if ($pleP05 -ge 0 -and $pleP05 -lt $pleFloor -and $poolAtTarget) {
+                if ($allExpress) {
+                    $sqlFindings.Add("memory-bound at the Express pool cap (PLE p05 ${pleP05}s) - more RAM won't help")
+                    if (-not ($flags -contains 'SQL-EXPRESS-CAP')) { $flags.Add('SQL-EXPRESS-CAP') }
+                } else {
+                    $sqlFindings.Add("memory-bound: PLE p05 ${pleP05}s < ${pleFloor}s with pool at target")
+                    $flags.Add('SQL-MEM')
+                }
+            }
+
+            # Squeezed: SQL lowers Target when Windows signals low memory, so
+            # a Target that spends real time well below its own peak means
+            # something outside SQL is taking memory from it (or the cap was
+            # lowered mid-window, which reads the same). 1GB minimum so small
+            # Express targets don't trip it on noise.
+            if ($null -ne $targetMax -and $targetP05 -lt ($targetMax * 0.8) -and ($targetMax - $targetP05) -ge 1) {
+                $sqlFindings.Add("target fell to ${targetP05}GB from ${targetMax}GB - OS pressure or a lowered cap")
+                if (-not ($flags -contains 'SQL-MEM')) { $flags.Add('SQL-MEM') }
+            }
+        }
+    }
+    elseif ($flags -contains 'SQL') {
+        $sqlNote = 'SQL counters not sampled'
     }
 
     # =======================================================================
@@ -442,10 +830,85 @@ try {
         $ramVerdict    = "INSUFFICIENT DATA - $coverage% coverage"
         $growthVerdict = "INSUFFICIENT DATA - $coverage% coverage"
     }
+    elseif ($role -eq 'SQLServer') {
+        # Commit reflects the configured cap, not demand, so no number in
+        # either direction - the growth verdict carries the SQL findings
+        # instead. Under memory pressure it still reads URGENT, as MySQL does:
+        # low available memory is real whatever commit says, and on a SQL host
+        # the commonest cause is an unset max server memory, which the
+        # findings name first.
+        $ramVerdict = if ($sqlNote) { "EXCLUDED (SQLServer) | $sqlNote" } else { 'EXCLUDED (SQLServer) - guest commit reflects configured cap, not demand' }
+
+        $prefix = if ($memPressure) { "${tag}URGENT - mem pressure (avail ${availMin}GB, faults ${faultP95}/s): " } else { 'REVIEW - ' }
+
+        # Shares Custom69's 255 characters with 'RAM: ', the CPU growth
+        # verdict and the timestamp (~70 between them in the usual case):
+        # keep whole findings, most actionable first, and point at the flags
+        # for the rest - every finding sets one. Format-VerdictUdf at the
+        # write-back is the backstop if the CPU side runs long.
+        $budget = 180 - $prefix.Length
+        $shown  = New-Object System.Collections.Generic.List[string]
+        foreach ($f in $sqlFindings) {
+            if (((@($shown) + $f) -join '; ').Length -gt $budget -and $shown.Count -gt 0) { break }
+            $shown.Add($f)
+        }
+        $body = $shown -join '; '
+        if ($shown.Count -lt $sqlFindings.Count) { $body += " (+$($sqlFindings.Count - $shown.Count), see flags)" }
+
+        if ($memPressure) {
+            $ramVerdict    = "NO RECLAIM - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s) - see growth verdict"
+            $cause         = if ($body) { $body } else { 'SQL counters show no cause - check other processes' }
+            $growthVerdict = "$prefix$cause"
+            $flags.Add('GROWTH')
+        }
+        elseif ($body) {
+            $growthVerdict = "$prefix$body"
+        }
+        elseif ($sqlTotalVals.Count -gt 0) {
+            $growthVerdict = 'NO CHANGE - SQL counters show no memory concern'
+        }
+        else {
+            $growthVerdict = 'EXCLUDED (SQLServer) - no SQL counters sampled, size from SQL metrics'
+        }
+    }
     elseif ($RamExcludedRoles -contains $role) {
         $ramVerdict = "EXCLUDED ($role) - guest commit reflects configured cap, not demand"
         if ($sqlNote) { $ramVerdict += " | $sqlNote" }
         $growthVerdict = "EXCLUDED ($role) - size from platform-specific metrics, not guest commit"
+    }
+    elseif ($role -eq 'MySQL') {
+        # Commit can't size this host in either direction - it carries the
+        # buffer pool reservation, so commit x multiplier just restates the
+        # configuration (a 24GB host with a 20GB pool reads as needing 30GB+).
+        # But unlike the plain exclusion above, active pressure is still
+        # surfaced as URGENT: low available memory and hard faults are real
+        # whatever commit says. Withhold the GB figure and say instead whether
+        # the configured pool explains the pressure - the fix is often lowering
+        # innodb_buffer_pool_size, not adding RAM.
+        $ramVerdict = 'EXCLUDED (MySQL) - guest commit includes the InnoDB buffer pool reservation, not demand'
+        if ($memPressure) {
+            $ramVerdict = "NO RECLAIM - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s) - see growth verdict"
+            $bpGB = $mysql.BufferPoolGB
+            $advice = if ($null -eq $bpGB) {
+                "buffer pool unresolved ($($mysql.BufferPoolSource)) - check it before resizing"
+            } elseif ($bpGB -gt ($allocatedGB * $InnoDbPoolShare)) {
+                $bpPct  = [math]::Round(100 * $bpGB / $allocatedGB, 0)
+                $safeGB = [math]::Floor($allocatedGB * $InnoDbPoolShare)
+                $needGB = Get-CeilEven -Value ($bpGB / $InnoDbPoolShare)
+                "buffer pool ${bpGB}GB is ${bpPct}% of ${allocatedGB}GB - lower it to ${safeGB}GB or grow RAM to ${needGB}GB"
+            } else {
+                $bpPct = [math]::Round(100 * $bpGB / $allocatedGB, 0)
+                "buffer pool ${bpGB}GB (${bpPct}%) isn't the cause - check connection buffers, other processes"
+            }
+            # Kept short: this shares Custom69's 255 characters with the CPU
+            # growth verdict and the timestamp.
+            $growthVerdict = "${tag}URGENT - mem pressure (min avail ${availMin}GB, faults ${faultP95}/s), unsized - commit holds the buffer pool: $advice"
+            # GROWTH with Growth GB left at 000 - same convention as the
+            # CPU-GROWTH queue REVIEW case, so a flag-based worklist catches it.
+            $flags.Add('GROWTH')
+        } else {
+            $growthVerdict = 'EXCLUDED (MySQL) - size from InnoDB metrics, not guest commit'
+        }
     }
     elseif ($ditUnknown) {
         # Same "suppress rather than degrade" philosophy as every other
@@ -610,14 +1073,31 @@ try {
         }
 
         $sized = Get-CeilEven -Value ($cpuBasis / $headroom)
+        # The role floor applies before deciding there's a reduction at all -
+        # applied afterwards, a floor at or above current vCPU produced
+        # "REDUCE to 4 vCPU" on a 4 vCPU host, or a "reduction" upwards on a
+        # 2 vCPU host whose role floor is 4.
+        $floored = [math]::Max($cpuFloor, $sized)
 
         # --- Reduction side --------------------------------------------------
         if ($cpuPressure) {
             $cpuVerdict = "NO REDUCTION - CPU pressure (p95 ${cpuTotalP95}%, p95 queue ${queueP95})"
             if ($sized -gt $vCPU) { $cpuVerdict += ' - see growth verdict' }
         }
-        elseif ($sized -lt $vCPU) {
-            $recVcpu = [math]::Max($cpuFloor, $sized)
+        elseif ($sized -lt $vCPU -and $floored -ge $vCPU) {
+            $cpuVerdict = "NO CHANGE - demand sizes to $sized but $role floor is $cpuFloor vCPU"
+        }
+        elseif ($memPressure -and $floored -lt $vCPU) {
+            # A host short of memory spends its time waiting on paging I/O, and
+            # waiting isn't CPU time - so utilisation measured under pressure
+            # understates what the workload will use once memory is fixed.
+            # Holding vCPU costs nothing; cutting it on depressed figures and
+            # then fixing memory leaves the host CPU-starved. Reduction only:
+            # growth below is unaffected, since pressure can't inflate demand.
+            $cpuVerdict = "NO REDUCTION - memory pressure, CPU measured while paging understates demand (would size to $floored); resolve memory first"
+        }
+        elseif ($floored -lt $vCPU) {
+            $recVcpu = $floored
             if ($Conservative -and $recVcpu -gt ($vCPU * 0.5)) {
                 $recVcpu    = $vCPU
                 $cpuVerdict = "${tag}NO CHANGE - reduction under half, defer to full window"
@@ -672,13 +1152,13 @@ try {
     # UDF write-back
     # =======================================================================
     $ramDetail = ('Alloc {0}GB | Commit p50 {1} p95 {2} max {3}GB | MinAvail {4}GB | Faults p95 {5}/s' -f `
-                 $allocatedGB, $commitP50, $commitP95, $commitMax, $availMin, $faultP95) + $dcDetailSuffix
+                 $allocatedGB, $commitP50, $commitP95, $commitMax, $availMin, $faultP95) + $dcDetailSuffix + $mysqlDetailSuffix
 
     $cpuDetail = '{0} vCPU | Total p50 {1}% p95 {2}% max {3}% | MaxCore p95 {4}% | Queue p95 {5} max {6}' -f `
                  $vCPU, $cpuTotalP50, $cpuTotalP95, $cpuTotalMax, $maxCoreP95, $queueP95, $queueMax
 
     $flagText = if ($flags.Count) { "$role | " + ($flags -join ',') } else { $role }
-    $summary  = 'RAM: {0} || CPU: {1} || {2}' -f $ramVerdict, $cpuVerdict, (Get-Date -Format 'dd/MM/yyyy HH:mm')
+    $summary  = Format-VerdictUdf -Ram $ramVerdict -Cpu $cpuVerdict
 
     Set-Udf -Index ($UdfBase + 0) -Value $windowText
     Set-Udf -Index ($UdfBase + 1) -Value $ramDetail
@@ -689,7 +1169,7 @@ try {
     Set-Udf -Index ($UdfBase + 6) -Value $summary
     Set-Udf -Index ($UdfBase + 7) -Value ('{0:D3}' -f $growthGB)    # zero-padded, same reason
     Set-Udf -Index ($UdfBase + 8) -Value ('{0:D2}' -f $vcpuGrowth)  # zero-padded, same reason
-    Set-Udf -Index ($UdfBase + 9) -Value ('RAM: {0} || CPU: {1} || {2}' -f $growthVerdict, $cpuGrowthVerdict, (Get-Date -Format 'dd/MM/yyyy HH:mm'))
+    Set-Udf -Index ($UdfBase + 9) -Value (Format-VerdictUdf -Ram $growthVerdict -Cpu $cpuGrowthVerdict)
 
     # =======================================================================
     # Optional per-device CSV row for estate-wide aggregation
@@ -733,6 +1213,10 @@ try {
                 VcpuGrowth      = $vcpuGrowth
                 CpuGrowthVerdict = $cpuGrowthVerdict
                 SqlNote         = $sqlNote
+                SqlFindings     = ($sqlFindings -join '; ')
+                SqlEditions     = (($sqlInstances | ForEach-Object { '{0}={1}' -f $_.Name, $_.Edition }) -join '; ')
+                MySqlPrivateGB  = $(if ($mysql) { $mysql.PrivateGB } else { $null })
+                InnoDbPoolGB    = $(if ($mysql) { $mysql.BufferPoolGB } else { $null })
             } | Export-Csv -LiteralPath $rowFile -NoTypeInformation -Encoding UTF8 -Force
             Write-Output "Exported device row to $rowFile"
         } catch {
@@ -752,6 +1236,11 @@ try {
     Write-Output "Memory verdict  : $ramVerdict"
     Write-Output "Memory growth   : $growthVerdict"
     if ($sqlNote) { Write-Output "SQL             : $sqlNote" }
+    foreach ($inst in $sqlInstances) {
+        $mdfText = if ($null -ne $inst.LargestMdfGB) { ", largest data file $($inst.LargestMdfGB)GB" } else { '' }
+        Write-Output "SQL instance    : $($inst.Name) - $($inst.Edition)$mdfText"
+    }
+    foreach ($f in $sqlFindings) { Write-Output "SQL finding     : $f" }
     Write-Output ''
     Write-Output "CPU             : $cpuDetail"
     Write-Output "Effective cores : $effectiveCores of $vCPU allocated"

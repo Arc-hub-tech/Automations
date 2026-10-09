@@ -48,6 +48,13 @@
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
 
+    Version : 1.9  -  09/10/2026  (MySQL/MariaDB role, kept in step with Component 2:
+              detected by service binary, excluded from reclaim where mysqld holds >=2GB
+              and >=25% of allocation - InnoDB commits its whole buffer pool up front, so
+              commit restates the configuration rather than the demand. Verdicts cite
+              mysqld's footprint and the configured innodb_buffer_pool_size; UPSIZE on a
+              MySQL host points at the buffer pool before RAM)
+
     Version : 1.8  -  19/08/2026  (the commit ratio no longer triggers UPSIZE on its own -
               at 100% it still flagged a 96GB host holding 30% of its memory available, plus
               three session hosts at 23-30%. Commit charge routinely exceeds RAM on RDSH.
@@ -132,9 +139,159 @@ function Set-Udf {
 
 function Get-Floor2 { param([double]$Value) [int]([math]::Floor($Value / 2) * 2) }
 
-# Role floors and exclusions kept identical to Component 2 so the two agree
-$RamFloor         = @{ DomainController = 4; RDSH = 8; FileServer = 8; SQLServer = 8; Exchange = 16; BackupInfra = 8; Generic = 4 }
-$RamExcludedRoles = @('SQLServer', 'Exchange', 'BackupInfra')
+# --- MySQL / MariaDB helpers -------------------------------------------------
+# Kept identical in Get-ArcCapacityScreen.ps1 - change both together.
+#
+# InnoDB commits its whole buffer pool up front on Windows, so on a MySQL host
+# guest committed bytes tracks the configured innodb_buffer_pool_size, not the
+# requirement - the same distortion that excludes SQL Server, but read from an
+# option file rather than a perf counter (MySQL publishes none). Read-only and
+# credential-free: the configured value is what matters here, and nothing in
+# this public repo may carry a database login.
+function ConvertFrom-MySqlSize {
+    param([string]$Value)
+    if ($Value -match '^(\d+(?:\.\d+)?)\s*([KMGT]?)B?$') {
+        $mult = switch ($Matches[2].ToUpper()) { 'K' { 1KB } 'M' { 1MB } 'G' { 1GB } 'T' { 1TB } default { 1 } }
+        return [math]::Round(([double]$Matches[1] * $mult) / 1GB, 2)
+    }
+    $null
+}
+
+# Server-section options from one option file, keys normalised the way mysqld
+# reads them (dash and underscore interchangeable, 'loose-' prefix ignored).
+# !include / !includedir are not followed - a value set only in an included
+# file reads as the built-in default, which errs toward "buffer pool smaller
+# than it is" and so never inflates a recommendation.
+function Read-MySqlOptionFile {
+    param([string]$Path)
+    $opts = @{}
+    $inServer = $false
+    foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        $t = $line.Trim()
+        if ($t -eq '' -or $t.StartsWith('#') -or $t.StartsWith(';')) { continue }
+        if ($t -match '^\[(.+)\]$') {
+            $inServer = ($Matches[1].Trim() -match '^(mysqld|server|mariadb|mariadbd)(-[\d.]+)?$')
+            continue
+        }
+        if (-not $inServer) { continue }
+        if ($t -match '^([A-Za-z0-9_-]+)\s*(?:=\s*(.*))?$') {
+            $key = $Matches[1].ToLower().Replace('-', '_') -replace '^loose_', ''
+            $val = if ($null -ne $Matches[2]) { ($Matches[2] -replace '\s+#.*$', '').Trim().Trim('"', "'") } else { 'ON' }
+            $opts[$key] = $val
+        }
+    }
+    $opts
+}
+
+# Configured innodb_buffer_pool_size for one service, from the same files
+# mysqld itself would read: --defaults-file if the service command line names
+# one, otherwise the standard Windows search order (later files override).
+# A MySQL 8 'SET PERSIST' in <datadir>\mysqld-auto.cnf overrides both. Returns
+# GB = $null with a Source explaining why whenever the value can't be trusted -
+# never a guess.
+function Get-InnoDbBufferPool {
+    param([string]$PathName)
+    try {
+        $exe = if ($PathName -match '^\s*"([^"]+)"') { $Matches[1] } elseif ($PathName -match '^\s*(\S+)') { $Matches[1] } else { '' }
+        $baseDir = if ($exe) { Split-Path -Path (Split-Path -Path $exe -Parent) -Parent } else { '' }
+
+        $files = @()
+        if ($PathName -match '--defaults-file=\s*"?([^"]+?\.(?:ini|cnf))') {
+            $files = @($Matches[1])
+        } elseif ($PathName -match '--defaults-file') {
+            # Named but not in a shape parsed above - mysqld then reads ONLY that
+            # file, so falling back to the search order would read the wrong ones
+            return [PSCustomObject]@{ GB = $null; Source = 'defaults-file not parsed' }
+        } else {
+            $files = @("$env:WINDIR\my.ini", "$env:WINDIR\my.cnf", 'C:\my.ini', 'C:\my.cnf')
+            if ($baseDir) { $files += @("$baseDir\my.ini", "$baseDir\my.cnf") }
+        }
+
+        $opts = @{}
+        $read = @()
+        foreach ($f in $files) {
+            if (Test-Path -LiteralPath $f) {
+                $o = Read-MySqlOptionFile -Path $f
+                foreach ($k in $o.Keys) { $opts[$k] = $o[$k] }
+                $read += (Split-Path -Path $f -Leaf)
+            }
+        }
+        if ($read.Count -eq 0) { return [PSCustomObject]@{ GB = $null; Source = 'no option file found' } }
+
+        $dataDir = if ($opts.ContainsKey('datadir')) { $opts['datadir'] } elseif ($baseDir) { "$baseDir\data" } else { '' }
+        if ($dataDir) {
+            $auto = Join-Path $dataDir 'mysqld-auto.cnf'
+            if (Test-Path -LiteralPath $auto) {
+                $persisted = Get-Content -LiteralPath $auto -Raw | ConvertFrom-Json
+                $p = $persisted.mysql_server.innodb_buffer_pool_size
+                if ($p -and $null -ne $p.Value) {
+                    $gb = ConvertFrom-MySqlSize -Value ([string]$p.Value)
+                    if ($null -ne $gb) { return [PSCustomObject]@{ GB = $gb; Source = 'mysqld-auto.cnf' } }
+                }
+            }
+        }
+
+        if ($opts.ContainsKey('innodb_buffer_pool_size')) {
+            $gb = ConvertFrom-MySqlSize -Value $opts['innodb_buffer_pool_size']
+            if ($null -eq $gb) { return [PSCustomObject]@{ GB = $null; Source = 'unparseable' } }
+            return [PSCustomObject]@{ GB = $gb; Source = ($read -join '+') }
+        }
+        # innodb_dedicated_server sizes the pool from RAM at startup, by a rule
+        # that differs between MySQL releases - report it rather than guess.
+        if ($opts.ContainsKey('innodb_dedicated_server') -and $opts['innodb_dedicated_server'] -match '^(ON|1|TRUE)$') {
+            return [PSCustomObject]@{ GB = $null; Source = 'innodb_dedicated_server' }
+        }
+        [PSCustomObject]@{ GB = (ConvertFrom-MySqlSize -Value '128M'); Source = 'default 128M' }
+    } catch {
+        [PSCustomObject]@{ GB = $null; Source = 'unreadable' }
+    }
+}
+
+# Detected by the service BINARY, not the service name - names vary (MySQL,
+# MySQL80, MariaDB, wampmysqld64...) where the binary doesn't. Returns $null
+# when no MySQL/MariaDB service exists. PrivateGB is mysqld's private bytes:
+# its share of the commit figure, which is exactly the thing in question.
+function Get-MySqlInfo {
+    $svcs = @()
+    try {
+        $svcs = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop `
+                  -Filter "PathName LIKE '%mysqld%' OR PathName LIKE '%mariadbd%'")
+    } catch { }
+    if ($svcs.Count -eq 0) { return $null }
+
+    $privateGB = 0.0
+    try {
+        $procs = @(Get-Process -Name 'mysqld', 'mariadbd' -ErrorAction SilentlyContinue)
+        if ($procs.Count -gt 0) {
+            $privateGB = [math]::Round((($procs | Measure-Object -Property PrivateMemorySize64 -Sum).Sum) / 1GB, 2)
+        }
+    } catch { }
+
+    # Sum across running instances; any unresolved instance makes the total
+    # unresolved rather than silently under-reporting it.
+    $running = @($svcs | Where-Object { $_.State -eq 'Running' })
+    if ($running.Count -eq 0) { $running = @($svcs) }
+    $bpGB    = 0.0
+    $sources = @()
+    foreach ($s in $running) {
+        $bp = Get-InnoDbBufferPool -PathName $s.PathName
+        $sources += $bp.Source
+        if ($null -eq $bp.GB) { $bpGB = $null } elseif ($null -ne $bpGB) { $bpGB += $bp.GB }
+    }
+
+    [PSCustomObject]@{
+        Engine           = $(if (@($svcs | Where-Object { $_.PathName -match 'mariadb' }).Count -gt 0) { 'MariaDB' } else { 'MySQL' })
+        PrivateGB        = $privateGB
+        BufferPoolGB     = $(if ($null -ne $bpGB) { [math]::Round($bpGB, 2) } else { $null })
+        BufferPoolSource = (($sources | Select-Object -Unique) -join ', ')
+    }
+}
+
+# Role floors and exclusions kept identical to Component 2 so the two agree.
+# MySQL is listed as excluded here but handled in its own branch there - the
+# outcome matches, since UPSIZE below already outranks every exclusion.
+$RamFloor         = @{ DomainController = 4; RDSH = 8; FileServer = 8; SQLServer = 8; MySQL = 8; Exchange = 16; BackupInfra = 8; Generic = 4 }
+$RamExcludedRoles = @('SQLServer', 'MySQL', 'Exchange', 'BackupInfra')
 
 function Get-ServerRole {
     param([double]$AllocatedGB = 0)
@@ -201,6 +358,22 @@ function Get-ServerRole {
             $flags.Add('SQL')
         } else {
             $flags.Add('SQL-MINOR')
+        }
+    }
+
+    # MySQL / MariaDB - the same materiality bar as SQL above, measured on
+    # private bytes rather than working set: InnoDB commits its whole buffer
+    # pool at startup, so private bytes is mysqld's actual share of the commit
+    # figure this screen sizes from, however little of the pool is touched yet.
+    $mysql = Get-MySqlInfo
+    if ($mysql) {
+        $mysqlIsMaterial = ($mysql.PrivateGB -ge 2) -and
+                           (($AllocatedGB -le 0) -or ($mysql.PrivateGB -ge ($AllocatedGB * 0.25)))
+        if ($mysqlIsMaterial) {
+            if ($role -eq 'Generic') { $role = 'MySQL' }
+            $flags.Add('MYSQL')
+        } else {
+            $flags.Add('MYSQL-MINOR')
         }
     }
     # Veeam: distinguish backup INFRASTRUCTURE from a backup TARGET.
@@ -282,7 +455,7 @@ function Get-ServerRole {
     # a Datto device filter.
     if ($svc.ContainsKey('vmms')) { $role = 'Hypervisor'; $flags.Add('HYPER-V') }
 
-    [PSCustomObject]@{ Role = $role; Flags = $flags; SqlWsGB = $sqlWsGB }
+    [PSCustomObject]@{ Role = $role; Flags = $flags; SqlWsGB = $sqlWsGB; MySql = $mysql }
 }
 
 try {
@@ -301,6 +474,11 @@ try {
     $role     = $roleInfo.Role
     $flags    = $roleInfo.Flags
     $sqlWsGB  = $roleInfo.SqlWsGB
+    $mysql    = $roleInfo.MySql
+    $mysqlDetail = if ($mysql) {
+        $bpText = if ($null -ne $mysql.BufferPoolGB) { "$($mysql.BufferPoolGB)GB" } else { "? ($($mysql.BufferPoolSource))" }
+        "mysqld $($mysql.PrivateGB)GB, buffer pool $bpText"
+    } else { '' }
 
     # -----------------------------------------------------------------------
     # Current memory position
@@ -434,7 +612,12 @@ try {
     if ($overCommitted) {
         $flags.Add('UPSIZE')
         $pctOfAlloc  = if ($allocatedGB -gt 0) { [math]::Round(100 * $committedGB / $allocatedGB, 0) } else { 0 }
-        $roleContext = if ($RamExcludedRoles -contains $role) { " | $role - confirm against the platform-specific metrics" } else { '' }
+        $roleContext = if ($role -eq 'MySQL') {
+            # An over-sized buffer pool is a common cause on these hosts, and
+            # the fix is then lowering it rather than adding RAM. Kept short:
+            # Custom73 also carries the flags and timestamp within 255 chars.
+            " | MySQL ($mysqlDetail) - check pool first"
+        } elseif ($RamExcludedRoles -contains $role) { " | $role - confirm against the platform-specific metrics" } else { '' }
 
         # Name what actually fired. The two triggers mean different things to
         # whoever reads the UDF - "the OS is out of memory now" versus
@@ -476,6 +659,8 @@ try {
         # same principle as the DIT-derived floor detail in Component 2.
         $exclDetail = if ($role -eq 'SQLServer' -and $null -ne $sqlWsGB -and $sqlWsGB -gt 0) {
             " (sqlservr holding ${sqlWsGB}GB)"
+        } elseif ($role -eq 'MySQL') {
+            " ($mysqlDetail)"
         } else { '' }
         $verdict = "EXCLUDED ($role)$exclDetail - size from the platform-specific metrics, not guest commit"
     }
@@ -572,6 +757,8 @@ try {
                 ScreenReclaim = $reclaimGB
                 OverCommitted = $(if ($overCommitted) { 1 } else { 0 })
                 SqlWsGB       = $sqlWsGB
+                MySqlPrivateGB = $(if ($mysql) { $mysql.PrivateGB } else { $null })
+                InnoDbPoolGB  = $(if ($mysql) { $mysql.BufferPoolGB } else { $null })
                 Verdict       = $verdict
                 vCPU          = $vCPU
                 AvgCpuPct     = $avgCpuPct

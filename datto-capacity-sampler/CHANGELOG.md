@@ -8,7 +8,201 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Added
+- **Cap-or-RAM decision for SQL hosts under memory pressure** (`Read-ArcCapacityBuffer.ps1` v1.13).
+  SQL hosts under pressure read `URGENT ... unsized`, which said "act" but not "do what". The first
+  real two-instance pilot host showed why that matters. It looked like an over-cap problem, but the
+  Screen's process list showed one busy instance and about 5–6GB committed by everything else on
+  12GB: capping SQL would have starved it. The answer was RAM.
+  - **The split:** every sample already records both total committed memory and the sampled
+    instance's Total Server Memory, so their difference measures everything else over the window.
+  - **Cap verdict:** when SQL's measured pool fits beside that remainder plus headroom (8%,
+    minimum 1.5GB) but the instance is allowed past it, the verdict is `cap <instance> max server
+    memory at N GB` (`SQL-CAP`, no `GROWTH`).
+  - **RAM verdict:** otherwise it's `RAM short: ... -> +X GB -> N GB, cap <instance> at M GB`. This
+    is the first SQL case that fills `Cap: Growth GB`, from SQL's own counters rather than inflated
+    total commit.
+  - **Instance name:** the sampled instance is named from the sampler's counter cache.
+  - **Withheld when commit falls below SQL's own memory** (locked pages), rather than built on a
+    remainder of nothing.
+  - **Low PLE is stated, not added to the number.** A ×1.25 uplift was tried and asked a 128GB host
+    for +62GB.
+  - **Healthy hosts are untouched:** applied only on SQL hosts under `MEM-PRESSURE`. Elsewhere it's
+    printed as "not applied".
+
+  Replayed: the pilot host as measured gives `+4GB -> 16GB, cap MSSQLSERVER at 7.4GB`; a cap-fixable
+  host gives `cap SAGE max server memory at 21.5GB`; locked-pages shapes give no split.
+
 ### Fixed
+- **`[math]::Max(0, x)` and similar silently rounded decimals to whole numbers**
+  (`Read-ArcCapacityBuffer.ps1` v1.13, `Get-ArcCapacityScreen.ps1` v1.13). With an integer literal
+  first, PowerShell binds the `Max(int, int)` overload, so `Max(0, 3.4)` is 3. Affected:
+  - the SQL half-reserve bars
+  - the conservative-mode reclaim minimum (`Max(8, alloc × 0.4)`: 12.8GB read as 13GB)
+  - the Screen's `HV-MEM` threshold (6.4GB read as 6GB)
+  
+  All now use decimal literals. Found while testing the cap-or-RAM split, where "everything else"
+  read 3GB instead of 3.4GB.
+- **Multi-instance SQL hosts couldn't raise `SQL-CAP`** (`Read-ArcCapacityBuffer.ps1` v1.12).
+  Found on the first real two-instance pilot host: two Standard instances on 12GB, 0.72GB free,
+  179 hard faults/s. It read only as "target fell to 6.4GB from 9.6GB - OS pressure or a lowered
+  cap". The counters cover one instance, so caps that are each reasonable but together exceed the
+  host were invisible, and the squeeze finding named the wrong suspects.
+  - **New `SQL-CAP` trigger:** on hosts running more than one instance, the combined live footprint
+    of every `sqlservr` process is compared with the allocation, using the same half-reserve bar as
+    the single-instance check. That gives `2 instances hold 10.8GB of 12GB - combined caps too
+    high, total at 8GB`.
+  - **The squeeze finding** names "another SQL instance" first on those hosts.
+  - **The live footprint** is now the larger of private bytes and working set per process. Working
+    set alone understates a host that's paging.
+  - **The CSV export** gains `SqlRunning` and `SqlLiveGB`.
+
+  Replayed against synthetic buffers: the two-instance host now leads with the combined finding,
+  two instances with room spare raise nothing, and a single-instance squeeze keeps its original
+  wording.
+- **Every Hyper-V host read `HV-PARTIAL`** (`Get-ArcCapacityScreen.ps1` v1.12). Found on the
+  first real cluster-node pilot, a Windows Server 2025 node with 2 running VMs. The explicit
+  Recovery checkpoint query raises an *error* for a VM that has no Recovery checkpoints, rather
+  than returning nothing. The check treated any error as "can't list them", so it skipped the
+  orphaned-`.avhdx` test on effectively every host. The stand-ins had returned an empty list, so
+  testing hadn't caught it. Now:
+  - `-SnapshotType` support is checked once, up front, instead of being inferred from an error.
+  - Errors are collected without stopping. ObjectNotFound, or Hyper-V's own "unable to find"
+    wording, means the VM has none.
+  - Anything else still skips the orphan test, and reports its exact text and category in the job
+    output. The match is deliberately narrow: a loose "not found" would read a genuine failure as
+    "no checkpoints" and let a VM mid-backup through as a failed merge.
+
+### Added
+- **Hyper-V pilot diagnostics** (`Get-ArcCapacityScreen.ps1` v1.12). The first real run on a
+  cluster node, via Datto as SYSTEM, worked with no `HV error` lines. That run confirmed the
+  module loads, `Get-VMHost` returns hypervisor-level figures (767.7GB, 72 LP), and cluster
+  detection works. But the output couldn't show whether that node owned the core cluster group, so
+  "no cluster findings" could mean either "checked and healthy" or "skipped here". The `Cluster :`
+  line now says which, and a new `HV checks :` line says whether the checks ran in-process or via
+  the 64-bit relaunch.
+- **Hyper-V host health checks in the Screen** (`Get-ArcCapacityScreen.ps1` v1.11). Hypervisors
+  used to get only `NO SCREEN`. Now they get point-in-time checks for what takes hosts down, read as
+  SYSTEM from the Hyper-V and FailoverClusters modules (no history, no login, nothing changed):
+  - `HV-CRITICAL`: a VM in a critical state.
+  - `HV-MEM`: host free memory under 5% of capacity (minimum 2GB).
+  - `HV-STORAGE`: a VM volume or CSV under 12% free.
+  - `HV-CHECKPOINT`: a standard checkpoint over 3 days old, a Recovery checkpoint over 1 day old
+    (a stuck backup), or a VM running on an `.avhdx` with no checkpoint (a failed merge).
+  - `HV-REPLICA`: replication Critical or Warning.
+  - `HV-GUEST`: a lost heartbeat.
+  - `HV-CPU-RATIO`: running vCPU above 4:1 logical processors.
+  - `HV-CLUSTER`: a node not Up, or a CSV in redirected I/O.
+
+  Noise controls, given UPSIZE's history:
+  - Replica VMs are excluded from the checkpoint checks.
+  - Thin provisioning alone doesn't flag; it's only mentioned on a volume that's already low.
+  - NoContact heartbeats count only after an hour of uptime with the heartbeat service enabled.
+  - Cluster-wide findings come from the core cluster group owner only.
+  - CSV redirection by design (ReFS/S2D, tiering, Storage Replica) is ignored.
+  - `HV-MEM`'s 5% is capped between 2GB and 8GB, so large packed hosts don't flag.
+  - On a hypervisor, `UPSIZE` is raised only on the absolute under-1GB trigger, never the
+    root-partition commit ratio.
+  - If Recovery checkpoints can't be listed, the orphaned-`.avhdx` test is skipped rather than
+    guessed.
+
+  Each check runs in its own try/catch. A failed check is listed and flags `HV-PARTIAL`, and checks
+  that couldn't run at all flag `HV-NO-DATA`, so "no findings" never stands in for "couldn't look".
+  The checks re-run in 64-bit PowerShell when Datto's process is 32-bit, since the Hyper-V module
+  only loads in 64-bit. No new UDFs or `ScreenStatus` values: the four Screen UDFs carry host
+  content on hypervisors, and `ScreenHvFindings` is a new result field the stub ignores. The CSV
+  export gains `Hv*` columns, including `HvCluster` for an estate-level N+1 rollup.
+
+  Tested with stub cmdlets across twelve scenarios plus a real 32-bit → 64-bit relaunch: a healthy
+  thin-provisioned host, PausedCritical, stale and orphaned checkpoints, replica VMs (must not flag),
+  memory/replication/heartbeat/ratio, a throwing cmdlet, cluster owner vs non-owner, module missing,
+  a worst case kept within 255 characters, ReFS by-design redirection, and an unsupported Recovery
+  query. **Not yet run on a real Hyper-V host.** In
+  particular, whether `Get-VMSnapshot` lists Recovery checkpoints by default varies, so it's queried
+  explicitly.
+
+### Fixed
+- **Component 2's role detection had fallen behind the Screen's fixes** (`Read-ArcCapacityBuffer.ps1`
+  v1.11, `Get-ArcCapacityScreen.ps1` v1.10). The Screen's header claims its roles are "kept identical
+  to Component 2", but its v1.4–v1.8 fixes were never carried across, so the 14-day analysis still
+  made the same mistakes:
+  - **SQL was excluded on mere presence.** That caught RD gateways, VPN hosts and file servers
+    carrying a bundled Express or Veeam instance, and discarded their reclaim. SQL now has to be
+    material (at least 2GB and at least 25% of allocation), otherwise the host is flagged
+    `SQL-MINOR` and sized normally. The footprint is the larger of the sampled p95 Total Server
+    Memory and the live `sqlservr` working set: the sampler reads one instance, the live figure
+    covers them all. The SQL attention checks still run on `SQL-MINOR` hosts, so an Express
+    database near its limit appears as `| SQL: ...` in `Cap: Growth Verdict`.
+  - **Any `Veeam*` service meant backup infrastructure**, including the installer and agent on
+    every protected server. Now only data-mover and control services; others get `VEEAM-MINOR`.
+  - **No Hyper-V guard.** Cluster nodes were sized from guest-side figures and flagged
+    `CPU-PRESSURE`. Hosts running `vmms` now get `NO SIZING` for RAM and vCPU and no CPU flags,
+    overriding every other role. The Screen also stops raising CPU flags on them.
+  - **Exchange and Veeam infrastructure hid memory pressure behind `EXCLUDED`.** They now read
+    `URGENT` (unsized, `GROWTH` flag), as SQL, MySQL and Hyper-V hosts do.
+
+  Tested with injected service lists across eight scenarios: a bundled-Express RD gateway, a
+  material SQL host, a Veeam-agent file server, a Veeam proxy under pressure, a Hyper-V node with
+  Veeam services at 80% CPU, a Hyper-V node under pressure, and Exchange with and without pressure.
+
+### Added
+- **SQL Server attention signals** (`Read-ArcCapacityBuffer.ps1` v1.10). SQL hosts were excluded
+  from RAM sizing with nothing else to say. `SqlTargetGB` was sampled but never read, and PLE was
+  reported as a raw minimum against no threshold. The new checks use only counters already in
+  the buffer plus the registry: no sampler change, so no buffer reset, and no database login.
+  Three flags, each with a short reason in `Cap: Growth Verdict`:
+  - `SQL-CAP`: the peak Target leaves the OS under half of Kehayias's recommended reserve, so
+    `max server memory` is unset or set too high. The verdict gives the cap to set.
+  - `SQL-MEM`: either PLE p05 is under 300s per 4GB of buffer pool while the pool sits at Target,
+    or Target p05 is under 80% of its peak (SQL squeezed by memory pressure from outside it).
+  - `SQL-EXPRESS-CAP`: an Express database is at 8GB or more of its 10GB limit, or a host with
+    only Express instances is memory-bound at the ~1.4GB pool cap, where RAM won't help.
+
+  A SQL host under `MEM-PRESSURE` now reads `URGENT` with the likeliest cause first, rather than
+  `EXCLUDED`. That was the same pressure-hiding gap MySQL had; Exchange and Veeam still have it.
+  The CSV export gains `SqlFindings` and `SqlEditions`. Instances are read through the 64-bit
+  registry view so a 32-bit host process can't miss them. Tested against six synthetic buffers
+  (cap unset under pressure, healthy capped, Express at cap with a DB near the limit, squeezed
+  Target, no counters sampled, a worst case with two instances) and a fake registry tree.
+- **The verdict UDFs now trim the RAM text instead of the end** (`Read-ArcCapacityBuffer.ps1`
+  v1.10). `Cap: Verdict` and `Cap: Growth Verdict` are `RAM || CPU || timestamp`. The plain
+  255-character cut took the timestamp and CPU verdict first, and the timestamp is how a stale
+  UDF gets spotted.
+- **MySQL / MariaDB role** (`Read-ArcCapacityBuffer.ps1` v1.9, `Get-ArcCapacityScreen.ps1` v1.9).
+  A 24GB, 4 vCPU MySQL host was read as `Generic`. It got `URGENT +32GB -> 56GB` and a vCPU cut
+  to 2. The +32GB is just commit max 44.4GB × 1.25. On Windows, InnoDB commits its whole buffer
+  pool at startup, so commit on a MySQL host restates the configured `innodb_buffer_pool_size`
+  rather than the demand. A pool sized beyond what the allocation can hold also produces exactly
+  this pattern, and then the fix is lowering the pool, not adding 32GB.
+  - **Detection** is by service binary (`mysqld` / `mariadbd`), since service names vary. A host
+    counts as MySQL only when mysqld's private bytes reach at least 2GB and at least 25% of
+    allocation, the same bar the Screen applies to SQL Server. Otherwise it's flagged
+    `MYSQL-MINOR` and sized normally.
+  - **Floors** are 8GB / 4 vCPU, matching SQL Server.
+  - **RAM** is excluded from commit-based sizing in both directions.
+  - **Under `MEM-PRESSURE`**, Component 2 still reports `URGENT` and flags `GROWTH`, with
+    `Cap: Growth GB` left at `000` (the same convention as the `CPU-GROWTH` queue REVIEW case).
+    Instead of a GB figure it cites the configured buffer pool: over 75% of allocation reads
+    "lower it to N GB or grow RAM to M GB", and under 75% reads "isn't the cause". The pool is
+    read credential-free from the option files mysqld reads: `--defaults-file`, the Windows
+    search order, and a `SET PERSIST` in `mysqld-auto.cnf`. A pool sized by
+    `innodb_dedicated_server` is reported as unresolved, never guessed.
+  - `Cap: RAM Detail` and both CSV exports gain mysqld's footprint and the configured pool.
+  - **`Arc-CapacitySampler.ps1` is deliberately unchanged.** A new buffer column would change the
+    header, which archives `samples.csv` and resets every device's 14-day window. All MySQL facts
+    are read at analysis time.
+
+### Fixed
+- **vCPU reduction was offered while the host was under memory pressure** (`Read-ArcCapacityBuffer.ps1`
+  v1.9). The same 24GB host was paging hard (0.1GB min available, 66 faults/s) and was recommended
+  4 → 2 vCPU on p95 17%, with a 67% peak that 2 vCPU couldn't carry. Waiting on paging I/O isn't CPU
+  time, so utilisation measured under pressure understates demand once memory is fixed. Reduction
+  is now held under `MEM-PRESSURE` (`NO REDUCTION - memory pressure ... resolve memory first`).
+  Growth is unaffected.
+- **The vCPU role floor was applied after deciding a reduction existed** (`Read-ArcCapacityBuffer.ps1`
+  v1.9). A host at or below its floor could read `REDUCE to 4 vCPU` on 4 vCPU, or a "reduction"
+  upwards on a 2 vCPU host with a floor of 4. The floor is now applied first, and such hosts read
+  `NO CHANGE - demand sizes to N but <role> floor is M vCPU`.
 - **The commit ratio still triggered `UPSIZE` on its own, and still produced false positives**
   (`Get-ArcCapacityScreen.ps1` v1.8). Raising the ratio from 90% to 100% in v1.6 fixed the reported
   case but not the class: on a 155-device run the same 96GB host reappeared at 108% commit while

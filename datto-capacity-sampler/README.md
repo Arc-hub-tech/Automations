@@ -170,8 +170,18 @@ tool won't tell you that's why.
 ### Guardrails — these suppress a recommendation rather than degrade it
 
 - Sample coverage under 60% of the expected window
-- Minimum Available memory under 1GB, or p95 hard faults above 10/sec — suppresses reclaim, but
-  **escalates** growth instead (see Sizing logic above)
+- Minimum Available memory under 1GB, **or** p95 hard faults above 10/sec *while* minimum
+  Available is under 20% of RAM. This is `MEM-PRESSURE`: it suppresses reclaim, but **escalates**
+  growth instead (see Sizing logic above).
+- High hard faults with memory to spare (`FAULTS-IO`). Hard faults count toward pressure only when
+  memory is genuinely tight, because the counter behind them (Memory\Pages Input/sec) also counts
+  pages read for memory-mapped *files*. File and web servers fault constantly with memory to spare.
+  - **Estate evidence:** on a 507-device run, 140 of 281 pressure hosts were flagged on faults
+    alone. 105 of those never dropped below 20% free in 14 days (19 never below 50%), and they
+    carried 244GB of growth recommendations.
+  - **What these hosts get instead:** `FAULTS-IO`, with no escalation, and **reclaim is held too**,
+    since cutting RAM would shrink the file cache serving those reads. The 20% bar is the Screen's
+    `UPSIZE` bar, so the two components agree on "short of headroom".
 - p95 max-core above 85% while total sits below the single-thread ceiling for that vCPU count —
   suppresses reduce *and* growth, since more vCPU doesn't help a workload that can't spread past
   one core
@@ -440,7 +450,8 @@ Analyse values are not.
 
 | Flag | Meaning |
 |---|---|
-| `MEM-PRESSURE` | Available memory or fault rate breached the guardrail; no reclaim offered, growth escalated instead |
+| `MEM-PRESSURE` | Minimum available memory under 1GB, or hard faults above 10/s while minimum available is under 20% of RAM. No reclaim offered, growth escalated instead |
+| `FAULTS-IO` | Hard faults above 10/s but memory never got tight (minimum available ≥20%), so most likely file I/O through memory mapping, typical of file and web servers. Not counted as pressure (no URGENT, no growth escalation), but reclaim is held, since cutting RAM would shrink the file cache |
 | `MEM-REVIEW` | Memory pressure is active but even the escalated (max-based) target shows no allocation shortfall — likely a leaking process or transient spike, not under-provisioning; no growth number is forced |
 | `GROWTH` | RAM growth recommended — see `Cap: Growth GB` / `Cap: Growth Verdict`. On a `MYSQL` host under memory pressure `Cap: Growth GB` stays `000` and the verdict cites the buffer pool instead, so build worklists on this flag, not the number |
 | `CPU-GROWTH` | vCPU growth recommended, or queue-driven pressure flagged `REVIEW` with no safe number to give — check `Cap: Growth Verdict`, since `Cap: Growth vCPU` stays `00` for the REVIEW case |

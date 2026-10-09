@@ -82,6 +82,14 @@
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
 
+    Version : 1.15 -  09/10/2026  (hard faults alone no longer trigger MEM-PRESSURE: they
+              count only while min available is under 20% of RAM. Memory\Pages Input/sec
+              also counts memory-mapped FILE reads, so file and web servers fault constantly
+              with memory to spare - on a 507-device run, 105 of 140 fault-only pressure
+              hosts never dropped below 20% free and carried 244GB of growth advice. Those
+              hosts are flagged FAULTS-IO and hold reclaim too, since cutting RAM would
+              shrink the file cache serving those reads. The < 1GB trigger is unchanged)
+
     Version : 1.14 -  09/10/2026  (MySQL buffer pool sanity check: a configured pool can't
               explain mysqld holding more than pool x1.5 + 4GB, so past that the figure is
               reported unresolved - "config reads XGB but mysqld holds YGB - effective config
@@ -1059,7 +1067,23 @@ try {
     # =======================================================================
     # Pressure guardrails
     # =======================================================================
-    $memPressure = ($availMin -lt 1.0) -or ($faultP95 -gt 10)
+    # Hard faults count only alongside genuinely low memory. The counter
+    # behind HardFaultsSec (Memory\Pages Input/sec) also counts pages read for
+    # memory-mapped FILES, so file and web servers fault constantly with
+    # memory to spare. On a 507-device estate run, 140 of 281 pressure hosts
+    # were flagged on faults alone; 105 of those never dropped below 20% free
+    # in 14 days (19 never below 50%), and carried 244GB of growth
+    # recommendations - "+22GB" on a 144GB host whose worst moment was 36%
+    # free. 20% is the Screen's UPSIZE bar, so the components agree on "short
+    # of headroom". The absolute < 1GB trigger is unchanged and unconditional,
+    # matching the Screen's own absolute trigger.
+    $MemPressureFaultAvailFraction = 0.20
+    $faultPressure = ($faultP95 -gt 10) -and ($availMin -lt ($allocatedGB * $MemPressureFaultAvailFraction))
+    $memPressure   = ($availMin -lt 1.0) -or $faultPressure
+    if (-not $memPressure -and $faultP95 -gt 10) {
+        # Not pressure, but worth seeing why the faults were discounted
+        $flags.Add('FAULTS-IO')
+    }
     if ($memPressure) { $flags.Add('MEM-PRESSURE') }
 
     # Single-thread bound: one core near saturation while total sits near the
@@ -1271,6 +1295,15 @@ try {
         if ($memPressure) {
             $ramVerdict = "NO RECLAIM - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s)"
             if ($raw -lt 0) { $ramVerdict += ' - see growth verdict' }
+        }
+        elseif ($flags -contains 'FAULTS-IO' -and $raw -gt 0) {
+            # Faults discounted as pressure (memory never got tight), but they
+            # are still real disk reads - typically a file or web server
+            # serving from its file cache. Reclaiming shrinks that cache and
+            # turns cached reads into disk reads, so hold rather than swing
+            # from "URGENT, add RAM" straight to "remove RAM". Suppress rather
+            # than degrade, as with every other guardrail here.
+            $ramVerdict = "NO RECLAIM - high fault rate (p95 ${faultP95}/s) with memory to spare, likely file I/O; reclaim would shrink the file cache"
         }
         elseif ($raw -gt 0) {
             $reclaimGB = Get-Floor2 -Value $raw

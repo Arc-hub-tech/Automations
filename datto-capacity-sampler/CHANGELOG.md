@@ -8,6 +8,47 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Added
+- **Hyper-V host health checks in the Screen** (`Get-ArcCapacityScreen.ps1` v1.11). Hypervisors
+  used to get only `NO SCREEN`. Now they get point-in-time checks for what takes hosts down, read as
+  SYSTEM from the Hyper-V and FailoverClusters modules (no history, no login, nothing changed):
+  - `HV-CRITICAL`: a VM in a critical state.
+  - `HV-MEM`: host free memory under 5% of capacity (minimum 2GB).
+  - `HV-STORAGE`: a VM volume or CSV under 12% free.
+  - `HV-CHECKPOINT`: a standard checkpoint over 3 days old, a Recovery checkpoint over 1 day old
+    (a stuck backup), or a VM running on an `.avhdx` with no checkpoint (a failed merge).
+  - `HV-REPLICA`: replication Critical or Warning.
+  - `HV-GUEST`: a lost heartbeat.
+  - `HV-CPU-RATIO`: running vCPU above 4:1 logical processors.
+  - `HV-CLUSTER`: a node not Up, or a CSV in redirected I/O.
+
+  Noise controls, given UPSIZE's history:
+  - Replica VMs are excluded from the checkpoint checks.
+  - Thin provisioning alone doesn't flag; it's only mentioned on a volume that's already low.
+  - NoContact heartbeats count only after an hour of uptime with the heartbeat service enabled.
+  - Cluster-wide findings come from the core cluster group owner only.
+  - CSV redirection by design (ReFS/S2D, tiering, Storage Replica) is ignored.
+  - `HV-MEM`'s 5% is capped between 2GB and 8GB, so large packed hosts don't flag.
+  - On a hypervisor, `UPSIZE` is raised only on the absolute under-1GB trigger, never the
+    root-partition commit ratio.
+  - If Recovery checkpoints can't be listed, the orphaned-`.avhdx` test is skipped rather than
+    guessed.
+
+  Each check runs in its own try/catch. A failed check is listed and flags `HV-PARTIAL`, and checks
+  that couldn't run at all flag `HV-NO-DATA`, so "no findings" never stands in for "couldn't look".
+  The checks re-run in 64-bit PowerShell when Datto's process is 32-bit, since the Hyper-V module
+  only loads in 64-bit. No new UDFs or `ScreenStatus` values: the four Screen UDFs carry host
+  content on hypervisors, and `ScreenHvFindings` is a new result field the stub ignores. The CSV
+  export gains `Hv*` columns, including `HvCluster` for an estate-level N+1 rollup.
+
+  Tested with stub cmdlets across twelve scenarios plus a real 32-bit → 64-bit relaunch: a healthy
+  thin-provisioned host, PausedCritical, stale and orphaned checkpoints, replica VMs (must not flag),
+  memory/replication/heartbeat/ratio, a throwing cmdlet, cluster owner vs non-owner, module missing,
+  a worst case kept within 255 characters, ReFS by-design redirection, and an unsupported Recovery
+  query. **Not yet run on a real Hyper-V host.** In
+  particular, whether `Get-VMSnapshot` lists Recovery checkpoints by default varies, so it's queried
+  explicitly.
+
 ### Fixed
 - **Component 2's role detection had fallen behind the Screen's fixes** (`Read-ArcCapacityBuffer.ps1`
   v1.11, `Get-ArcCapacityScreen.ps1` v1.10). The Screen's header claims its roles are "kept identical

@@ -200,13 +200,48 @@ match). Agent- or installer-only hosts are flagged `VEEAM-MINOR` and screened no
 unrecognised future service name falls through to `VEEAM-MINOR` — the gross-over-allocation gate
 still has to clear before anything is recommended, which keeps that failure mode cheap.
 
-**Hyper-V hosts get no sizing regardless of every other role** (`NO SCREEN` in the Screen, `NO SIZING` in Component 2, which also raises no CPU flags for them). This tool measures guest-side
+**Hyper-V hosts get no sizing regardless of every other role** (`NO SIZING` in Component 2, which also raises no CPU flags for them; the Screen runs host health checks instead, below). This tool measures guest-side
 demand, which can't describe a host whose memory is consumed by its VMs: a 127GB cluster node
 reporting 51GB committed and 78% sustained CPU is describing its guests, not itself, and neither
 figure supports a right-sizing decision. Detected via the `vmms` service, which exists only where
 the role is actually installed. Other hypervisors aren't detected because they never run this script
 — an ESXi host has no Windows guest OS — so Hyper-V is the only case that can reach a device filter.
 Size these from your hypervisor's own reporting instead.
+
+### Hyper-V host health (Screen)
+
+On a Hyper-V host the Screen replaces guest-side screening with host health checks. These are
+point-in-time facts read from the Hyper-V and FailoverClusters modules as SYSTEM. They need no
+history and no login, and nothing is changed. Each finding sets an `HV-*` flag. `Scr: Verdict`
+reads `HYPER-V ATTENTION - <findings>` or `HYPER-V OK - N VMs, M running, no findings`. The
+other three Screen UDFs carry host content:
+- `Scr: RAM`: host memory, VMs running and memory assigned, available, uptime.
+- `Scr: Reclaim GB`: `000`.
+- `Scr: CPU`: logical processors vs running vCPU.
+
+Findings are listed most actionable first:
+
+| Flag | Fires when | Deliberately ignores |
+|---|---|---|
+| `HV-CRITICAL` | Any VM is in a `*Critical` state. PausedCritical almost always means the volume under the VM is full or gone | — |
+| `HV-MEM` | Host free memory is under 5% of capacity, **between 2GB and 8GB** (32GB host → 2GB, 128GB → 6GB, 256GB+ → 8GB), so the host can't start or restart VMs. Replaces the guest-style `UPSIZE` wording | **The commit ratio.** On a hypervisor `UPSIZE` is raised only when free memory is under 1GB, because root-partition commit doesn't describe a host whose memory belongs to its VMs |
+| `HV-CLUSTER` | A cluster node isn't Up, or a CSV is in redirected I/O | Reported by the **core cluster group owner only**, so N nodes don't repeat it. **Redirection by design**: ReFS CSVs (most S2D clusters) and tiered volumes run file-system-redirected permanently, and Storage Replica volumes run block-redirected. Those reasons are ignored; one with no reason recorded still counts |
+| `HV-STORAGE` | A local volume holding VM disks, or a CSV (core owner only), is under **12%** free. Context is added when dynamic disks could grow past the free space | **Thin provisioning alone.** Maximum disk sizes exceeding free space is normal on most hosts, so it's only mentioned on a volume that's already low. SMB-hosted disks are skipped. A differencing disk's growth isn't double-counted |
+| `HV-CHECKPOINT` | A standard/production checkpoint older than **3 days**. Or a Recovery checkpoint (what backup products create and should remove) older than **1 day**, which means a stuck backup. Or a VM running on an `.avhdx` with no checkpoint at all, which is a failed merge that grows until the volume fills | **Replica VMs** and replica recovery points, which carry these by design. If Recovery checkpoints can't be listed (an older module without `-SnapshotType`), the `.avhdx` test is skipped and `HV-PARTIAL` set, because a VM mid-backup would otherwise read as a failed merge |
+| `HV-REPLICA` | Hyper-V Replica health is Critical or Warning | — |
+| `HV-GUEST` | A running VM's heartbeat is LostCommunication or Error | **NoContact**, unless the VM has been up over an hour *and* its heartbeat service is enabled. Appliances and Linux guests without integration services report NoContact normally |
+| `HV-CPU-RATIO` | vCPU on running VMs exceeds **4:1** logical processors. Above 8:1 expect real contention | — |
+| `HV-PARTIAL` | One or more checks failed, listed in the job output and the CSV `HvErrors` column | So "no findings" is never mistaken for "healthy" |
+| `HV-NO-DATA` | The checks couldn't run at all, e.g. the Hyper-V PowerShell module isn't installed (`RSAT-Hyper-V-Tools`); the verdict says why | — |
+
+- **32-bit hosts:** the Hyper-V module only loads in 64-bit PowerShell. If Datto runs the
+  component in a 32-bit process, the checks are re-run through the 64-bit PowerShell and the result
+  read back.
+- **Thresholds:** all are reasoned starting points. Calibrate them against the CSV export's `Hv*`
+  columns.
+- **Cluster N+1:** check the cluster can absorb losing its largest node by grouping the CSV export
+  by `HvCluster` and comparing `HvAssignedGB` against `HvHostMemGB`. Each node can only see its own
+  VMs.
 
 **MySQL and MariaDB are excluded for the same reason, with one difference: memory pressure still
 surfaces.** On Windows, InnoDB commits its whole buffer pool at startup, so committed bytes on a
@@ -336,9 +371,9 @@ exactly as it already works, rather than changing what that field means.
 
 | UDF | Suggested label | Content |
 |---|---|---|
-| Custom70 | `Scr: RAM` | `Alloc 32GB \| Commit 8.1GB \| PeakWS sum 11.4GB \| Avail 19.2GB \| Up 34d` |
+| Custom70 | `Scr: RAM` | `Alloc 32GB \| Commit 8.1GB \| PeakWS sum 11.4GB \| Avail 19.2GB \| Up 34d`. Hyper-V host: `Host 128GB \| 9/11 VMs running, assigned 96GB \| Avail 24.1GB \| Up 34d` |
 | Custom71 | `Scr: Reclaim GB` | Zero-padded, e.g. `014` |
-| Custom72 | `Scr: CPU` | `8 vCPU \| Avg since boot 6.4% over 34d = 0.51 cores of 8 \| REVIEW` |
+| Custom72 | `Scr: CPU` | `8 vCPU \| Avg since boot 6.4% over 34d = 0.51 cores of 8 \| REVIEW`. Hyper-V host: `32 LP \| 56 vCPU on running VMs = 1.8:1` |
 | Custom73 | `Scr: Verdict` | Verdict, flags, timestamp |
 
 There is no `Scr: Rec vCPU` — the screen deliberately produces no vCPU number (see Operation
@@ -391,7 +426,8 @@ Analyse values are not.
 | `UPSIZE` | Screen only — available memory under 1GB, **or** committed bytes exceeding allocation *while* available memory is under 20% of allocation. The commit ratio never triggers alone. The 1GB test is the same metric and threshold Component 2 uses for `MEM-PRESSURE`, so the two can't disagree. The verdict names what fired. Outranks the uptime gate **and** the role exclusions (it's an observable fact, not a sizing claim). Reported, never sized — Component 2's growth-sizing produces the number |
 | `SQL-MINOR` | A SQL instance is present but the engine isn't a material memory consumer (under 2GB, or under 25% of allocation), so the host is sized/screened normally instead of excluded. Typically a bundled Express instance from an RDS Connection Broker, Veeam, or an LOB app. Component 2 measures the footprint as the larger of sampled p95 Total Server Memory and live `sqlservr` working set, and still runs the SQL attention checks (an Express DB near its limit appears as `| SQL: ...` in `Cap: Growth Verdict`) |
 | `VEEAM-MINOR` | Veeam is installed but only as an agent or installer service, i.e. this host is a backup *target*, not backup infrastructure. Sized/screened normally instead of excluded |
-| `HYPER-V` | The Hyper-V role is installed. `NO SCREEN` / `NO SIZING` regardless of every other role, and no CPU flags; memory pressure on the host still reads `URGENT` in Component 2: guest-side demand can't describe a host whose memory is consumed by its VMs |
+| `HYPER-V` | The Hyper-V role is installed. `NO SIZING` in Component 2 and host health checks in the Screen, regardless of every other role, and no CPU flags; memory pressure on the host still reads `URGENT` in Component 2: guest-side demand can't describe a host whose memory is consumed by its VMs |
+| `HV-*` | Screen only — Hyper-V host health findings: `HV-CRITICAL`, `HV-MEM`, `HV-CLUSTER`, `HV-STORAGE`, `HV-CHECKPOINT`, `HV-REPLICA`, `HV-GUEST`, `HV-CPU-RATIO`, plus `HV-PARTIAL` / `HV-NO-DATA` when checks couldn't run. See Hyper-V host health |
 | `CPU-PRESSURE` | Screen only (also a Component 2 flag; neither raises it on a Hyper-V host) — average CPU since boot at or above 70%. Because averaging flattens spikes, a sustained average this high implies peaks well above it: this host needs *more* vCPU, not fewer |
 
 ## Deployment

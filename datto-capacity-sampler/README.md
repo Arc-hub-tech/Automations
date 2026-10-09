@@ -257,9 +257,17 @@ The configured buffer pool is read without credentials from the option files mys
 reads. That means `--defaults-file` from the service command line, or otherwise the standard
 Windows search order. A MySQL 8 `SET PERSIST` in `<datadir>\mysqld-auto.cnf` overrides both.
 Parsing covers K/M/G/T suffixes, dash/underscore key spellings, `loose-` prefixes and versioned
-`[mysqld-8.0]` sections. A pool sized automatically by `innodb_dedicated_server` is reported as
-unresolved rather than guessed. `!include` directives are not followed. `Cap: RAM Detail` gains
-`| mysqld 21.5GB, buffer pool 20GB`.
+`[mysqld-8.0]` sections. It also reads **the group named after the Windows service**, which a
+server running as a service reads too. WAMP, for example, keeps its settings under
+`[wampmysqld64]`. A pool sized automatically by `innodb_dedicated_server` is reported as unresolved
+rather than guessed. `!include` directives are not followed. `Cap: RAM Detail` gains `| mysqld
+21.5GB, buffer pool 20GB`.
+
+**Sanity check:** if `mysqld` holds more than the read pool × 1.5 + 4GB, the configured value
+can't explain its footprint, so the effective configuration must be somewhere the parser didn't
+read. The pool is then reported unresolved (`config reads XGB but mysqld holds YGB - effective
+config not found`) rather than asserted, and the verdict says to check the pool rather than that
+it's fine.
 
 Unlike the plain exclusion, a MySQL host under `MEM-PRESSURE` still reads **URGENT** in
 `Cap: Growth Verdict`, flagged `GROWTH`, with `Cap: Growth GB` left at `000`. Instead of a

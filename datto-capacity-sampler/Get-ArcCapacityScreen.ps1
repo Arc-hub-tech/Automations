@@ -48,6 +48,10 @@
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
 
+    Version : 1.10 -  09/10/2026  (Hyper-V hosts no longer flagged CPU-PRESSURE or
+              CPU-REVIEW - their CPU is their guests' demand. Matches Component 2, whose
+              role detection is now aligned with this script)
+
     Version : 1.9  -  09/10/2026  (MySQL/MariaDB role, kept in step with Component 2:
               detected by service binary, excluded from reclaim where mysqld holds >=2GB
               and >=25% of allocation - InnoDB commits its whole buffer pool up front, so
@@ -709,7 +713,13 @@ try {
     # Name matches Component 2's flag vocabulary so one filter catches both.
     $cpuNote = if ($null -ne $avgCpuPct) {
         $n = "Avg since boot ${avgCpuPct}% over ${uptimeText} = ${effCores} cores of $vCPU"
-        if ($avgCpuPct -ge 70) {
+        if ($role -eq 'Hypervisor') {
+            # A hypervisor's CPU is its guests' demand - flagging it read as
+            # actionable on three busy cluster nodes when it wasn't. Same rule
+            # as Component 2.
+            $n += ' | Hyper-V host - describes its guests'
+        }
+        elseif ($avgCpuPct -ge 70) {
             $flags.Add('CPU-PRESSURE')
             $n += ' | PRESSURE - sustained saturation, needs more vCPU not fewer'
         }

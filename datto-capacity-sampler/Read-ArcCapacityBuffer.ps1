@@ -66,11 +66,13 @@
       - Memory pressure also holds vCPU reduction (not growth)
       - SQL Server hosts are never sized, but are checked for attention signals
         (flags SQL-CAP, SQL-MEM, SQL-EXPRESS-CAP) reported in the growth verdict
-      - Role exclusions from RAM sizing (both directions): SQL, Exchange, Veeam
-        proxy/repository, and MySQL/MariaDB where mysqld holds >=2GB and >=25%
-        of allocation (InnoDB commits its whole buffer pool up front). MySQL
-        still reports URGENT under memory pressure, with the configured
-        innodb_buffer_pool_size in place of a commit-derived GB figure
+      - Role exclusions from RAM sizing (both directions): SQL Server and
+        MySQL/MariaDB where the engine holds >=2GB and >=25% of allocation
+        (else SQL-MINOR / MYSQL-MINOR, sized normally), Exchange, and Veeam
+        data-mover/control services (agent/installer only = VEEAM-MINOR).
+        Under memory pressure every excluded role still reads URGENT, unsized
+      - Hyper-V hosts (vmms): no RAM or vCPU sizing at all, overriding every
+        other role; memory pressure still reads URGENT
 
     Component input variables (all optional):
               usrUdfBase       Integer  default 60    First UDF index, uses 10 consecutive fields (1-291)
@@ -79,6 +81,14 @@
               usrExportPath    String   default ''    Optional UNC for per-device CSV row
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
+
+    Version : 1.11 -  09/10/2026  (role detection aligned with the Screen. SQL excluded
+              only when material - >=2GB and >=25% of allocation, footprint the larger of
+              sampled p95 Total Server Memory and live sqlservr working set - otherwise
+              SQL-MINOR and sized, with SQL findings still appended. Veeam excluded only for
+              data-mover/control services, else VEEAM-MINOR. Hyper-V hosts (vmms) get no
+              sizing and no CPU flags, overriding every other role. Exchange, Veeam infra
+              and Hyper-V hosts under memory pressure read URGENT instead of EXCLUDED)
 
     Version : 1.10 -  09/10/2026  (SQL Server attention signals from counters already
               sampled plus the registry - no sampler change, no login: SQL-CAP (max server
@@ -216,6 +226,22 @@ function Format-VerdictUdf {
     $room = 255 - $tail.Length
     if ($head.Length -gt $room -and $room -gt 20) { $head = $head.Substring(0, $room - 3) + '...' }
     $head + $tail
+}
+
+# Whole findings joined with '; ', most actionable first, as many as fit the
+# budget - always at least one - then a pointer to the flags for the rest
+# (every finding sets one). Cutting mid-finding would leave a half-sentence
+# that reads as a different instruction.
+function Format-Findings {
+    param([string[]]$Findings, [int]$Budget)
+    $shown = New-Object System.Collections.Generic.List[string]
+    foreach ($f in $Findings) {
+        if (((@($shown) + $f) -join '; ').Length -gt $Budget -and $shown.Count -gt 0) { break }
+        $shown.Add($f)
+    }
+    $body = $shown -join '; '
+    if ($shown.Count -lt @($Findings).Count) { $body += " (+$(@($Findings).Count - $shown.Count), see flags)" }
+    $body
 }
 
 function Get-Floor2   { param([double]$Value) [int]([math]::Floor($Value / 2) * 2) }
@@ -467,11 +493,16 @@ function Get-MySqlInfo {
 # ---------------------------------------------------------------------------
 # Role detection
 # ---------------------------------------------------------------------------
+#   Kept in step with Get-ArcCapacityScreen.ps1's Get-ServerRole: same roles,
+#   same order, same materiality bars and Veeam/Hyper-V rules. The one
+#   deliberate difference is the SQL footprint, which here can draw on 14 days
+#   of sampled Total Server Memory where the Screen only has a live reading.
 function Get-ServerRole {
-    param([double]$AllocatedGB = 0)
+    param([double]$AllocatedGB = 0, [double]$SqlSampledGB = 0)
 
     $flags = New-Object System.Collections.Generic.List[string]
     $role  = 'Generic'
+    $sqlGB = $null
 
     $svc = @{}
     try {
@@ -493,9 +524,41 @@ function Get-ServerRole {
     # Exchange
     if ((& $hasSvc 'MSExchange*')) { $role = 'Exchange'; $flags.Add('EXCH') }
 
-    # SQL Server
+    # SQL Server - presence alone is NOT enough to exclude a host from sizing.
+    # The exclusion exists because commit on a host SQL dominates reports the
+    # configured cap rather than the requirement; that only holds while SQL is
+    # a material consumer. Presence-only matching excluded 21 of 73 devices on
+    # a real estate (RD gateways, a VPN host, file servers carrying a bundled
+    # Express or Veeam instance) and threw away real reclaim. Same bar as the
+    # Screen and as MySQL below: at least 2GB AND at least 25% of allocation.
+    #
+    # Footprint is the larger of the sampled p95 Total Server Memory (14 days,
+    # but one instance only - the sampler reads the first counter set it
+    # resolves) and the live working set of every sqlservr process (all
+    # instances, but one moment). Taking the larger means a busy instance is
+    # never missed because the sampler happened to read a small one.
+    # Below the bar: SQL-MINOR, sized normally. The SQL attention checks run
+    # either way, so an Express database near its limit still surfaces.
     $isSql = ($svc.ContainsKey('MSSQLSERVER')) -or (& $hasSvc 'MSSQL$*')
-    if ($isSql) { if ($role -eq 'Generic') { $role = 'SQLServer' }; $flags.Add('SQL') }
+    if ($isSql) {
+        $liveGB = 0.0
+        try {
+            $sqlProcs = @(Get-Process -Name 'sqlservr' -ErrorAction SilentlyContinue)
+            if ($sqlProcs.Count -gt 0) {
+                $liveGB = [math]::Round((($sqlProcs | Measure-Object -Property WorkingSet64 -Sum).Sum) / 1GB, 2)
+            }
+        } catch { }
+        $sqlGB = [math]::Max($liveGB, $SqlSampledGB)
+
+        $sqlIsMaterial = ($sqlGB -ge 2) -and
+                         (($AllocatedGB -le 0) -or ($sqlGB -ge ($AllocatedGB * 0.25)))
+        if ($sqlIsMaterial) {
+            if ($role -eq 'Generic') { $role = 'SQLServer' }
+            $flags.Add('SQL')
+        } else {
+            $flags.Add('SQL-MINOR')
+        }
+    }
 
     # MySQL / MariaDB - same materiality bar the Screen applies to SQL Server:
     # mysqld must hold at least 2GB AND at least 25% of allocation in private
@@ -513,8 +576,36 @@ function Get-ServerRole {
         }
     }
 
-    # Veeam proxy / repository - job windows can fall outside a p95 view
-    if ((& $hasSvc 'Veeam*')) { $flags.Add('VEEAM'); if ($role -eq 'Generic') { $role = 'BackupInfra' } }
+    # Veeam: backup INFRASTRUCTURE, not a backup TARGET. The exclusion exists
+    # because proxy and repository demand peaks inside the job window, which a
+    # 14-day p95 flattens - an argument about things that move or store backup
+    # data. Veeam installs its Installer/Deployment service on every server it
+    # backs up and its agent on protected endpoints, so matching any Veeam*
+    # service classed a plain 12GB file server as backup infrastructure and
+    # discarded its reclaim. Match only data-mover and control services, by
+    # prefix so version suffixes survive. An unrecognised future service name
+    # falls through to VEEAM-MINOR and the host is sized normally.
+    if ((& $hasSvc 'Veeam*')) {
+        $veeamInfraPatterns = @(
+            'VeeamBackup*',        # B&R server
+            'VeeamTransport*',     # data mover - proxy and repository
+            'VeeamNFS*',           # vPower NFS
+            'VeeamCatalog*',       # guest file catalog
+            'VeeamBroker*',        # broker
+            'VeeamMount*',         # mount server
+            'VeeamHvIntegration*'  # Hyper-V off-host data mover
+        )
+        $hasVeeamInfra = $false
+        foreach ($p in $veeamInfraPatterns) {
+            if (& $hasSvc $p) { $hasVeeamInfra = $true; break }
+        }
+        if ($hasVeeamInfra) {
+            $flags.Add('VEEAM')
+            if ($role -eq 'Generic') { $role = 'BackupInfra' }
+        } else {
+            $flags.Add('VEEAM-MINOR')
+        }
+    }
 
     # RDSH
     $isRdsh = $false
@@ -544,7 +635,15 @@ function Get-ServerRole {
         }
     } catch { }
 
-    [PSCustomObject]@{ Role = $role; Flags = $flags; MySql = $mysql }
+    # Hyper-V host. Last and unconditional, so it overrides every other role
+    # rather than relying on the '-eq Generic' guards above: a hypervisor
+    # running a Veeam data mover, or with RDSH bolted on, is still a
+    # hypervisor. Guest-side demand can't describe a host whose memory is
+    # consumed by its VMs, and its CPU figures describe its guests. vmms exists
+    # only where the role is actually installed, not merely available.
+    if ($svc.ContainsKey('vmms')) { $role = 'Hypervisor'; $flags.Add('HYPER-V') }
+
+    [PSCustomObject]@{ Role = $role; Flags = $flags; MySql = $mysql; SqlPresent = $isSql; SqlGB = $sqlGB }
 }
 
 # Role floors: minimum sensible allocation, independent of measured demand
@@ -611,12 +710,16 @@ try {
     $availMin     = if ($availVals.Count)  { [math]::Round(($availVals | Measure-Object -Minimum).Minimum, 2) } else { 0 }
     $faultP95     = if ($faultVals.Count)  { [math]::Round((Get-Percentile -Values $faultVals -P 0.95), 1) } else { 0 }
 
-    # Role detection needs the allocation for the MySQL materiality test, so it
-    # runs here rather than before the no-data exit above (which doesn't use it).
-    $roleInfo = Get-ServerRole -AllocatedGB $allocatedGB
-    $role     = $roleInfo.Role
-    $flags    = $roleInfo.Flags
-    $mysql    = $roleInfo.MySql
+    # Role detection needs the allocation and the sampled SQL footprint for the
+    # SQL/MySQL materiality tests, so it runs here rather than before the
+    # no-data exit above (which doesn't use it).
+    $sqlTotalVals = Get-NumericColumn -Rows $rows -Column 'SqlTotalGB'
+    $sqlSampledGB = if ($sqlTotalVals.Count) { [math]::Round((Get-Percentile -Values $sqlTotalVals -P 0.95), 2) } else { 0 }
+    $roleInfo   = Get-ServerRole -AllocatedGB $allocatedGB -SqlSampledGB $sqlSampledGB
+    $role       = $roleInfo.Role
+    $flags      = $roleInfo.Flags
+    $mysql      = $roleInfo.MySql
+    $sqlPresent = $roleInfo.SqlPresent
 
     $mysqlDetailSuffix = ''
     if ($mysql) {
@@ -658,12 +761,14 @@ try {
     # =======================================================================
     $sqlNote       = ''
     $sqlFindings   = New-Object System.Collections.Generic.List[string]
-    $sqlTotalVals  = Get-NumericColumn -Rows $rows -Column 'SqlTotalGB'
     $sqlTargetVals = Get-NumericColumn -Rows $rows -Column 'SqlTargetGB'
     $pleVals       = Get-NumericColumn -Rows $rows -Column 'SqlPLE'
-    # @() around the whole if: an if statement unrolls its output, so a single
-    # instance would otherwise arrive as a bare object with no usable .Count
-    $sqlInstances  = @(if ($flags -contains 'SQL') { Get-SqlInstanceInfo })
+    # Keyed on presence, not the SQLServer role: a SQL-MINOR host (a bundled
+    # Express instance) is sized normally but its database can still be
+    # approaching Express's 10GB limit. @() around the whole if: an if
+    # statement unrolls its output, so a single instance would otherwise
+    # arrive as a bare object with no usable .Count.
+    $sqlInstances  = @(if ($sqlPresent) { Get-SqlInstanceInfo })
     $allExpress    = ($sqlInstances.Count -gt 0) -and (@($sqlInstances | Where-Object { -not $_.IsExpress }).Count -eq 0)
 
     # Express caps every database at 10GB of data, and the engine stops
@@ -769,10 +874,15 @@ try {
     # ceiling a single thread can produce on this vCPU count.
     $singleThreadCeiling = (100.0 / $vCPU) * 1.30
     $singleThreadBound = ($maxCoreP95 -gt 85) -and ($cpuTotalP95 -lt $singleThreadCeiling)
-    if ($singleThreadBound) { $flags.Add('SINGLE-THREAD') }
-
     $cpuPressure = ($queueP95 -gt (2 * $vCPU)) -or ($cpuTotalP95 -gt 75)
-    if ($cpuPressure) { $flags.Add('CPU-PRESSURE') }
+
+    # Not flagged on a Hyper-V host: its CPU is its guests' demand, and three
+    # busy cluster nodes reading CPU-PRESSURE on a real estate looked
+    # actionable when it wasn't. MEM-PRESSURE above still applies to them.
+    if ($role -ne 'Hypervisor') {
+        if ($singleThreadBound) { $flags.Add('SINGLE-THREAD') }
+        if ($cpuPressure)       { $flags.Add('CPU-PRESSURE') }
+    }
 
     # =======================================================================
     # RAM recommendation - reclaim (over-allocated) or growth (under-provisioned)
@@ -830,6 +940,21 @@ try {
         $ramVerdict    = "INSUFFICIENT DATA - $coverage% coverage"
         $growthVerdict = "INSUFFICIENT DATA - $coverage% coverage"
     }
+    elseif ($role -eq 'Hypervisor') {
+        # Guest-side commit can't size a host whose memory goes to its VMs, so
+        # no number either way. Memory pressure is still surfaced, as the
+        # Screen surfaces UPSIZE on a hypervisor: a root partition that is
+        # itself out of memory is a host problem worth knowing about whatever
+        # its guests are doing.
+        $ramVerdict = 'NO SIZING - Hyper-V host, guest-side commit describes its VMs; size from hypervisor reporting'
+        if ($memPressure) {
+            $ramVerdict    = "NO RECLAIM - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s) - see growth verdict"
+            $growthVerdict = "${tag}URGENT - host mem pressure (avail ${availMin}GB, faults ${faultP95}/s), unsized - check VM memory assignments and the host's own processes"
+            $flags.Add('GROWTH')
+        } else {
+            $growthVerdict = 'NO SIZING - Hyper-V host'
+        }
+    }
     elseif ($role -eq 'SQLServer') {
         # Commit reflects the configured cap, not demand, so no number in
         # either direction - the growth verdict carries the SQL findings
@@ -842,18 +967,10 @@ try {
         $prefix = if ($memPressure) { "${tag}URGENT - mem pressure (avail ${availMin}GB, faults ${faultP95}/s): " } else { 'REVIEW - ' }
 
         # Shares Custom69's 255 characters with 'RAM: ', the CPU growth
-        # verdict and the timestamp (~70 between them in the usual case):
-        # keep whole findings, most actionable first, and point at the flags
-        # for the rest - every finding sets one. Format-VerdictUdf at the
-        # write-back is the backstop if the CPU side runs long.
-        $budget = 180 - $prefix.Length
-        $shown  = New-Object System.Collections.Generic.List[string]
-        foreach ($f in $sqlFindings) {
-            if (((@($shown) + $f) -join '; ').Length -gt $budget -and $shown.Count -gt 0) { break }
-            $shown.Add($f)
-        }
-        $body = $shown -join '; '
-        if ($shown.Count -lt $sqlFindings.Count) { $body += " (+$($sqlFindings.Count - $shown.Count), see flags)" }
+        # verdict and the timestamp (~70 between them in the usual case).
+        # Format-VerdictUdf at the write-back is the backstop if the CPU side
+        # runs long.
+        $body = Format-Findings -Findings $sqlFindings -Budget (180 - $prefix.Length)
 
         if ($memPressure) {
             $ramVerdict    = "NO RECLAIM - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s) - see growth verdict"
@@ -872,9 +989,19 @@ try {
         }
     }
     elseif ($RamExcludedRoles -contains $role) {
+        # Exchange and Veeam infrastructure (SQLServer has its own branch
+        # above). Excluded from sizing in both directions, but - as for SQL,
+        # MySQL and Hyper-V - active memory pressure reads URGENT rather than
+        # hiding behind EXCLUDED: the exclusions exist to stop commit sizing a
+        # host, never to conceal one that's out of memory.
         $ramVerdict = "EXCLUDED ($role) - guest commit reflects configured cap, not demand"
-        if ($sqlNote) { $ramVerdict += " | $sqlNote" }
-        $growthVerdict = "EXCLUDED ($role) - size from platform-specific metrics, not guest commit"
+        if ($memPressure) {
+            $ramVerdict    = "NO RECLAIM - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s) - see growth verdict"
+            $growthVerdict = "${tag}URGENT - mem pressure (avail ${availMin}GB, faults ${faultP95}/s), unsized - size from $role metrics, not guest commit"
+            $flags.Add('GROWTH')
+        } else {
+            $growthVerdict = "EXCLUDED ($role) - size from platform-specific metrics, not guest commit"
+        }
     }
     elseif ($role -eq 'MySQL') {
         # Commit can't size this host in either direction - it carries the
@@ -1038,6 +1165,16 @@ try {
         }
     }
 
+    # SQL findings on a host that isn't in the SQLServer role - SQL-MINOR (a
+    # bundled Express instance), or SQL on a DC/Exchange/hypervisor - still
+    # belong in front of someone: an Express database near its 10GB limit is an
+    # outage waiting, whatever the host's RAM sizing says. The SQLServer branch
+    # above already carries them. Appended, so the host's own RAM verdict
+    # stays first; Format-VerdictUdf trims if the total runs long.
+    if ($role -ne 'SQLServer' -and $sqlFindings.Count -gt 0) {
+        $growthVerdict += ' | SQL: ' + (Format-Findings -Findings $sqlFindings -Budget 100)
+    }
+
     # =======================================================================
     # vCPU recommendation - reduction (over-provisioned) or growth (under-provisioned)
     # =======================================================================
@@ -1052,6 +1189,12 @@ try {
     if (-not $confident) {
         $cpuVerdict       = "INSUFFICIENT DATA - $coverage% coverage"
         $cpuGrowthVerdict = "INSUFFICIENT DATA - $coverage% coverage"
+    }
+    elseif ($role -eq 'Hypervisor') {
+        # A busy host's utilisation is its guests' demand - sustained high CPU
+        # is normal and says nothing about the host's own vCPU.
+        $cpuVerdict       = 'NO SIZING - Hyper-V host, CPU describes its guests'
+        $cpuGrowthVerdict = 'NO SIZING - Hyper-V host'
     }
     elseif ($singleThreadBound) {
         $cpuVerdict = "NO CHANGE - single-thread bound (p95 max-core ${maxCoreP95}%)"
@@ -1212,6 +1355,7 @@ try {
                 CpuVerdict      = $cpuVerdict
                 VcpuGrowth      = $vcpuGrowth
                 CpuGrowthVerdict = $cpuGrowthVerdict
+                SqlFootprintGB  = $roleInfo.SqlGB
                 SqlNote         = $sqlNote
                 SqlFindings     = ($sqlFindings -join '; ')
                 SqlEditions     = (($sqlInstances | ForEach-Object { '{0}={1}' -f $_.Name, $_.Edition }) -join '; ')

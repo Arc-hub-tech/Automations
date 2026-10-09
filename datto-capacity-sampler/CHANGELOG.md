@@ -8,6 +8,30 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Fixed
+- **Component 2's role detection had fallen behind the Screen's fixes** (`Read-ArcCapacityBuffer.ps1`
+  v1.11, `Get-ArcCapacityScreen.ps1` v1.10). The Screen's header claims its roles are "kept identical
+  to Component 2", but its v1.4–v1.8 fixes were never carried across, so the 14-day analysis still
+  made the same mistakes:
+  - **SQL was excluded on mere presence.** That caught RD gateways, VPN hosts and file servers
+    carrying a bundled Express or Veeam instance, and discarded their reclaim. SQL now has to be
+    material (at least 2GB and at least 25% of allocation), otherwise the host is flagged
+    `SQL-MINOR` and sized normally. The footprint is the larger of the sampled p95 Total Server
+    Memory and the live `sqlservr` working set: the sampler reads one instance, the live figure
+    covers them all. The SQL attention checks still run on `SQL-MINOR` hosts, so an Express
+    database near its limit appears as `| SQL: ...` in `Cap: Growth Verdict`.
+  - **Any `Veeam*` service meant backup infrastructure**, including the installer and agent on
+    every protected server. Now only data-mover and control services; others get `VEEAM-MINOR`.
+  - **No Hyper-V guard.** Cluster nodes were sized from guest-side figures and flagged
+    `CPU-PRESSURE`. Hosts running `vmms` now get `NO SIZING` for RAM and vCPU and no CPU flags,
+    overriding every other role. The Screen also stops raising CPU flags on them.
+  - **Exchange and Veeam infrastructure hid memory pressure behind `EXCLUDED`.** They now read
+    `URGENT` (unsized, `GROWTH` flag), as SQL, MySQL and Hyper-V hosts do.
+
+  Tested with injected service lists across eight scenarios: a bundled-Express RD gateway, a
+  material SQL host, a Veeam-agent file server, a Veeam proxy under pressure, a Hyper-V node with
+  Veeam services at 80% CPU, a Hyper-V node under pressure, and Exchange with and without pressure.
+
 ### Added
 - **SQL Server attention signals** (`Read-ArcCapacityBuffer.ps1` v1.10). SQL hosts were excluded
   from RAM sizing with nothing else to say. `SqlTargetGB` was sampled but never read, and PLE was

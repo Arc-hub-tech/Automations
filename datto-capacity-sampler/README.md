@@ -193,14 +193,14 @@ timing argument is about something which moves or stores backup data — it says
 server that is merely a backup source. Matching any `Veeam*` service was the same over-broad mistake
 the SQL predicate made: Veeam installs its Installer/Deployment service on every managed server and
 its agent on protected endpoints, so on a real estate a 12GB file server with 8.58GB committed was
-classed as backup infrastructure and had its reclaim discarded. The Screen now matches only
+classed as backup infrastructure and had its reclaim discarded. Both components now match only
 data-mover and control services (`VeeamBackup*`, `VeeamTransport*`, `VeeamNFS*`, `VeeamCatalog*`,
 `VeeamBroker*`, `VeeamMount*`, `VeeamHvIntegration*`, by prefix so version suffixes don't break the
 match). Agent- or installer-only hosts are flagged `VEEAM-MINOR` and screened normally. An
 unrecognised future service name falls through to `VEEAM-MINOR` — the gross-over-allocation gate
 still has to clear before anything is recommended, which keeps that failure mode cheap.
 
-**Hyper-V hosts return `NO SCREEN` regardless of every other role.** This tool measures guest-side
+**Hyper-V hosts get no sizing regardless of every other role** (`NO SCREEN` in the Screen, `NO SIZING` in Component 2, which also raises no CPU flags for them). This tool measures guest-side
 demand, which can't describe a host whose memory is consumed by its VMs: a 127GB cluster node
 reporting 51GB committed and 78% sustained CPU is describing its guests, not itself, and neither
 figure supports a right-sizing decision. Detected via the `vmms` service, which exists only where
@@ -242,8 +242,8 @@ matching excluded 21 of 73 devices on a real estate — including RD gateways, a
 file servers, none of them mis-matched: they genuinely carried a bundled instance
 (`MSSQL$SQLEXPRESS` from an RDS Connection Broker deployment, `MSSQL$VEEAMSQL*` from Veeam, or an
 LOB app's Express instance). A capped Express instance idling at a few hundred MB on a 12GB gateway
-doesn't distort that host's commit figure, and excluding it discarded real, safe reclaim. The
-Screen therefore requires `sqlservr` to hold **at least 2GB and at least 25% of allocated RAM** —
+doesn't distort that host's commit figure, and excluding it discarded real, safe reclaim. Both
+components therefore require `sqlservr` to hold **at least 2GB and at least 25% of allocated RAM** —
 both conditions, since the ratio alone over-fires on small hosts (Express's buffer pool caps around
 1.4GB) and the absolute alone under-fires on large ones. Below the bar the host is flagged
 `SQL-MINOR` and screened normally. The exclusion verdict cites the footprint that justified it, so
@@ -378,7 +378,7 @@ Analyse values are not.
 | `CPU-GROWTH` | vCPU growth recommended, or queue-driven pressure flagged `REVIEW` with no safe number to give — check `Cap: Growth Verdict`, since `Cap: Growth vCPU` stays `00` for the REVIEW case |
 | `SINGLE-THREAD` | One core near saturation on a low total; vCPU held in both directions |
 | `CPU-PRESSURE` | Sustained high utilisation or queue depth; no reduction offered, and growth flagged `REVIEW` if queue-driven |
-| `SQL` / `EXCH` / `VEEAM` | Excluded from RAM sizing by role, in both directions |
+| `SQL` / `EXCH` / `VEEAM` | Excluded from RAM sizing by role, in both directions. Under `MEM-PRESSURE` Component 2 still reads `URGENT` (unsized) and sets `GROWTH` |
 | `MYSQL` | MySQL or MariaDB is a material memory consumer (mysqld private bytes ≥2GB and ≥25% of allocation). Excluded from commit-based RAM sizing in both directions; under `MEM-PRESSURE` Component 2 still reports `URGENT` + `GROWTH` with `Cap: Growth GB` at `000`, citing the configured buffer pool instead. vCPU floor 4 |
 | `MYSQL-MINOR` | MySQL/MariaDB present but under the materiality bar (e.g. an LOB app's bundled instance) — sized/screened normally |
 | `SQL-CAP` | SQL Server `max server memory` unset or leaving the OS too little — see SQL Server attention signals |
@@ -389,10 +389,10 @@ Analyse values are not.
 | `LOW-UPTIME` | Screen only — under `usrMinUptimeHrs`, peak working sets not yet representative |
 | `CANDIDATE` | Screen only — cleared the gross over-allocation test |
 | `UPSIZE` | Screen only — available memory under 1GB, **or** committed bytes exceeding allocation *while* available memory is under 20% of allocation. The commit ratio never triggers alone. The 1GB test is the same metric and threshold Component 2 uses for `MEM-PRESSURE`, so the two can't disagree. The verdict names what fired. Outranks the uptime gate **and** the role exclusions (it's an observable fact, not a sizing claim). Reported, never sized — Component 2's growth-sizing produces the number |
-| `SQL-MINOR` | Screen only — a SQL instance is present but the engine isn't a material memory consumer (under 2GB, or under 25% of allocation), so the host is screened normally instead of excluded. Typically a bundled Express instance from an RDS Connection Broker, Veeam, or an LOB app |
-| `VEEAM-MINOR` | Screen only — Veeam is installed but only as an agent or installer service, i.e. this host is a backup *target*, not backup infrastructure. Screened normally instead of excluded |
-| `HYPER-V` | Screen only — the Hyper-V role is installed. Returns `NO SCREEN` regardless of every other role: guest-side demand can't describe a host whose memory is consumed by its VMs |
-| `CPU-PRESSURE` | Screen only (also a Component 2 flag) — average CPU since boot at or above 70%. Because averaging flattens spikes, a sustained average this high implies peaks well above it: this host needs *more* vCPU, not fewer |
+| `SQL-MINOR` | A SQL instance is present but the engine isn't a material memory consumer (under 2GB, or under 25% of allocation), so the host is sized/screened normally instead of excluded. Typically a bundled Express instance from an RDS Connection Broker, Veeam, or an LOB app. Component 2 measures the footprint as the larger of sampled p95 Total Server Memory and live `sqlservr` working set, and still runs the SQL attention checks (an Express DB near its limit appears as `| SQL: ...` in `Cap: Growth Verdict`) |
+| `VEEAM-MINOR` | Veeam is installed but only as an agent or installer service, i.e. this host is a backup *target*, not backup infrastructure. Sized/screened normally instead of excluded |
+| `HYPER-V` | The Hyper-V role is installed. `NO SCREEN` / `NO SIZING` regardless of every other role, and no CPU flags; memory pressure on the host still reads `URGENT` in Component 2: guest-side demand can't describe a host whose memory is consumed by its VMs |
+| `CPU-PRESSURE` | Screen only (also a Component 2 flag; neither raises it on a Hyper-V host) — average CPU since boot at or above 70%. Because averaging flattens spikes, a sustained average this high implies peaks well above it: this host needs *more* vCPU, not fewer |
 
 ## Deployment
 

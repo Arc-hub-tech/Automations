@@ -60,7 +60,7 @@ One SCVMM manages the whole Arc platform: one cluster per site, with each custom
 
 | Where | What |
 |---|---|
-| SentinelOne console | A Hyper-V host group or policy with the cluster exclusions: VM configuration and VHDX paths, the ClusterStorage folder, vmms.exe, vmwp.exe, vmcompute.exe and the Windows Cluster folder |
+| SentinelOne console | A Hyper-V host group or policy with the cluster exclusions (VM configuration and VHDX paths, the ClusterStorage folder, vmms.exe, vmwp.exe, vmcompute.exe and the Windows Cluster folder) and Veeam's host exclusions |
 | Network switches | Host ports trunked with the Management, Live Migration and Cluster VLANs and every VM VLAN, with no LACP. MTU set end to end only if jumbo frames are used |
 | SCVMM | A logical switch whose host adapters match HostNetworks in `cluster.json`: the same names, VLANs, subnets and bandwidth weights |
 | HPE support portal | The SPP release that the existing nodes run, and that lists Windows Server 2025 for your Gen10 models |
@@ -449,11 +449,50 @@ Then log on to the host and run `-Phase Next` again for start 4.
 
 ### After the script
 
-→ Add the host to backups.
+→ Rescan the cluster in Veeam and check the next backup and replication jobs succeed (see Veeam and the hosts).
 
 → Check the Datto site and monitoring policy.
 
 → Live-migrate a non-critical VM onto the new node and back off it.
+## Veeam and the hosts
+
+Veeam Backup and Replication protects every workload on the platform: daily backups, and hourly replicas to the secondary site for failover. The full standard (where Veeam runs, repositories, jobs, failover plans and testing) is in the Veeam section of the SCVMM baseline guide. This section covers the parts that touch the hosts and this script.
+
+### What Veeam puts on the hosts
+
+→ When Veeam adds the clusters (through SCVMM), it installs its transport components on every Hyper-V host at both sites. At the primary site the hosts read the changed data for backup and replication jobs (on-host processing). At the secondary site the hosts receive the replica data.
+
+→ Every hourly replication run takes a checkpoint of each protected VM and reads the changed blocks from the cluster shared volume. That load is on the primary hosts, and is watched against the thresholds in the SCVMM guide (job duration, CSV latency and host CPU).
+
+→ The secondary cluster's storage holds every replica and its restore points, so its CSV capacity is planned for replicas, not just for running VMs.
+
+### Firewall
+
+Baseline turns Windows Firewall on for all profiles. Veeam adds its own firewall rules when it installs its components on a host.
+
+→ New node: Baseline runs before Veeam reaches the host, so Veeam's rules are added afterwards in the normal way.
+
+→ Existing node where the firewall was previously off: Veeam may never have added its rules. After Baseline, rescan the host in Veeam and run a test of the jobs that cover it before moving to the next node.
+
+### SentinelOne exclusions
+
+The Hyper-V host policy in SentinelOne also needs Veeam's exclusions on the hosts: the Veeam services and processes, and the Veeam installation and temporary folders. Use the current list from Veeam's documentation for the release in use, and add it to the same policy as the Hyper-V and cluster exclusions. Without them, scanning can slow or break backup and replication jobs.
+
+### Maintenance and Veeam jobs
+
+→ Drain nodes outside the busiest replication windows where possible. A VM that live-migrates mid-job usually completes on retry, but draining a node while many jobs are running adds load and can cause warnings.
+
+→ For planned work on a whole site, disable the relevant Veeam jobs first and re-enable them afterwards, so they do not fail repeatedly.
+
+→ Never start or edit a replica at the secondary site by hand. Replicas are only started by a Veeam failover plan.
+
+### Adding a new node
+
+After SCVMM adds the node to the cluster and the script's Report passes:
+
+1. Rescan the cluster in Veeam, so the new node gets Veeam's components before it runs protected VMs.
+2. Check the next run of the backup and replication jobs that cover VMs on the node completes successfully.
+3. At the secondary site, confirm the node can receive replicas if the new node is in the secondary cluster.
 ## What Baseline changes
 
 ### Security defaults

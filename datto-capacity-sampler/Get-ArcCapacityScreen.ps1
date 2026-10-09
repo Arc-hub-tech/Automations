@@ -48,6 +48,14 @@
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
 
+    Version : 1.12 -  09/10/2026  (job output now says whether this node owns the core
+              cluster group - i.e. whether the cluster checks ran here or were skipped - and
+              whether the Hyper-V checks ran in-process or via the 64-bit relaunch. Both were
+              ambiguous on the first real cluster-node pilot run. Also fixes HV-PARTIAL on
+              every host: WS2025 raises an error for a VM with no Recovery checkpoints, which
+              was read as "can't list them". Parameter support is now checked up front,
+              not-found errors mean "none", and any other error is reported verbatim)
+
     Version : 1.11 -  09/10/2026  (Hyper-V host health checks replace NO SCREEN on
               hypervisors: VMs in a critical state, host memory headroom, low free space
               on VM volumes, stale/stuck/orphaned checkpoints, replication health, lost
@@ -517,7 +525,7 @@ function Get-HyperVHealth {
     $result   = [ordered]@{
         Unavailable = ''; Findings = @(); Flags = @(); Errors = @()
         VmCount = 0; Running = 0; MemoryGB = $null; AssignedGB = 0
-        LogicalProcs = $null; VcpuRunning = 0; VcpuRatio = $null; ClusterName = ''
+        LogicalProcs = $null; VcpuRunning = 0; VcpuRatio = $null; ClusterName = ''; CoreOwner = ''; RunMode = ''
     }
     $add = {
         param([int]$Priority, [string]$Flag, [string]$Text)
@@ -592,6 +600,7 @@ function Get-HyperVHealth {
         if ($clusSvc -and "$($clusSvc.Status)" -eq 'Running' -and (Get-Command Get-Cluster -ErrorAction SilentlyContinue)) {
             $result.ClusterName = [string](Get-Cluster -ErrorAction Stop).Name
             $coreOwner = [string](Get-ClusterGroup -Name 'Cluster Group' -ErrorAction Stop).OwnerNode.Name
+            $result.CoreOwner = $coreOwner
             if ($coreOwner -eq $env:COMPUTERNAME) {
                 $notUp = @(Get-ClusterNode -ErrorAction Stop | Where-Object { "$($_.State)" -ne 'Up' })
                 if ($notUp.Count -gt 0) {
@@ -682,15 +691,45 @@ function Get-HyperVHealth {
         $stale  = New-Object System.Collections.Generic.List[object]
         $orphan = New-Object System.Collections.Generic.List[string]
         $now    = Get-Date
-        $recoveryOk = $true
+        # Whether -SnapshotType exists is checked once, up front, rather than
+        # inferred from an error: on Windows Server 2025 the Recovery query
+        # raises an error for a VM that simply HAS no Recovery checkpoints, so
+        # treating any error as "can't list" set HV-PARTIAL on every host (found
+        # on the first real cluster-node pilot). Errors are now collected
+        # without stopping. "Not found" ones mean none; anything else still
+        # skips the orphan test, with the real error text reported.
+        $recoveryOk    = (Get-Command Get-VMSnapshot).Parameters.ContainsKey('SnapshotType')
+        $recoveryError = if ($recoveryOk) { '' } else { 'Get-VMSnapshot has no -SnapshotType parameter on this host' }
         foreach ($vm in $primary) {
             $snaps = @{}
             $list  = @(Get-VMSnapshot -VM $vm -ErrorAction SilentlyContinue)
             # Own try: -ErrorAction doesn't stop a parameter-binding error, so
             # a module without -SnapshotType would otherwise abort the whole
             # check for every VM.
-            try { $list += @(Get-VMSnapshot -VM $vm -SnapshotType Recovery -ErrorAction Stop) }
-            catch { $recoveryOk = $false }
+            if ($recoveryOk) {
+                $ev = $null
+                try {
+                    $list += @(Get-VMSnapshot -VM $vm -SnapshotType Recovery -ErrorAction SilentlyContinue -ErrorVariable ev)
+                } catch { $ev = @($_) }
+                # ObjectNotFound, or Hyper-V's own "unable to find" wording, is
+                # "this VM has none" - the normal case. Verified on WS2025:
+                # category ObjectNotFound, VirtualizationException, message
+                # "Unable to find a snapshot matching the given criteria."
+                # Deliberately narrow: a
+                # loose "not found" match would read a genuine failure (a
+                # missing file, say) as "no checkpoints" and let a VM mid-backup
+                # through as a failed merge. Anything else skips the orphan
+                # test and reports its text and category, so a wording this
+                # doesn't recognise shows up in the job output to be added.
+                $real = @($ev | Where-Object {
+                    $_ -and "$($_.CategoryInfo.Category)" -ne 'ObjectNotFound' -and
+                    "$($_.Exception.Message)" -notmatch 'unable to find'
+                })
+                if ($real.Count -gt 0) {
+                    $recoveryOk    = $false
+                    $recoveryError = "$($vm.Name): $($real[0].Exception.Message) [$($real[0].CategoryInfo.Category)]"
+                }
+            }
             foreach ($s in $list) {
                 if ($s -and "$($s.SnapshotType)" -notmatch 'Replica') { $snaps["$($s.Id)"] = $s }
             }
@@ -706,7 +745,7 @@ function Get-HyperVHealth {
                 $orphan.Add($vm.Name)
             }
         }
-        if (-not $recoveryOk) { $errors.Add('checkpoints: Recovery checkpoints could not be listed - orphaned .avhdx check skipped') }
+        if (-not $recoveryOk) { $errors.Add("checkpoints: Recovery checkpoints could not be listed ($recoveryError) - orphaned .avhdx check skipped") }
         if ($stale.Count -gt 0) {
             $oldest = $stale | Sort-Object Age -Descending | Select-Object -First 1
             & $add 5 'HV-CHECKPOINT' "$($stale.Count) old checkpoint(s), oldest $($oldest.Age)d on $($oldest.Vm)"
@@ -771,7 +810,9 @@ function Invoke-HyperVHealth {
     param([double]$AvailableGB)
     try {
         if ([Environment]::Is64BitProcess -or -not [Environment]::Is64BitOperatingSystem) {
-            return Get-HyperVHealth -AvailableGB $AvailableGB
+            $direct = Get-HyperVHealth -AvailableGB $AvailableGB
+            $direct.RunMode = 'in-process (64-bit)'
+            return $direct
         }
         $ps64 = Join-Path $env:WINDIR 'sysnative\WindowsPowerShell\v1.0\powershell.exe'
         $tmp  = Join-Path $env:TEMP ("arc-hvhealth-{0}.ps1" -f $PID)
@@ -790,12 +831,13 @@ function Invoke-HyperVHealth {
         }
         $parsed = ($json | Where-Object { $_ -like '{*' } | Select-Object -Last 1) | ConvertFrom-Json
         if (-not $parsed) { throw '64-bit health run returned no result' }
+        $parsed.RunMode = '64-bit relaunch from a 32-bit host process'
         $parsed
     } catch {
         [PSCustomObject]@{
             Unavailable = "health check failed: $($_.Exception.Message)"; Findings = @(); Flags = @(); Errors = @()
             VmCount = 0; Running = 0; MemoryGB = $null; AssignedGB = 0
-            LogicalProcs = $null; VcpuRunning = 0; VcpuRatio = $null; ClusterName = ''
+            LogicalProcs = $null; VcpuRunning = 0; VcpuRatio = $null; ClusterName = ''; CoreOwner = ''; RunMode = 'failed'
         }
     }
 }
@@ -1198,7 +1240,17 @@ try {
     if ($hv) {
         foreach ($f in @($hv.Findings)) { Write-Output "HV finding: $f" }
         foreach ($e in @($hv.Errors))   { Write-Output "HV error  : $e" }
-        if ($hv.ClusterName) { Write-Output "Cluster   : $($hv.ClusterName) (cluster-wide checks run on the core group owner only)" }
+        if ($hv.ClusterName) {
+            # Say which way it went - "no cluster findings" means something
+            # different on the owner (checked, healthy) than elsewhere (skipped)
+            $ownerText = if ($hv.CoreOwner -eq $env:COMPUTERNAME) {
+                'this node owns the core group - cluster checks RAN here'
+            } elseif ($hv.CoreOwner) {
+                "core group owned by $($hv.CoreOwner) - cluster checks skipped here"
+            } else { 'core group owner unknown - see HV error lines' }
+            Write-Output "Cluster   : $($hv.ClusterName) ($ownerText)"
+        }
+        if ($hv.RunMode) { Write-Output "HV checks : $($hv.RunMode)" }
     }
     Write-Output ''
     Write-Output 'NOTE: screening figures only, from a single instantaneous reading. Reclaim is'

@@ -8,7 +8,28 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Fixed
+- **Every Hyper-V host read `HV-PARTIAL`** (`Get-ArcCapacityScreen.ps1` v1.12). Found on the
+  first real cluster-node pilot, a Windows Server 2025 node with 2 running VMs. The explicit
+  Recovery checkpoint query raises an *error* for a VM that has no Recovery checkpoints, rather
+  than returning nothing. The check treated any error as "can't list them", so it skipped the
+  orphaned-`.avhdx` test on effectively every host. The stand-ins had returned an empty list, so
+  testing hadn't caught it. Now:
+  - `-SnapshotType` support is checked once, up front, instead of being inferred from an error.
+  - Errors are collected without stopping. ObjectNotFound, or Hyper-V's own "unable to find"
+    wording, means the VM has none.
+  - Anything else still skips the orphan test, and reports its exact text and category in the job
+    output. The match is deliberately narrow: a loose "not found" would read a genuine failure as
+    "no checkpoints" and let a VM mid-backup through as a failed merge.
+
 ### Added
+- **Hyper-V pilot diagnostics** (`Get-ArcCapacityScreen.ps1` v1.12). The first real run on a
+  cluster node, via Datto as SYSTEM, worked with no `HV error` lines. That run confirmed the
+  module loads, `Get-VMHost` returns hypervisor-level figures (767.7GB, 72 LP), and cluster
+  detection works. But the output couldn't show whether that node owned the core cluster group, so
+  "no cluster findings" could mean either "checked and healthy" or "skipped here". The `Cluster :`
+  line now says which, and a new `HV checks :` line says whether the checks ran in-process or via
+  the 64-bit relaunch.
 - **Hyper-V host health checks in the Screen** (`Get-ArcCapacityScreen.ps1` v1.11). Hypervisors
   used to get only `NO SCREEN`. Now they get point-in-time checks for what takes hosts down, read as
   SYSTEM from the Hyper-V and FailoverClusters modules (no history, no login, nothing changed):

@@ -82,6 +82,14 @@
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
 
+    Version : 1.12 -  09/10/2026  (multi-instance SQL hosts: the combined live footprint
+              of every running sqlservr is compared with the allocation - "2 instances
+              hold XGB of YGB - combined caps too high" (SQL-CAP) - since the counters
+              cover only one instance and per-instance caps can each look fine. The squeeze
+              finding names "another SQL instance" first on those hosts. Live footprint is
+              now the larger of private bytes and working set per process. From the first
+              real two-instance pilot host)
+
     Version : 1.11 -  09/10/2026  (role detection aligned with the Screen. SQL excluded
               only when material - >=2GB and >=25% of allocation, footprint the larger of
               sampled p95 Total Server Memory and live sqlservr working set - otherwise
@@ -541,11 +549,17 @@ function Get-ServerRole {
     # either way, so an Express database near its limit still surfaces.
     $isSql = ($svc.ContainsKey('MSSQLSERVER')) -or (& $hasSvc 'MSSQL$*')
     if ($isSql) {
-        $liveGB = 0.0
+        # Per process, the larger of private bytes and working set: working
+        # set alone understates a host that's paging (the pool is partly on
+        # disk), private bytes alone understates one using locked pages.
+        $liveGB    = 0.0
+        $procCount = 0
         try {
             $sqlProcs = @(Get-Process -Name 'sqlservr' -ErrorAction SilentlyContinue)
-            if ($sqlProcs.Count -gt 0) {
-                $liveGB = [math]::Round((($sqlProcs | Measure-Object -Property WorkingSet64 -Sum).Sum) / 1GB, 2)
+            $procCount = $sqlProcs.Count
+            if ($procCount -gt 0) {
+                $bytes  = ($sqlProcs | ForEach-Object { [math]::Max([double]$_.WorkingSet64, [double]$_.PrivateMemorySize64) } | Measure-Object -Sum).Sum
+                $liveGB = [math]::Round($bytes / 1GB, 2)
             }
         } catch { }
         $sqlGB = [math]::Max($liveGB, $SqlSampledGB)
@@ -643,7 +657,10 @@ function Get-ServerRole {
     # only where the role is actually installed, not merely available.
     if ($svc.ContainsKey('vmms')) { $role = 'Hypervisor'; $flags.Add('HYPER-V') }
 
-    [PSCustomObject]@{ Role = $role; Flags = $flags; MySql = $mysql; SqlPresent = $isSql; SqlGB = $sqlGB }
+    [PSCustomObject]@{
+        Role = $role; Flags = $flags; MySql = $mysql
+        SqlPresent = $isSql; SqlGB = $sqlGB; SqlLiveGB = $liveGB; SqlRunning = $procCount
+    }
 }
 
 # Role floors: minimum sensible allocation, independent of measured demand
@@ -770,6 +787,11 @@ try {
     # arrive as a bare object with no usable .Count.
     $sqlInstances  = @(if ($sqlPresent) { Get-SqlInstanceInfo })
     $allExpress    = ($sqlInstances.Count -gt 0) -and (@($sqlInstances | Where-Object { -not $_.IsExpress }).Count -eq 0)
+    # Multi-instance means more than one engine actually RUNNING - installed
+    # but stopped instances don't compete for memory
+    $sqlRunning    = [int]$roleInfo.SqlRunning
+    $sqlLiveGB     = [double]$roleInfo.SqlLiveGB
+    $multiSql      = $sqlRunning -gt 1
 
     # Express caps every database at 10GB of data, and the engine stops
     # accepting writes at the limit - the one finding here that's an outage
@@ -816,7 +838,7 @@ try {
         }
 
         if ($pleP05 -ge 0) { $sqlNote += ", PLE p05 ${pleP05}s (floor ${pleFloor}s)" }
-        if ($sqlInstances.Count -gt 1) { $sqlNote += " | $($sqlInstances.Count) instances, one sampled" }
+        if ($multiSql) { $sqlNote += " | $sqlRunning instances, one sampled, all hold ${sqlLiveGB}GB" }
 
         if ($confident) {
             # max server memory unset, or set so high the OS is left short.
@@ -854,14 +876,39 @@ try {
             # something outside SQL is taking memory from it (or the cap was
             # lowered mid-window, which reads the same). 1GB minimum so small
             # Express targets don't trip it on noise.
+            # On a multi-instance host the likeliest squeezer is the other
+            # instance, so say so - "OS pressure" alone sent the reader the
+            # wrong way on the first real two-instance host.
             if ($null -ne $targetMax -and $targetP05 -lt ($targetMax * 0.8) -and ($targetMax - $targetP05) -ge 1) {
-                $sqlFindings.Add("target fell to ${targetP05}GB from ${targetMax}GB - OS pressure or a lowered cap")
+                $suspects = if ($multiSql) { 'another SQL instance, OS pressure or a lowered cap' } else { 'OS pressure or a lowered cap' }
+                $sqlFindings.Add("target fell to ${targetP05}GB from ${targetMax}GB - $suspects")
                 if (-not ($flags -contains 'SQL-MEM')) { $flags.Add('SQL-MEM') }
             }
         }
     }
     elseif ($flags -contains 'SQL') {
         $sqlNote = 'SQL counters not sampled'
+        if ($multiSql) { $sqlNote += " | $sqlRunning instances hold ${sqlLiveGB}GB" }
+    }
+
+    # Combined footprint on a multi-instance host. The cap check above sees
+    # only the one instance the sampler reads, so two instances whose caps
+    # are each reasonable but together exceed the host can't trip it - the
+    # first real two-instance host (two Standard instances on 12GB, 0.72GB
+    # free, 179 faults/s) read only as "squeezed". This uses the live footprint
+    # of every sqlservr process, which needs no counters and covers all
+    # instances. Same half-reserve bar as the single-instance check, so the
+    # two agree on what "leaves the OS too little" means; the advised total is
+    # the full reserve. Inserted ahead of the squeeze finding, since it names
+    # the cause the squeeze is the symptom of.
+    if ($confident -and $multiSql -and $sqlLiveGB -gt 0) {
+        $reserveGB = Get-SqlOsReserveGB -AllocatedGB $allocatedGB
+        if ($sqlLiveGB -gt ($allocatedGB - [math]::Max(1, $reserveGB / 2))) {
+            $capGB = [int]($allocatedGB - $reserveGB)
+            $at = [math]::Min($sqlFindings.Count, @($sqlFindings | Where-Object { $_ -like 'Express DB*' -or $_ -like 'max server memory*' }).Count)
+            $sqlFindings.Insert($at, "$sqlRunning instances hold ${sqlLiveGB}GB of ${allocatedGB}GB - combined caps too high, total at ${capGB}GB")
+            if (-not ($flags -contains 'SQL-CAP')) { $flags.Add('SQL-CAP') }
+        }
     }
 
     # =======================================================================
@@ -1356,6 +1403,8 @@ try {
                 VcpuGrowth      = $vcpuGrowth
                 CpuGrowthVerdict = $cpuGrowthVerdict
                 SqlFootprintGB  = $roleInfo.SqlGB
+                SqlRunning      = $sqlRunning
+                SqlLiveGB       = $sqlLiveGB
                 SqlNote         = $sqlNote
                 SqlFindings     = ($sqlFindings -join '; ')
                 SqlEditions     = (($sqlInstances | ForEach-Object { '{0}={1}' -f $_.Name, $_.Edition }) -join '; ')

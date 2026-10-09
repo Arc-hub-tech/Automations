@@ -300,8 +300,8 @@ Findings are listed most actionable first. When they don't all fit in the UDF, t
 | Flag | Fires when | Usual fix |
 |---|---|---|
 | `SQL-EXPRESS-CAP` | An Express database is at **8GB** or more of its 10GB limit. Express stops accepting writes at the limit, so this is the one finding that's an outage rather than a slowdown. Also fires when the only instances are Express and PLE is low with the pool full: Express caps its buffer pool at about 1.4GB, so more RAM won't help | Archive/purge data, or move to Standard edition |
-| `SQL-CAP` | The peak Target leaves the OS less than **half** the recommended reserve. With `max server memory` unset, Target climbs to nearly all of physical memory, so this means the cap is unset or set too high. Recommended reserve is 1GB, plus 1GB per 4GB up to 16GB, plus 1GB per 8GB above that (Jonathan Kehayias's guidance; 32GB → 7GB). Half rather than the whole reserve, because a cap a few GB above the guidance is common and usually fine | Set `max server memory` to the figure in the verdict |
-| `SQL-MEM` | Either: PLE p05 is below **300s per 4GB of buffer pool** (minimum 300s) *while* the pool sits at Target, i.e. SQL is using all it's allowed and pages still don't stay. Or: Target p05 is below **80%** of its peak (and at least 1GB down), meaning SQL was made to shrink, normally by memory pressure from outside SQL (a lowered cap mid-window reads the same) | Raise the cap or add RAM; for the squeeze, find what else is using memory |
+| `SQL-CAP` | The peak Target leaves the OS less than **half** the recommended reserve. With `max server memory` unset, Target climbs to nearly all of physical memory, so this means the cap is unset or set too high. Recommended reserve is 1GB, plus 1GB per 4GB up to 16GB, plus 1GB per 8GB above that (Jonathan Kehayias's guidance; 32GB → 7GB). Half rather than the whole reserve, because a cap a few GB above the guidance is common and usually fine. **On a host running more than one instance**, also fires when the combined live footprint of every `sqlservr` process (the larger of private bytes and working set, per process) crosses the same bar: `2 instances hold 10.8GB of 12GB - combined caps too high, total at 8GB`. The counters cover only one instance, so caps that each look reasonable can together exceed the host | Set `max server memory` to the figure in the verdict; on a multi-instance host, split that total across the instances |
+| `SQL-MEM` | Either: PLE p05 is below **300s per 4GB of buffer pool** (minimum 300s) *while* the pool sits at Target, i.e. SQL is using all it's allowed and pages still don't stay. Or: Target p05 is below **80%** of its peak (and at least 1GB down), meaning SQL was made to shrink, normally by memory pressure from outside SQL (a lowered cap mid-window reads the same). On a multi-instance host the verdict names **another SQL instance** as the first suspect | Raise the cap or add RAM; for the squeeze, find what else is using memory |
 
 Notes on the thresholds:
 - **Total below Target is not a finding on its own.** An instance whose data fits in less than its
@@ -312,8 +312,9 @@ Notes on the thresholds:
 - **Express database size** comes from the largest user `.mdf` in each instance's default data
   directory. Databases stored elsewhere or split across `.ndf` files aren't seen.
 - **Only one instance is sampled.** The sampler reads counters for one instance per host, so on a
-  multi-instance host the note says `N instances, one sampled`. Editions are still read for every
-  instance.
+  multi-instance host the note says `N instances, one sampled, all hold XGB`. The combined figure
+  comes from the live `sqlservr` processes, which cover every running instance. Editions are still
+  read for every instance.
 - **Instances are read through the 64-bit registry view**, so a 32-bit host process still sees
   64-bit instances.
 - **Calibrate against your estate.** All thresholds are reasoned starting points. Use the CSV

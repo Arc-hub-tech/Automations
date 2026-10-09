@@ -9,6 +9,23 @@ script versions independently — see its own header comment for its current ver
 _Work in progress on the `develop` branch._
 
 ### Fixed
+- **Multi-instance SQL hosts couldn't raise `SQL-CAP`** (`Read-ArcCapacityBuffer.ps1` v1.12).
+  Found on the first real two-instance pilot host: two Standard instances on 12GB, 0.72GB free,
+  179 hard faults/s. It read only as "target fell to 6.4GB from 9.6GB - OS pressure or a lowered
+  cap". The counters cover one instance, so caps that are each reasonable but together exceed the
+  host were invisible, and the squeeze finding named the wrong suspects.
+  - **New `SQL-CAP` trigger:** on hosts running more than one instance, the combined live footprint
+    of every `sqlservr` process is compared with the allocation, using the same half-reserve bar as
+    the single-instance check. That gives `2 instances hold 10.8GB of 12GB - combined caps too
+    high, total at 8GB`.
+  - **The squeeze finding** names "another SQL instance" first on those hosts.
+  - **The live footprint** is now the larger of private bytes and working set per process. Working
+    set alone understates a host that's paging.
+  - **The CSV export** gains `SqlRunning` and `SqlLiveGB`.
+
+  Replayed against synthetic buffers: the two-instance host now leads with the combined finding,
+  two instances with room spare raise nothing, and a single-instance squeeze keeps its original
+  wording.
 - **Every Hyper-V host read `HV-PARTIAL`** (`Get-ArcCapacityScreen.ps1` v1.12). Found on the
   first real cluster-node pilot, a Windows Server 2025 node with 2 running VMs. The explicit
   Recovery checkpoint query raises an *error* for a VM that has no Recovery checkpoints, rather

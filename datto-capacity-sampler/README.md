@@ -128,12 +128,13 @@ RAM   RoleFloor   = flat per-role minimum, except DomainController: raised to
       Reclaim     = Allocated − Target when positive, floored to a 2GB increment,
                     suppressed below 4GB (not worth a change window)
       Growth      = Target − Allocated when positive, ceilinged to a 2GB increment.
-                    Escalates independently whenever MEM-PRESSURE is active, using
-                    max Committed rather than p95 (active thrashing is a peak
-                    problem, not a typical-case one) with the same multiplier the
-                    current mode already selected. If pressure is active but even
-                    that escalation shows no shortfall, flags REVIEW rather than
-                    forcing a number the math doesn't support
+                    Escalates whenever MEM-PRESSURE is active, to max( Target,
+                    peak Committed ): the worst moment always fits in RAM (active
+                    thrashing is a peak problem a percentile can understate),
+                    without adding the multiplier on top of a figure that's
+                    already the peak. If pressure is active but even that shows no
+                    shortfall, flags REVIEW rather than forcing a number the math
+                    doesn't support
 
 CPU   EffCores    = (p95 Total% ÷ 100) × vCPU
       Reduce      = current vCPU − max( RoleFloor, ceil( EffCores ÷ 0.65 ) [rounded even] ),
@@ -722,7 +723,7 @@ $rows | Sort-Object { [int]$_.ReclaimGB } -Descending |
         Select-Object Hostname,Role,AllocatedGB,CommitP95GB,ReclaimGB,vCPU,RecommendedVcpu -First 25
 
 # Under-provisioned hosts, most urgent first (memory-pressure escalation sorts to the top
-# since it uses the max-based basis and rarely gets suppressed to 0 the way p95-only does)
+# since it sizes to at least the peak and rarely gets suppressed to 0 the way p95-only does)
 # Filter on the flags, not just the numbers: MySQL URGENT (RAM) and queue REVIEW (CPU) hosts
 # carry GROWTH / CPU-GROWTH with a zero figure. Split, don't -match: GROWTH is inside CPU-GROWTH.
 $rows | Where-Object { $f = $_.Flags -split ','; [int]$_.GrowthGB -gt 0 -or [int]$_.VcpuGrowth -gt 0 -or
@@ -840,7 +841,7 @@ actual alert for that condition; a coverage gap in `Cap: Window` is the visible 
 | Reclaim `000` on an apparently idle server | Check `Cap: RAM Detail` for `MEM-PRESSURE` — a leaking process can hold committed bytes high |
 | UDFs populated but stale | `Arc — Capacity Analyse` hasn't run recently; check the timestamp in `Cap: Verdict` |
 | `Cap: Growth GB` non-zero *and* `Cap: Reclaim GB` shows `000` at the same time | Expected — a device is only ever a candidate on one side of the target, never both |
-| `Cap: Growth Verdict` says `URGENT` and the figure looks larger than `Cap: RAM Detail`'s p95 numbers suggest | Working as intended — the memory-pressure escalation path uses max Committed, not p95, specifically because active thrashing is a peak problem a percentile can understate |
+| `Cap: Growth Verdict` says `URGENT` and the figure looks larger than `Cap: RAM Detail`'s p95 numbers suggest | Working as intended. Under memory pressure the target is raised to at least the **peak** Committed, so the worst moment fits in RAM, because active thrashing is a peak problem a percentile can understate. The peak isn't multiplied again, so the figure is the larger of p95 × 1.25 and the peak |
 | `Cap: Growth Verdict` says `URGENT` but `Cap: Growth GB` is `000` | Expected on a `MYSQL` host - commit carries the InnoDB buffer pool, so no GB figure is derived from it. The verdict states whether the configured `innodb_buffer_pool_size` explains the pressure; if it's over 75% of allocation, lowering it is often the fix rather than adding RAM |
 | `Cap: Growth vCPU` stays `00` despite `CPU-PRESSURE` being flagged | Check `Cap: Growth Verdict` for `REVIEW` — that means the pressure is queue-driven rather than total%-driven, and the sizing model doesn't fabricate a core count from queue depth alone; needs a manual look |
 

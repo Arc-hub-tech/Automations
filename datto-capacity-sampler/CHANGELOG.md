@@ -8,6 +8,32 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Changed
+- **URGENT growth is sized to max(p95 × 1.25, peak) rather than peak × 1.25**
+  (`Read-ArcCapacityBuffer.ps1` v1.16). Measured on a 507-device run of v1.15. Once the
+  hard-fault false positives were gone, the URGENT list itself held up: most of the 224 hosts are
+  genuinely short, 69 with their *typical* commit above RAM. The sizes were the problem.
+  - **What was wrong:** multiplying the peak by 1.25 added 25% on top of a figure that's already
+    the worst moment. It asked for 1,532GB, and inflated most on RDS session hosts, whose
+    logon-storm peaks run far above their busy-time commit. A 24GB host with p95 commit 23GB and a
+    39GB peak was told "+26GB".
+  - **What it does now:** the target is the normal p95 × 1.25, raised to the peak if the peak is
+    higher, so the worst moment still always fits in RAM and spike-thrashing hosts stay covered.
+    Conservative mode is unchanged in effect, since its basis is already the peak (× 1.4).
+
+  | On that run | Before (peak × 1.25) | Now |
+  |---|---|---|
+  | All URGENT (224 hosts) | 1,532GB | 1,016GB |
+  | RDS session hosts (58) | 850GB | 486GB |
+  | Typical commit above RAM (69) | 392GB | 350GB |
+  | Dip-only, p95 under 80% of RAM (25) | 104GB | 22GB (20 move to `MEM-REVIEW`) |
+
+  - **Replayed on synthetic buffers built to the export's figures:**
+    - the session host: +26GB → +16GB, with the peak still fitting;
+    - a 4GB host short all the time: +4GB → +2GB, to 6GB;
+    - a dip-only host: now `MEM-REVIEW`;
+    - a 24GB host with p95 commit 44GB: unchanged at +32GB.
+
 ### Fixed
 - **Hard faults alone triggered `MEM-PRESSURE` on half the flagged estate**
   (`Read-ArcCapacityBuffer.ps1` v1.15).

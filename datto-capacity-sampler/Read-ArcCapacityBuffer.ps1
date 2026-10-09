@@ -36,15 +36,13 @@
             Reclaim     = Allocated - Target when positive, floored to a 2GB
                           increment, suppressed below 4GB (not worth a change window)
             Growth      = Target - Allocated when positive, ceilinged to a 2GB
-                          increment. Escalates independently of Target whenever the
-                          memory-pressure guardrail is active (min available <1GB or
-                          p95 faults >10/s), using max Committed rather than p95 -
-                          active thrashing is a peak problem, not a typical-case one -
-                          with the same mode-appropriate multiplier as the primary
-                          target (shared via Get-SizingTarget, so the two can't drift
-                          onto different multipliers). If pressure is active but even
-                          that escalation shows no shortfall, flags REVIEW rather than
-                          forcing a number the math doesn't support.
+                          increment. Escalates whenever the memory-pressure guardrail
+                          is active (min available <1GB, or p95 faults >10/s while min
+                          available <20% of RAM) to max( Target, peak Committed ): the
+                          worst moment always fits in RAM, without adding the
+                          multiplier on top of a figure that's already the peak. If
+                          pressure is active but even that shows no shortfall, flags
+                          REVIEW rather than forcing a number the math doesn't support.
       CPU   EffCores    = (p95 Total% / 100) x vCPU
             Reduce      = current vCPU minus max( RoleFloor, ceil( EffCores / 0.65 )
                           [rounded even] ) when that's lower than current. Held
@@ -81,6 +79,12 @@
               usrExportPath    String   default ''    Optional UNC for per-device CSV row
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
+
+    Version : 1.16 -  09/10/2026  (URGENT growth sized to max(p95 x1.25, peak commit)
+              rather than peak x1.25 - the peak always fits, without 25% added on top of
+              the worst moment. On a 224-host URGENT run: 1,532GB -> 1,016GB, session hosts
+              850 -> 486GB, short-all-the-time hosts barely moved (392 -> 350GB), and 20 of
+              25 dip-only hosts fall to MEM-REVIEW instead of a growth figure)
 
     Version : 1.15 -  09/10/2026  (hard faults alone no longer trigger MEM-PRESSURE: they
               count only while min available is under 20% of RAM. Memory\Pages Input/sec
@@ -1363,12 +1367,20 @@ try {
         # real hard faults) are a more direct signal than a percentile crossing
         # a threshold, and can fire even when the trigger above doesn't - a
         # host can be thrashing on short spikes that a 14-day p95 smooths over.
-        # Uses max, not p95, since the concern here is the peak that's actually
-        # causing the pain, not the typical case - but the SAME mode-appropriate
-        # multiplier as the primary target, via the shared helper, so this can't
-        # silently end up narrower than standard mode's own margin.
+        #
+        # Target = the primary target (p95 x multiplier, or the floor), raised
+        # to the PEAK if the peak is higher: the worst moment always fits in
+        # RAM, so spike-thrashing is still covered. It was peak x multiplier,
+        # which added 25% on top of a figure that is already the worst moment;
+        # on a 224-host URGENT population that asked for 1,532GB, inflated most
+        # on RDS session hosts whose logon-storm peaks run far above their
+        # busy-time commit ("+26GB" on a 24GB host with p95 commit 23GB). This
+        # asks 1,016GB: short-all-the-time hosts barely move (392 -> 350GB),
+        # and 20 of 25 dip-only hosts (p95 under 80% of RAM) get no number and
+        # fall to the MEM-REVIEW path below instead. Conservative mode is
+        # unchanged in effect - its basis is already the peak, x1.4.
         if ($memPressure) {
-            $pressureTarget = Get-SizingTarget -FloorGB $ramFloorGB -BasisGB $commitMax -Multiplier $multiplier
+            $pressureTarget = [math]::Max($targetGB, [math]::Round($commitMax, 2))
             $pressureRaw    = $allocatedGB - $pressureTarget
             $pressureGrowth = if ($pressureRaw -lt 0) { Get-CeilEven -Value (-$pressureRaw) } else { 0 }
             if ($pressureGrowth -gt $growthGB) { $growthGB = $pressureGrowth }

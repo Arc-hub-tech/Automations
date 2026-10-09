@@ -8,7 +8,41 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Added
+- **Cap-or-RAM decision for SQL hosts under memory pressure** (`Read-ArcCapacityBuffer.ps1` v1.13).
+  SQL hosts under pressure read `URGENT ... unsized`, which said "act" but not "do what". The first
+  real two-instance pilot host showed why that matters. It looked like an over-cap problem, but the
+  Screen's process list showed one busy instance and about 5–6GB committed by everything else on
+  12GB: capping SQL would have starved it. The answer was RAM.
+  - **The split:** every sample already records both total committed memory and the sampled
+    instance's Total Server Memory, so their difference measures everything else over the window.
+  - **Cap verdict:** when SQL's measured pool fits beside that remainder plus headroom (8%,
+    minimum 1.5GB) but the instance is allowed past it, the verdict is `cap <instance> max server
+    memory at N GB` (`SQL-CAP`, no `GROWTH`).
+  - **RAM verdict:** otherwise it's `RAM short: ... -> +X GB -> N GB, cap <instance> at M GB`. This
+    is the first SQL case that fills `Cap: Growth GB`, from SQL's own counters rather than inflated
+    total commit.
+  - **Instance name:** the sampled instance is named from the sampler's counter cache.
+  - **Withheld when commit falls below SQL's own memory** (locked pages), rather than built on a
+    remainder of nothing.
+  - **Low PLE is stated, not added to the number.** A ×1.25 uplift was tried and asked a 128GB host
+    for +62GB.
+  - **Healthy hosts are untouched:** applied only on SQL hosts under `MEM-PRESSURE`. Elsewhere it's
+    printed as "not applied".
+
+  Replayed: the pilot host as measured gives `+4GB -> 16GB, cap MSSQLSERVER at 7.4GB`; a cap-fixable
+  host gives `cap SAGE max server memory at 21.5GB`; locked-pages shapes give no split.
+
 ### Fixed
+- **`[math]::Max(0, x)` and similar silently rounded decimals to whole numbers**
+  (`Read-ArcCapacityBuffer.ps1` v1.13, `Get-ArcCapacityScreen.ps1` v1.13). With an integer literal
+  first, PowerShell binds the `Max(int, int)` overload, so `Max(0, 3.4)` is 3. Affected:
+  - the SQL half-reserve bars
+  - the conservative-mode reclaim minimum (`Max(8, alloc × 0.4)`: 12.8GB read as 13GB)
+  - the Screen's `HV-MEM` threshold (6.4GB read as 6GB)
+  
+  All now use decimal literals. Found while testing the cap-or-RAM split, where "everything else"
+  read 3GB instead of 3.4GB.
 - **Multi-instance SQL hosts couldn't raise `SQL-CAP`** (`Read-ArcCapacityBuffer.ps1` v1.12).
   Found on the first real two-instance pilot host: two Standard instances on 12GB, 0.72GB free,
   179 hard faults/s. It read only as "target fell to 6.4GB from 9.6GB - OS pressure or a lowered

@@ -286,13 +286,36 @@ the decision is auditable from the UDF rather than being an unexplained suppress
 
 ### SQL Server attention signals
 
-A SQL Server host's RAM is never sized, but Component 2 does check it for signs it needs a look.
-The inputs are the counters the sampler already collects (Total/Target Server Memory and PLE) plus
-the registry, so this needs no sampler change and no database login. Each finding sets a flag and
-adds a short reason to `Cap: Growth Verdict`, as `REVIEW - ...`. Under `MEM-PRESSURE` it reads
-`URGENT - ...` and sets `GROWTH`, with `Cap: Growth GB` at `000`, in the same way as MySQL.
-`Cap: Verdict` carries `EXCLUDED (SQLServer) | SQL pool p95 20.1GB of target 22GB, PLE p05 840s
-(floor 1500s)`.
+A SQL Server host's RAM is never sized from total commit, but Component 2 does check it for signs
+it needs a look. The inputs are the counters the sampler already collects (Total/Target Server
+Memory and PLE) plus the registry, so this needs no sampler change and no database login. Each
+finding sets a flag and adds a short reason to `Cap: Growth Verdict`, as `REVIEW - ...`. Under
+`MEM-PRESSURE` it reads `URGENT - ...`. `Cap: Verdict` carries `EXCLUDED (SQLServer) | SQL pool p95
+20.1GB of target 22GB, PLE p05 840s (floor 1500s)`.
+
+**Under memory pressure, Component 2 decides between a cap and more RAM.** Every sample records both
+total committed memory and the sampled instance's Total Server Memory. The difference between them
+is everything else: the OS, other processes and other instances, measured over the 14 days rather
+than guessed. The decision leads `Cap: Growth Verdict`:
+
+| Case | Verdict | Flags / Growth GB |
+|---|---|---|
+| SQL's measured pool fits beside everything else (p95) plus headroom, but the instance is currently allowed past that | `cap SAGE max server memory at 21.5GB - other processes need 7.9GB, SQL fits in 18GB` | `SQL-CAP`, no `GROWTH`, `000`. A cap fixes it; it isn't a RAM candidate |
+| It doesn't fit | `RAM short: SQL 7.2GB (low PLE) + other 7.1GB + 1.5GB headroom -> +4GB -> 16GB, cap MSSQLSERVER at 7.4GB` | `GROWTH`, and **`Cap: Growth GB` is filled**: the figure comes from SQL's own counters and the measured remainder, not inflated total commit |
+
+- **What SQL needs:** its measured pool (p95), not its Target. SQL grows to whatever it's allowed,
+  so Target says what it's permitted, not what it needs.
+- **Low PLE** means SQL would like more, but there's no measurement of how much. It's stated in the
+  text, not added to the number. A ×1.25 uplift asked a 128GB host for +62GB, because the PLE floor
+  gets very strict on large pools.
+- **Headroom** is 8% of the allocation, minimum 1.5GB.
+- **Which instance:** the advice names the sampled instance, read from the sampler's counter cache.
+- **Locked pages:** with Lock Pages in Memory, SQL's buffer pool sits outside committed memory, so
+  "everything else" would read as nothing. When committed memory falls below SQL's own memory in
+  more than a quarter of samples, no decision is made, and the note says `commit excludes SQL
+  (locked pages?) - no cap/RAM split`.
+- **No pressure:** on a host without memory pressure the decision is printed in the job output,
+  marked not applied, and never reaches a UDF.
 
 Findings are listed most actionable first. When they don't all fit in the UDF, the verdict ends
 `(+N, see flags)`.
@@ -389,9 +412,10 @@ to sum it. Build a reclaim worklist by filtering `Cap: Reclaim GB` **not equal t
 growth worklist, see the next paragraph: the number alone isn't enough.
 
 **Growth worklists need the flag, not just the number - for RAM and CPU alike.** A MySQL/MariaDB
-or SQL Server host under memory pressure sets `GROWTH` and reads `URGENT` but leaves `Cap: Growth
-GB` at `000`, because its commit figure carries the configured buffer pool and can't be turned into
-a safe GB number (see the MySQL and SQL Server notes under Guardrails). Filtering on `Cap: Growth GB` not equal to `000` silently misses
+host under memory pressure, or a SQL Server host whose cap-or-RAM split can't be made (locked
+pages, or not enough samples with SQL counters), sets `GROWTH` and reads `URGENT` but leaves `Cap:
+Growth GB` at `000`, because its commit figure carries the configured buffer pool and can't be turned
+into a safe GB number (see the MySQL and SQL Server notes under Guardrails). Filtering on `Cap: Growth GB` not equal to `000` silently misses
 those hosts, so filter on the `GROWTH` flag instead.
 
 The same applies to CPU. Queue-driven CPU pressure that the

@@ -48,6 +48,10 @@
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
 
+    Version : 1.13 -  09/10/2026  (HV-MEM threshold no longer rounded to a whole GB:
+              [math]::Max(2, x) binds the integer overload in PowerShell, so 5% of 128GB
+              read as 6GB rather than 6.4GB. Decimal literals now)
+
     Version : 1.12 -  09/10/2026  (job output now says whether this node owns the core
               cluster group - i.e. whether the cluster checks ran here or were skipped - and
               whether the Hyper-V checks ran in-process or via the 64-bit relaunch. Both were
@@ -584,7 +588,7 @@ function Get-HyperVHealth {
     #    and a healthy host would flag.
     try {
         if ($AvailableGB -ge 0 -and $result.MemoryGB) {
-            $minFree = [math]::Min(8, [math]::Max(2, $result.MemoryGB * 0.05))
+            $minFree = [math]::Min(8.0, [math]::Max(2.0, $result.MemoryGB * 0.05))
             if ($AvailableGB -lt $minFree) {
                 & $add 2 'HV-MEM' "host memory low: ${AvailableGB}GB free of $($result.MemoryGB)GB (VMs assigned $($result.AssignedGB)GB)"
             }

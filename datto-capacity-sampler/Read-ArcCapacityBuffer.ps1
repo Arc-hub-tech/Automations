@@ -82,6 +82,17 @@
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
 
+    Version : 1.13 -  09/10/2026  (SQL hosts under memory pressure get a cap-or-RAM
+              decision instead of "URGENT, unsized": per-sample commit minus the sampled
+              instance's Total Server Memory measures everything else over 14 days, so
+              "cap <instance> at N GB" or "RAM short ... -> grow to N GB, then cap at M GB"
+              (which fills Growth GB) can be stated from evidence. Names the sampled
+              instance from the sampler's counter cache. From the first real two-instance
+              pilot host, where the answer was RAM, not caps. Withheld where commit falls
+              below SQL's own memory (locked pages). Also fixes [math]::Max(0, x) and
+              similar binding PowerShell's integer overload and rounding decimals away -
+              in the half-reserve bars and the conservative-mode reclaim minimum)
+
     Version : 1.12 -  09/10/2026  (multi-instance SQL hosts: the combined live footprint
               of every running sqlservr is compared with the allocation - "2 instances
               hold XGB of YGB - combined caps too high" (SQL-CAP) - since the counters
@@ -338,6 +349,20 @@ function Get-SqlInstanceInfo {
             if ($base) { $base.Dispose() }
         }
     }
+}
+
+# Which instance the sampler's SQL counters describe, from the counter set it
+# cached (sqlcounters.json beside the buffer): 'SQLServer:Memory Manager' is
+# the default instance, 'MSSQL$NAME:Memory Manager' a named one. So cap advice
+# can name the instance it applies to. $null if the cache can't be read.
+function Get-SampledSqlInstance {
+    try {
+        $cache = Get-Content -LiteralPath (Join-Path $InstallDir 'sqlcounters.json') -Raw -ErrorAction Stop | ConvertFrom-Json
+        $set   = [string]$cache.MemorySet
+        if ($set -match '^MSSQL\$(.+?):') { return $Matches[1] }
+        if ($set -match '^SQLServer:')     { return 'MSSQLSERVER' }
+    } catch { }
+    $null
 }
 
 # Memory to leave the OS when capping SQL Server: 1GB, plus 1GB per 4GB up to
@@ -777,6 +802,8 @@ try {
     #   one of them - the note says so.
     # =======================================================================
     $sqlNote       = ''
+    $sqlSizing     = $null   # cap-or-RAM decision, used only under MEM-PRESSURE
+    $sampledInst   = if ($sqlPresent) { Get-SampledSqlInstance } else { $null }
     $sqlFindings   = New-Object System.Collections.Generic.List[string]
     $sqlTargetVals = Get-NumericColumn -Rows $rows -Column 'SqlTargetGB'
     $pleVals       = Get-NumericColumn -Rows $rows -Column 'SqlPLE'
@@ -838,7 +865,90 @@ try {
         }
 
         if ($pleP05 -ge 0) { $sqlNote += ", PLE p05 ${pleP05}s (floor ${pleFloor}s)" }
-        if ($multiSql) { $sqlNote += " | $sqlRunning instances, one sampled, all hold ${sqlLiveGB}GB" }
+        if ($multiSql) {
+            $which = if ($sampledInst) { " ($sampledInst)" } else { '' }
+            $sqlNote += " | $sqlRunning instances, one sampled$which, all hold ${sqlLiveGB}GB"
+        }
+
+        # Cap or RAM? Every sample records both total committed memory and the
+        # sampled instance's Total Server Memory, so their difference is
+        # everything that ISN'T that instance - the OS, other processes, other
+        # instances - measured over the whole window rather than guessed. That
+        # turns "URGENT, unsized" into a decision:
+        #   capFits = allocation - other (p95) - headroom
+        #             the largest cap that still leaves everything else room
+        #   sqlNeed = the instance's measured pool (p95). Not its Target: SQL
+        #             grows to whatever it's allowed, so Target says what it's
+        #             permitted, not what it needs. Low PLE says it would like
+        #             more, but there's no measurement of how much - a x1.25
+        #             uplift was tried and asked a 128GB host for +62GB, since
+        #             the PLE floor gets very strict on large pools - so low
+        #             PLE is stated in the text, not added to the number.
+        #   capFits >= sqlNeed -> a cap fixes it, if the instance is currently
+        #                         allowed past capFits (else no claim at all)
+        #   capFits <  sqlNeed -> RAM short: grow to sqlNeed + other +
+        #                         headroom, then cap at what fits
+        # Built here, applied only on a SQLServer host under MEM-PRESSURE (see
+        # the RAM verdict), so it can't add noise to a healthy host. "Other"
+        # is commit, which can exceed what's resident - the direction that
+        # recommends slightly more, not less, and only where pressure is
+        # already proven by available memory and hard faults.
+        #
+        # Locked pages: with Lock Pages in Memory the buffer pool is allocated
+        # outside the commit charge, so commit minus SQL goes small or
+        # negative and "everything else" reads as nothing. If commit falls
+        # below SQL's own memory in more than a quarter of samples the split
+        # isn't valid on this host, and no decision is made rather than one
+        # built on a wrong remainder.
+        if ($confident -and $role -eq 'SQLServer') {
+            # NB [math]::Max(0.0, ...) - with an integer literal first,
+            # PowerShell binds Max(int, int) and rounds the double away
+            # (Max(0, 3.4) is 3). Same reason for the 1.0 / 8.0 / 2.0
+            # literals elsewhere in this file and in the Screen.
+            $otherVals = New-Object System.Collections.Generic.List[double]
+            $belowSql  = 0
+            foreach ($r in $rows) {
+                $c = 0.0; $s = 0.0
+                if ([double]::TryParse($r.CommittedGB, [ref]$c) -and [double]::TryParse($r.SqlTotalGB, [ref]$s)) {
+                    if ($c -lt $s) { $belowSql++ }
+                    $otherVals.Add([math]::Max(0.0, $c - $s))
+                }
+            }
+            if ($otherVals.Count -gt 0 -and $belowSql -gt ($otherVals.Count * 0.25)) {
+                $sqlNote += ' | commit excludes SQL (locked pages?) - no cap/RAM split'
+            }
+            elseif ($otherVals.Count -ge ($rows.Count * 0.5)) {
+                $otherP95   = [math]::Round((Get-Percentile -Values $otherVals.ToArray() -P 0.95), 1)
+                $headroomGB = [math]::Round([math]::Max(1.5, $allocatedGB * 0.08), 1)
+                $capFits    = [math]::Floor(($allocatedGB - $otherP95 - $headroomGB) * 10) / 10
+                $pleLow     = ($pleP05 -ge 0 -and $pleP05 -lt $pleFloor)
+                $sqlNeed    = $sqlTotal
+                $allowedGB  = if ($null -ne $targetMax) { $targetMax } else { $sqlTotal }
+                $inst       = if ($sampledInst) { $sampledInst } else { 'SQL' }
+
+                if ($capFits -ge $sqlNeed) {
+                    if ($allowedGB -gt $capFits) {
+                        $sqlSizing = [PSCustomObject]@{
+                            Kind = 'CAP'; GrowthGB = 0
+                            Text = "cap $inst max server memory at ${capFits}GB - other processes need ${otherP95}GB, SQL fits in ${sqlNeed}GB"
+                        }
+                    }
+                } else {
+                    $grow = Get-CeilEven -Value ($sqlNeed + $otherP95 + $headroomGB - $allocatedGB)
+                    if ($grow -gt 0) {
+                        $newAlloc = [int]($allocatedGB + $grow)
+                        $capAfter = [math]::Floor(($newAlloc - $otherP95 - $headroomGB) * 10) / 10
+                        # Kept short: shares Custom69's 255 characters with the
+                        # pressure prefix, the CPU verdict and the timestamp
+                        $sqlText  = if ($pleLow) { "SQL ${sqlTotal}GB (low PLE)" } else { "SQL ${sqlTotal}GB" }
+                        $sqlSizing = [PSCustomObject]@{
+                            Kind = 'RAM'; GrowthGB = $grow
+                            Text = "RAM short: $sqlText + other ${otherP95}GB + ${headroomGB}GB headroom -> +${grow}GB -> ${newAlloc}GB, cap $inst at ${capAfter}GB"
+                        }
+                    }
+                }
+            }
+        }
 
         if ($confident) {
             # max server memory unset, or set so high the OS is left short.
@@ -850,7 +960,7 @@ try {
             # usually fine; this is for the clear cases.
             if ($null -ne $targetMax -and -not $allExpress) {
                 $reserveGB = Get-SqlOsReserveGB -AllocatedGB $allocatedGB
-                if ($targetMax -gt ($allocatedGB - [math]::Max(1, $reserveGB / 2))) {
+                if ($targetMax -gt ($allocatedGB - [math]::Max(1.0, $reserveGB / 2))) {
                     $capGB = [int]($allocatedGB - $reserveGB)
                     $sqlFindings.Add("max server memory unset/too high (target ${targetMax}GB of ${allocatedGB}GB) - cap at ${capGB}GB")
                     $flags.Add('SQL-CAP')
@@ -903,7 +1013,7 @@ try {
     # the cause the squeeze is the symptom of.
     if ($confident -and $multiSql -and $sqlLiveGB -gt 0) {
         $reserveGB = Get-SqlOsReserveGB -AllocatedGB $allocatedGB
-        if ($sqlLiveGB -gt ($allocatedGB - [math]::Max(1, $reserveGB / 2))) {
+        if ($sqlLiveGB -gt ($allocatedGB - [math]::Max(1.0, $reserveGB / 2))) {
             $capGB = [int]($allocatedGB - $reserveGB)
             $at = [math]::Min($sqlFindings.Count, @($sqlFindings | Where-Object { $_ -like 'Express DB*' -or $_ -like 'max server memory*' }).Count)
             $sqlFindings.Insert($at, "$sqlRunning instances hold ${sqlLiveGB}GB of ${allocatedGB}GB - combined caps too high, total at ${capGB}GB")
@@ -1017,13 +1127,27 @@ try {
         # verdict and the timestamp (~70 between them in the usual case).
         # Format-VerdictUdf at the write-back is the backstop if the CPU side
         # runs long.
-        $body = Format-Findings -Findings $sqlFindings -Budget (180 - $prefix.Length)
+        # Under pressure, the cap-or-RAM decision (built in the SQL block
+        # above) leads, since it answers what to actually do; the findings
+        # explaining it follow. A RAM-short decision is the one SQL case that
+        # fills Growth GB - its figure comes from SQL's own counters and the
+        # measured non-SQL remainder, not the inflated commit total that keeps
+        # every other SQL verdict unsized.
+        $leading = @($sqlFindings)
+        if ($memPressure -and $sqlSizing) {
+            $leading = @($sqlSizing.Text) + $leading
+            if ($sqlSizing.Kind -eq 'RAM') { $growthGB = $sqlSizing.GrowthGB }
+            if ($sqlSizing.Kind -eq 'CAP' -and -not ($flags -contains 'SQL-CAP')) { $flags.Add('SQL-CAP') }
+        }
+        $body = Format-Findings -Findings $leading -Budget (180 - $prefix.Length)
 
         if ($memPressure) {
             $ramVerdict    = "NO RECLAIM - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s) - see growth verdict"
             $cause         = if ($body) { $body } else { 'SQL counters show no cause - check other processes' }
             $growthVerdict = "$prefix$cause"
-            $flags.Add('GROWTH')
+            # GROWTH means "needs RAM". A host a cap alone fixes isn't a RAM
+            # candidate - SQL-CAP and MEM-PRESSURE carry it to a worklist.
+            if (-not ($sqlSizing -and $sqlSizing.Kind -eq 'CAP')) { $flags.Add('GROWTH') }
         }
         elseif ($body) {
             $growthVerdict = "$prefix$body"
@@ -1121,7 +1245,7 @@ try {
             # and at 50% a 32GB VM with 12GB peak demand - the most obvious
             # candidate there is - falls just outside and gets deferred for no
             # good reason.
-            $minReclaim = if ($Conservative) { [math]::Max(8, $allocatedGB * 0.4) } else { 4 }
+            $minReclaim = if ($Conservative) { [math]::Max(8.0, $allocatedGB * 0.4) } else { 4 }
 
             if ($reclaimGB -lt $minReclaim) {
                 $shortfall = $reclaimGB
@@ -1403,6 +1527,8 @@ try {
                 VcpuGrowth      = $vcpuGrowth
                 CpuGrowthVerdict = $cpuGrowthVerdict
                 SqlFootprintGB  = $roleInfo.SqlGB
+                SqlSampled      = $sampledInst
+                SqlSizing       = $(if ($sqlSizing) { $sqlSizing.Text } else { $null })
                 SqlRunning      = $sqlRunning
                 SqlLiveGB       = $sqlLiveGB
                 SqlNote         = $sqlNote
@@ -1434,6 +1560,10 @@ try {
         Write-Output "SQL instance    : $($inst.Name) - $($inst.Edition)$mdfText"
     }
     foreach ($f in $sqlFindings) { Write-Output "SQL finding     : $f" }
+    if ($sqlSizing) {
+        $applied = if ($memPressure -and $role -eq 'SQLServer') { '' } else { ' (not applied - no memory pressure)' }
+        Write-Output "SQL sizing      : $($sqlSizing.Text)$applied"
+    }
     Write-Output ''
     Write-Output "CPU             : $cpuDetail"
     Write-Output "Effective cores : $effectiveCores of $vCPU allocated"

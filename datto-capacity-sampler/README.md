@@ -136,7 +136,8 @@ RAM   RoleFloor   = flat per-role minimum, except DomainController: raised to
                     forcing a number the math doesn't support
 
 CPU   EffCores    = (p95 Total% ÷ 100) × vCPU
-      Reduce      = current vCPU − ceil( EffCores ÷ 0.65 ) [rounded even], when lower
+      Reduce      = current vCPU − max( RoleFloor, ceil( EffCores ÷ 0.65 ) [rounded even] ),
+                    when lower. Held while MEM-PRESSURE is active (see Guardrails)
       Growth      = ceil( EffCores ÷ 0.65 ) [rounded even] − current vCPU, when higher.
                     Queue-driven CPU pressure the total%-based model doesn't catch
                     (e.g. many short-lived threads) is flagged `REVIEW` for manual
@@ -151,7 +152,10 @@ pressure symptoms (available memory near zero, real hard faults) get to override
 percentile math alone would conclude.
 
 Role floors (RAM GB / vCPU): DC 4/2 (RAM floor raised per DIT size where resolvable — see above)
-· RDSH 8/4 · File server 8/2 · SQL 8/4 · Exchange 16/4 · Veeam 8/4 · Generic 4/2.
+· RDSH 8/4 · File server 8/2 · SQL 8/4 · MySQL/MariaDB 8/4 · Exchange 16/4 · Veeam 8/4 · Generic 4/2.
+The vCPU floor is applied *before* deciding whether a reduction exists, so a host already at or
+below its role floor reads `NO CHANGE - demand sizes to N but <role> floor is M vCPU` rather than a
+`REDUCE` to its own current count.
 
 **The 1.15× / 2GB DIT margin is a reasoned estimate, not a vendor-published constant** — same
 status as this tool's other multipliers (1.25, 1.4, 65%). It only ever raises the DC floor above
@@ -171,27 +175,32 @@ tool won't tell you that's why.
 - p95 max-core above 85% while total sits below the single-thread ceiling for that vCPU count —
   suppresses reduce *and* growth, since more vCPU doesn't help a workload that can't spread past
   one core
-- Role exclusions from RAM sizing, both directions: **SQL Server, Exchange, Veeam infrastructure**
+- The same memory-pressure guardrail also **holds vCPU reduction** (growth is unaffected). A host short of memory spends its time waiting on paging
+  I/O, and waiting isn't CPU time, so utilisation measured under pressure understates what the
+  workload will use once memory is fixed. Cutting vCPU on those figures and then fixing memory
+  leaves the host CPU-starved. Verdict: `NO REDUCTION - memory pressure ... resolve memory first`
+- Role exclusions from RAM sizing, both directions: **SQL Server, Exchange, Veeam infrastructure,
+  MySQL/MariaDB**
 
 Veeam is excluded because proxy and repository demand peaks inside the job window, and a p95
 across 14 days will flatten it. SQL and Exchange are excluded because guest committed bytes
 reports the configured memory cap, not the requirement, in either direction — their buffer pool
-figure and minimum PLE are reported instead (UDF 66), enough to triage which instances justify a
-`max server memory` review.
+figure and PLE are reported instead (UDF 66), and SQL hosts are checked for the attention signals
+below (`SQL-CAP`, `SQL-MEM`, `SQL-EXPRESS-CAP`).
 
 **The Veeam exclusion applies to backup *infrastructure*, not to machines being backed up.** That
 timing argument is about something which moves or stores backup data — it says nothing about a
 server that is merely a backup source. Matching any `Veeam*` service was the same over-broad mistake
 the SQL predicate made: Veeam installs its Installer/Deployment service on every managed server and
 its agent on protected endpoints, so on a real estate a 12GB file server with 8.58GB committed was
-classed as backup infrastructure and had its reclaim discarded. The Screen now matches only
+classed as backup infrastructure and had its reclaim discarded. Both components now match only
 data-mover and control services (`VeeamBackup*`, `VeeamTransport*`, `VeeamNFS*`, `VeeamCatalog*`,
 `VeeamBroker*`, `VeeamMount*`, `VeeamHvIntegration*`, by prefix so version suffixes don't break the
 match). Agent- or installer-only hosts are flagged `VEEAM-MINOR` and screened normally. An
 unrecognised future service name falls through to `VEEAM-MINOR` — the gross-over-allocation gate
 still has to clear before anything is recommended, which keeps that failure mode cheap.
 
-**Hyper-V hosts return `NO SCREEN` regardless of every other role.** This tool measures guest-side
+**Hyper-V hosts get no sizing regardless of every other role** (`NO SIZING` in Component 2, which also raises no CPU flags for them; the Screen runs host health checks instead, below). This tool measures guest-side
 demand, which can't describe a host whose memory is consumed by its VMs: a 127GB cluster node
 reporting 51GB committed and 78% sustained CPU is describing its guests, not itself, and neither
 figure supports a right-sizing decision. Detected via the `vmms` service, which exists only where
@@ -199,18 +208,148 @@ the role is actually installed. Other hypervisors aren't detected because they n
 — an ESXi host has no Windows guest OS — so Hyper-V is the only case that can reach a device filter.
 Size these from your hypervisor's own reporting instead.
 
+### Hyper-V host health (Screen)
+
+On a Hyper-V host the Screen replaces guest-side screening with host health checks. These are
+point-in-time facts read from the Hyper-V and FailoverClusters modules as SYSTEM. They need no
+history and no login, and nothing is changed. Each finding sets an `HV-*` flag. `Scr: Verdict`
+reads `HYPER-V ATTENTION - <findings>` or `HYPER-V OK - N VMs, M running, no findings`. The
+other three Screen UDFs carry host content:
+- `Scr: RAM`: host memory, VMs running and memory assigned, available, uptime.
+- `Scr: Reclaim GB`: `000`.
+- `Scr: CPU`: logical processors vs running vCPU.
+
+Findings are listed most actionable first:
+
+| Flag | Fires when | Deliberately ignores |
+|---|---|---|
+| `HV-CRITICAL` | Any VM is in a `*Critical` state. PausedCritical almost always means the volume under the VM is full or gone | — |
+| `HV-MEM` | Host free memory is under 5% of capacity, **between 2GB and 8GB** (32GB host → 2GB, 128GB → 6GB, 256GB+ → 8GB), so the host can't start or restart VMs. Replaces the guest-style `UPSIZE` wording | **The commit ratio.** On a hypervisor `UPSIZE` is raised only when free memory is under 1GB, because root-partition commit doesn't describe a host whose memory belongs to its VMs |
+| `HV-CLUSTER` | A cluster node isn't Up, or a CSV is in redirected I/O | Reported by the **core cluster group owner only**, so N nodes don't repeat it. **Redirection by design**: ReFS CSVs (most S2D clusters) and tiered volumes run file-system-redirected permanently, and Storage Replica volumes run block-redirected. Those reasons are ignored; one with no reason recorded still counts |
+| `HV-STORAGE` | A local volume holding VM disks, or a CSV (core owner only), is under **12%** free. Context is added when dynamic disks could grow past the free space | **Thin provisioning alone.** Maximum disk sizes exceeding free space is normal on most hosts, so it's only mentioned on a volume that's already low. SMB-hosted disks are skipped. A differencing disk's growth isn't double-counted |
+| `HV-CHECKPOINT` | A standard/production checkpoint older than **3 days**. Or a Recovery checkpoint (what backup products create and should remove) older than **1 day**, which means a stuck backup. Or a VM running on an `.avhdx` with no checkpoint at all, which is a failed merge that grows until the volume fills | **Replica VMs** and replica recovery points, which carry these by design. If Recovery checkpoints can't be listed (an older module without `-SnapshotType`), the `.avhdx` test is skipped and `HV-PARTIAL` set, because a VM mid-backup would otherwise read as a failed merge |
+| `HV-REPLICA` | Hyper-V Replica health is Critical or Warning | — |
+| `HV-GUEST` | A running VM's heartbeat is LostCommunication or Error | **NoContact**, unless the VM has been up over an hour *and* its heartbeat service is enabled. Appliances and Linux guests without integration services report NoContact normally |
+| `HV-CPU-RATIO` | vCPU on running VMs exceeds **4:1** logical processors. Above 8:1 expect real contention | — |
+| `HV-PARTIAL` | One or more checks failed, listed in the job output and the CSV `HvErrors` column | So "no findings" is never mistaken for "healthy" |
+| `HV-NO-DATA` | The checks couldn't run at all, e.g. the Hyper-V PowerShell module isn't installed (`RSAT-Hyper-V-Tools`); the verdict says why | — |
+
+- **32-bit hosts:** the Hyper-V module only loads in 64-bit PowerShell. If Datto runs the
+  component in a 32-bit process, the checks are re-run through the 64-bit PowerShell and the result
+  read back.
+- **Thresholds:** all are reasoned starting points. Calibrate them against the CSV export's `Hv*`
+  columns.
+- **Cluster N+1:** check the cluster can absorb losing its largest node by grouping the CSV export
+  by `HvCluster` and comparing `HvAssignedGB` against `HvHostMemGB`. Each node can only see its own
+  VMs.
+
+**MySQL and MariaDB are excluded for the same reason, with one difference: memory pressure still
+surfaces.** On Windows, InnoDB commits its whole buffer pool at startup, so committed bytes on a
+MySQL host tracks the configured `innodb_buffer_pool_size`, not the requirement. Commit × 1.25
+just restates the configuration: a 24GB host with a 20GB pool reads as needing 30GB+. Detection
+is by service binary (`mysqld` / `mariadbd` in the service's `PathName`), since service names vary
+(`MySQL`, `MySQL80`, `MariaDB`, `wampmysqld64`…). The materiality bar is the same one the Screen
+applies to SQL Server, measured on mysqld's **private bytes**, which is its actual share of the
+commit figure: at least 2GB and at least 25% of allocation, otherwise `MYSQL-MINOR` and sized
+normally.
+
+The configured buffer pool is read without credentials from the option files mysqld itself
+reads. That means `--defaults-file` from the service command line, or otherwise the standard
+Windows search order. A MySQL 8 `SET PERSIST` in `<datadir>\mysqld-auto.cnf` overrides both.
+Parsing covers K/M/G/T suffixes, dash/underscore key spellings, `loose-` prefixes and versioned
+`[mysqld-8.0]` sections. It also reads **the group named after the Windows service**, which a
+server running as a service reads too. WAMP, for example, keeps its settings under
+`[wampmysqld64]`. A pool sized automatically by `innodb_dedicated_server` is reported as unresolved
+rather than guessed. `!include` directives are not followed. `Cap: RAM Detail` gains `| mysqld
+21.5GB, buffer pool 20GB`.
+
+**Sanity check:** if `mysqld` holds more than the read pool × 1.5 + 4GB, the configured value
+can't explain its footprint, so the effective configuration must be somewhere the parser didn't
+read. The pool is then reported unresolved (`config reads XGB but mysqld holds YGB - effective
+config not found`) rather than asserted, and the verdict says to check the pool rather than that
+it's fine.
+
+Unlike the plain exclusion, a MySQL host under `MEM-PRESSURE` still reads **URGENT** in
+`Cap: Growth Verdict`, flagged `GROWTH`, with `Cap: Growth GB` left at `000`. Instead of a
+commit-derived number, the verdict states whether the configured pool explains the pressure:
+- **Pool over 75% of allocation:** `lower it to 18GB or grow RAM to 28GB`. Lowering
+  `innodb_buffer_pool_size` is often the right fix, not adding RAM. 75% is the share MySQL 8.0's
+  own `innodb_dedicated_server` uses above 4GB, and it's a reasoned working figure.
+- **Pool within 75%:** `isn't the cause - check connection buffers, other processes`.
+  Per-connection buffers (`max_connections` × sort/join/read buffers) are the classic MySQL
+  memory blow-out.
+
 **The SQL exclusion requires the engine to be a *material* memory consumer, not merely present.**
 That reasoning above only holds while SQL actually dominates memory on the host. Presence-only
 matching excluded 21 of 73 devices on a real estate — including RD gateways, a VPN host and plain
 file servers, none of them mis-matched: they genuinely carried a bundled instance
 (`MSSQL$SQLEXPRESS` from an RDS Connection Broker deployment, `MSSQL$VEEAMSQL*` from Veeam, or an
 LOB app's Express instance). A capped Express instance idling at a few hundred MB on a 12GB gateway
-doesn't distort that host's commit figure, and excluding it discarded real, safe reclaim. The
-Screen therefore requires `sqlservr` to hold **at least 2GB and at least 25% of allocated RAM** —
+doesn't distort that host's commit figure, and excluding it discarded real, safe reclaim. Both
+components therefore require `sqlservr` to hold **at least 2GB and at least 25% of allocated RAM** —
 both conditions, since the ratio alone over-fires on small hosts (Express's buffer pool caps around
 1.4GB) and the absolute alone under-fires on large ones. Below the bar the host is flagged
 `SQL-MINOR` and screened normally. The exclusion verdict cites the footprint that justified it, so
 the decision is auditable from the UDF rather than being an unexplained suppression.
+
+### SQL Server attention signals
+
+A SQL Server host's RAM is never sized from total commit, but Component 2 does check it for signs
+it needs a look. The inputs are the counters the sampler already collects (Total/Target Server
+Memory and PLE) plus the registry, so this needs no sampler change and no database login. Each
+finding sets a flag and adds a short reason to `Cap: Growth Verdict`, as `REVIEW - ...`. Under
+`MEM-PRESSURE` it reads `URGENT - ...`. `Cap: Verdict` carries `EXCLUDED (SQLServer) | SQL pool p95
+20.1GB of target 22GB, PLE p05 840s (floor 1500s)`.
+
+**Under memory pressure, Component 2 decides between a cap and more RAM.** Every sample records both
+total committed memory and the sampled instance's Total Server Memory. The difference between them
+is everything else: the OS, other processes and other instances, measured over the 14 days rather
+than guessed. The decision leads `Cap: Growth Verdict`:
+
+| Case | Verdict | Flags / Growth GB |
+|---|---|---|
+| SQL's measured pool fits beside everything else (p95) plus headroom, but the instance is currently allowed past that | `cap SAGE max server memory at 21.5GB - other processes need 7.9GB, SQL fits in 18GB` | `SQL-CAP`, no `GROWTH`, `000`. A cap fixes it; it isn't a RAM candidate |
+| It doesn't fit | `RAM short: SQL 7.2GB (low PLE) + other 7.1GB + 1.5GB headroom -> +4GB -> 16GB, cap MSSQLSERVER at 7.4GB` | `GROWTH`, and **`Cap: Growth GB` is filled**: the figure comes from SQL's own counters and the measured remainder, not inflated total commit |
+
+- **What SQL needs:** its measured pool (p95), not its Target. SQL grows to whatever it's allowed,
+  so Target says what it's permitted, not what it needs.
+- **Low PLE** means SQL would like more, but there's no measurement of how much. It's stated in the
+  text, not added to the number. A ×1.25 uplift asked a 128GB host for +62GB, because the PLE floor
+  gets very strict on large pools.
+- **Headroom** is 8% of the allocation, minimum 1.5GB.
+- **Which instance:** the advice names the sampled instance, read from the sampler's counter cache.
+- **Locked pages:** with Lock Pages in Memory, SQL's buffer pool sits outside committed memory, so
+  "everything else" would read as nothing. When committed memory falls below SQL's own memory in
+  more than a quarter of samples, no decision is made, and the note says `commit excludes SQL
+  (locked pages?) - no cap/RAM split`.
+- **No pressure:** on a host without memory pressure the decision is printed in the job output,
+  marked not applied, and never reaches a UDF.
+
+Findings are listed most actionable first. When they don't all fit in the UDF, the verdict ends
+`(+N, see flags)`.
+
+| Flag | Fires when | Usual fix |
+|---|---|---|
+| `SQL-EXPRESS-CAP` | An Express database is at **8GB** or more of its 10GB limit. Express stops accepting writes at the limit, so this is the one finding that's an outage rather than a slowdown. Also fires when the only instances are Express and PLE is low with the pool full: Express caps its buffer pool at about 1.4GB, so more RAM won't help | Archive/purge data, or move to Standard edition |
+| `SQL-CAP` | The peak Target leaves the OS less than **half** the recommended reserve. With `max server memory` unset, Target climbs to nearly all of physical memory, so this means the cap is unset or set too high. Recommended reserve is 1GB, plus 1GB per 4GB up to 16GB, plus 1GB per 8GB above that (Jonathan Kehayias's guidance; 32GB → 7GB). Half rather than the whole reserve, because a cap a few GB above the guidance is common and usually fine. **On a host running more than one instance**, also fires when the combined live footprint of every `sqlservr` process (the larger of private bytes and working set, per process) crosses the same bar: `2 instances hold 10.8GB of 12GB - combined caps too high, total at 8GB`. The counters cover only one instance, so caps that each look reasonable can together exceed the host | Set `max server memory` to the figure in the verdict; on a multi-instance host, split that total across the instances |
+| `SQL-MEM` | Either: PLE p05 is below **300s per 4GB of buffer pool** (minimum 300s) *while* the pool sits at Target, i.e. SQL is using all it's allowed and pages still don't stay. Or: Target p05 is below **80%** of its peak (and at least 1GB down), meaning SQL was made to shrink, normally by memory pressure from outside SQL (a lowered cap mid-window reads the same). On a multi-instance host the verdict names **another SQL instance** as the first suspect | Raise the cap or add RAM; for the squeeze, find what else is using memory |
+
+Notes on the thresholds:
+- **Total below Target is not a finding on its own.** An instance whose data fits in less than its
+  cap sits below Target indefinitely. It only counts alongside low PLE.
+- **p05, not the minimum.** PLE always dips briefly during index maintenance, CHECKDB or a restart.
+  p05 needs the low reading to last about 17 hours of the 14-day window.
+- **The fixed 300s rule is too lax for modern servers.** It dates from 4GB servers.
+- **Express database size** comes from the largest user `.mdf` in each instance's default data
+  directory. Databases stored elsewhere or split across `.ndf` files aren't seen.
+- **Only one instance is sampled.** The sampler reads counters for one instance per host, so on a
+  multi-instance host the note says `N instances, one sampled, all hold XGB`. The combined figure
+  comes from the live `sqlservr` processes, which cover every running instance. Editions are still
+  read for every instance.
+- **Instances are read through the 64-bit registry view**, so a 32-bit host process still sees
+  64-bit instances.
+- **Calibrate against your estate.** All thresholds are reasoned starting points. Use the CSV
+  export's `SqlNote`, `SqlFindings` and `SqlEditions` columns.
 
 ## UDF map
 
@@ -264,9 +403,9 @@ exactly as it already works, rather than changing what that field means.
 
 | UDF | Suggested label | Content |
 |---|---|---|
-| Custom70 | `Scr: RAM` | `Alloc 32GB \| Commit 8.1GB \| PeakWS sum 11.4GB \| Avail 19.2GB \| Up 34d` |
+| Custom70 | `Scr: RAM` | `Alloc 32GB \| Commit 8.1GB \| PeakWS sum 11.4GB \| Avail 19.2GB \| Up 34d`. Hyper-V host: `Host 128GB \| 9/11 VMs running, assigned 96GB \| Avail 24.1GB \| Up 34d` |
 | Custom71 | `Scr: Reclaim GB` | Zero-padded, e.g. `014` |
-| Custom72 | `Scr: CPU` | `8 vCPU \| Avg since boot 6.4% over 34d = 0.51 cores of 8 \| REVIEW` |
+| Custom72 | `Scr: CPU` | `8 vCPU \| Avg since boot 6.4% over 34d = 0.51 cores of 8 \| REVIEW`. Hyper-V host: `32 LP \| 56 vCPU on running VMs = 1.8:1` |
 | Custom73 | `Scr: Verdict` | Verdict, flags, timestamp |
 
 There is no `Scr: Rec vCPU` — the screen deliberately produces no vCPU number (see Operation
@@ -277,10 +416,17 @@ below); don't leave a gap for one when building grid views. Keeping the screen's
 every UDF as a string, so an unpadded `8` sorts above `20` and your worst offenders end up buried
 mid-list. Padding to a fixed width makes the lexical sort behave like a numeric one. Export the
 grid with those columns for your dataset; strip the padding in Excel with `=VALUE(A2)` if you need
-to sum it. Build a reclaim worklist by filtering `Cap: Reclaim GB` **not equal to `000`**; build a
-RAM growth worklist the same way on `Cap: Growth GB`.
+to sum it. Build a reclaim worklist by filtering `Cap: Reclaim GB` **not equal to `000`**. For a RAM
+growth worklist, see the next paragraph: the number alone isn't enough.
 
-**A CPU growth worklist needs the flag, not just the number.** Queue-driven CPU pressure that the
+**Growth worklists need the flag, not just the number - for RAM and CPU alike.** A MySQL/MariaDB
+host under memory pressure, or a SQL Server host whose cap-or-RAM split can't be made (locked
+pages, or not enough samples with SQL counters), sets `GROWTH` and reads `URGENT` but leaves `Cap:
+Growth GB` at `000`, because its commit figure carries the configured buffer pool and can't be turned
+into a safe GB number (see the MySQL and SQL Server notes under Guardrails). Filtering on `Cap: Growth GB` not equal to `000` silently misses
+those hosts, so filter on the `GROWTH` flag instead.
+
+The same applies to CPU. Queue-driven CPU pressure that the
 sizing model can't turn into a safe core count still sets `CPU-GROWTH` in `Cap: Role/Flags`, but
 leaves `Cap: Growth vCPU` at `00` since there's nothing to show there — filtering only on `Cap:
 Growth vCPU not equal to 00` silently misses those hosts. Filter on the `CPU-GROWTH` flag (or check
@@ -296,20 +442,26 @@ Analyse values are not.
 |---|---|
 | `MEM-PRESSURE` | Available memory or fault rate breached the guardrail; no reclaim offered, growth escalated instead |
 | `MEM-REVIEW` | Memory pressure is active but even the escalated (max-based) target shows no allocation shortfall — likely a leaking process or transient spike, not under-provisioning; no growth number is forced |
-| `GROWTH` | RAM growth recommended — see `Cap: Growth GB` / `Cap: Growth Verdict` |
+| `GROWTH` | RAM growth recommended — see `Cap: Growth GB` / `Cap: Growth Verdict`. On a `MYSQL` host under memory pressure `Cap: Growth GB` stays `000` and the verdict cites the buffer pool instead, so build worklists on this flag, not the number |
 | `CPU-GROWTH` | vCPU growth recommended, or queue-driven pressure flagged `REVIEW` with no safe number to give — check `Cap: Growth Verdict`, since `Cap: Growth vCPU` stays `00` for the REVIEW case |
 | `SINGLE-THREAD` | One core near saturation on a low total; vCPU held in both directions |
 | `CPU-PRESSURE` | Sustained high utilisation or queue depth; no reduction offered, and growth flagged `REVIEW` if queue-driven |
-| `SQL` / `EXCH` / `VEEAM` | Excluded from RAM sizing by role, in both directions |
+| `SQL` / `EXCH` / `VEEAM` | Excluded from RAM sizing by role, in both directions. Under `MEM-PRESSURE` Component 2 still reads `URGENT` (unsized) and sets `GROWTH` |
+| `MYSQL` | MySQL or MariaDB is a material memory consumer (mysqld private bytes ≥2GB and ≥25% of allocation). Excluded from commit-based RAM sizing in both directions; under `MEM-PRESSURE` Component 2 still reports `URGENT` + `GROWTH` with `Cap: Growth GB` at `000`, citing the configured buffer pool instead. vCPU floor 4 |
+| `MYSQL-MINOR` | MySQL/MariaDB present but under the materiality bar (e.g. an LOB app's bundled instance) — sized/screened normally |
+| `SQL-CAP` | SQL Server `max server memory` unset or leaving the OS too little — see SQL Server attention signals |
+| `SQL-MEM` | SQL Server memory-bound (low PLE with the pool at Target) or squeezed (Target forced well below its peak) |
+| `SQL-EXPRESS-CAP` | SQL Express database near its 10GB limit, or memory-bound at Express's ~1.4GB pool cap where more RAM won't help |
 | `DIT-UNKNOWN` | DC only — the DIT path couldn't be resolved from the registry, so both `Cap: Verdict` and `Cap: Growth Verdict` are suppressed to `REVIEW` rather than computed against the flat floor |
 | `DIT-REVIEW` | DC only — the DIT-raised floor alone would trigger growth, but the same target using the flat floor doesn't; measured demand doesn't corroborate it, so no growth number is forced |
 | `LOW-UPTIME` | Screen only — under `usrMinUptimeHrs`, peak working sets not yet representative |
 | `CANDIDATE` | Screen only — cleared the gross over-allocation test |
 | `UPSIZE` | Screen only — available memory under 1GB, **or** committed bytes exceeding allocation *while* available memory is under 20% of allocation. The commit ratio never triggers alone. The 1GB test is the same metric and threshold Component 2 uses for `MEM-PRESSURE`, so the two can't disagree. The verdict names what fired. Outranks the uptime gate **and** the role exclusions (it's an observable fact, not a sizing claim). Reported, never sized — Component 2's growth-sizing produces the number |
-| `SQL-MINOR` | Screen only — a SQL instance is present but the engine isn't a material memory consumer (under 2GB, or under 25% of allocation), so the host is screened normally instead of excluded. Typically a bundled Express instance from an RDS Connection Broker, Veeam, or an LOB app |
-| `VEEAM-MINOR` | Screen only — Veeam is installed but only as an agent or installer service, i.e. this host is a backup *target*, not backup infrastructure. Screened normally instead of excluded |
-| `HYPER-V` | Screen only — the Hyper-V role is installed. Returns `NO SCREEN` regardless of every other role: guest-side demand can't describe a host whose memory is consumed by its VMs |
-| `CPU-PRESSURE` | Screen only (also a Component 2 flag) — average CPU since boot at or above 70%. Because averaging flattens spikes, a sustained average this high implies peaks well above it: this host needs *more* vCPU, not fewer |
+| `SQL-MINOR` | A SQL instance is present but the engine isn't a material memory consumer (under 2GB, or under 25% of allocation), so the host is sized/screened normally instead of excluded. Typically a bundled Express instance from an RDS Connection Broker, Veeam, or an LOB app. Component 2 measures the footprint as the larger of sampled p95 Total Server Memory and live `sqlservr` working set, and still runs the SQL attention checks (an Express DB near its limit appears as `| SQL: ...` in `Cap: Growth Verdict`) |
+| `VEEAM-MINOR` | Veeam is installed but only as an agent or installer service, i.e. this host is a backup *target*, not backup infrastructure. Sized/screened normally instead of excluded |
+| `HYPER-V` | The Hyper-V role is installed. `NO SIZING` in Component 2 and host health checks in the Screen, regardless of every other role, and no CPU flags; memory pressure on the host still reads `URGENT` in Component 2: guest-side demand can't describe a host whose memory is consumed by its VMs |
+| `HV-*` | Screen only — Hyper-V host health findings: `HV-CRITICAL`, `HV-MEM`, `HV-CLUSTER`, `HV-STORAGE`, `HV-CHECKPOINT`, `HV-REPLICA`, `HV-GUEST`, `HV-CPU-RATIO`, plus `HV-PARTIAL` / `HV-NO-DATA` when checks couldn't run. See Hyper-V host health |
+| `CPU-PRESSURE` | Screen only (also a Component 2 flag; neither raises it on a Hyper-V host) — average CPU since boot at or above 70%. Because averaging flattens spikes, a sustained average this high implies peaks well above it: this host needs *more* vCPU, not fewer |
 
 ## Deployment
 
@@ -560,7 +712,10 @@ $rows | Sort-Object { [int]$_.ReclaimGB } -Descending |
 
 # Under-provisioned hosts, most urgent first (memory-pressure escalation sorts to the top
 # since it uses the max-based basis and rarely gets suppressed to 0 the way p95-only does)
-$rows | Where-Object { [int]$_.GrowthGB -gt 0 -or [int]$_.VcpuGrowth -gt 0 } |
+# Filter on the flags, not just the numbers: MySQL URGENT (RAM) and queue REVIEW (CPU) hosts
+# carry GROWTH / CPU-GROWTH with a zero figure. Split, don't -match: GROWTH is inside CPU-GROWTH.
+$rows | Where-Object { $f = $_.Flags -split ','; [int]$_.GrowthGB -gt 0 -or [int]$_.VcpuGrowth -gt 0 -or
+                       $f -contains 'GROWTH' -or $f -contains 'CPU-GROWTH' } |
         Sort-Object { [int]$_.GrowthGB } -Descending |
         Select-Object Hostname,Role,AllocatedGB,CommitMaxGB,GrowthGB,GrowthVerdict,vCPU,VcpuGrowth -First 25
 
@@ -675,6 +830,7 @@ actual alert for that condition; a coverage gap in `Cap: Window` is the visible 
 | UDFs populated but stale | `Arc — Capacity Analyse` hasn't run recently; check the timestamp in `Cap: Verdict` |
 | `Cap: Growth GB` non-zero *and* `Cap: Reclaim GB` shows `000` at the same time | Expected — a device is only ever a candidate on one side of the target, never both |
 | `Cap: Growth Verdict` says `URGENT` and the figure looks larger than `Cap: RAM Detail`'s p95 numbers suggest | Working as intended — the memory-pressure escalation path uses max Committed, not p95, specifically because active thrashing is a peak problem a percentile can understate |
+| `Cap: Growth Verdict` says `URGENT` but `Cap: Growth GB` is `000` | Expected on a `MYSQL` host - commit carries the InnoDB buffer pool, so no GB figure is derived from it. The verdict states whether the configured `innodb_buffer_pool_size` explains the pressure; if it's over 75% of allocation, lowering it is often the fix rather than adding RAM |
 | `Cap: Growth vCPU` stays `00` despite `CPU-PRESSURE` being flagged | Check `Cap: Growth Verdict` for `REVIEW` — that means the pressure is queue-driven rather than total%-driven, and the sizing model doesn't fabricate a core count from queue depth alone; needs a manual look |
 
 Device-side log: `C:\ProgramData\Arc\CapacitySampler\sampler.log` (self-trims at 200KB).

@@ -8,6 +8,33 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Fixed
+- **Hard faults alone triggered `MEM-PRESSURE` on half the flagged estate**
+  (`Read-ArcCapacityBuffer.ps1` v1.15).
+  - **The cause:** the fault figure is Memory\Pages Input/sec. That counter also counts pages read
+    for memory-mapped *files*, so file and web servers fault constantly with memory to spare.
+  - **The estate evidence:** a 507-device run had **281** hosts under `MEM-PRESSURE`. **140** of
+    those were on faults alone (minimum available never under 1GB), and **105** of the 140 never
+    dropped below 20% free in 14 days. 73 never went below 30% and 19 never below 50%. Those 105
+    carried **244GB** of growth recommendations across 30 hosts, the largest being "+22GB" on a
+    144GB host whose worst moment was 36% free. The 10/s bar also sat below normal background
+    levels: most fault-only hosts ran 50–100/s.
+  - **The fix:** faults now count only while minimum available is under **20% of RAM**, the
+    Screen's `UPSIZE` bar, so the components agree on "short of headroom". On that run this
+    removes 105 hosts, keeps 35, and leaves the 141 absolute-trigger hosts (under 1GB) untouched.
+    That trigger stays unconditional and still matches the Screen's.
+  - **What the discounted hosts get:** `FAULTS-IO`, with no escalation. **Reclaim is held as
+    well**, because the faults are still real disk reads, and cutting RAM shrinks the file cache
+    serving them. Swinging such a host from "URGENT, add RAM" straight to "remove RAM" would be the
+    wrong lesson.
+  - **Measured on the export, then replayed on synthetic buffers:**
+    - a 64GB host at 24% minimum free with 322 faults/s gets `FAULTS-IO` and no reclaim;
+    - a 16GB host at 10% minimum free stays URGENT;
+    - an under-1GB dip stays URGENT.
+  - **Still open, for later:** the remaining URGENT sizing uses peak commit × 1.25, which can
+    overstate hosts whose commit sits well above RAM. The 141 absolute-trigger hosts rest on a
+    single worst sample of 1344. Both are separate questions.
+
 ### Added
 - **Cap-or-RAM decision for SQL hosts under memory pressure** (`Read-ArcCapacityBuffer.ps1` v1.13).
   SQL hosts under pressure read `URGENT ... unsized`, which said "act" but not "do what". The first

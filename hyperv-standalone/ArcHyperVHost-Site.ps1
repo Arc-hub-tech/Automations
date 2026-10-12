@@ -68,7 +68,7 @@ param(
 
 # Version of this script, surfaced in the banner/transcript. Both standalone
 # scripts share one version; '-dev' suffix while work accumulates under [Unreleased].
-$ScriptVersion = '0.1.0-dev'
+$ScriptVersion = '0.1.1-dev'
 $ScriptRole    = 'Site'   # which half of the build; names the state entries and the logon task
 
 $ErrorActionPreference = 'Stop'
@@ -326,7 +326,8 @@ function Stop-Next {
 # not USB, Wi-Fi or Bluetooth. Grouped by model, because SET members must match.
 function Get-ArcNicGroups {
     $nics = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object {
-        $_.NdisPhysicalMedium -eq 14 -and
+        # 802.3 Ethernet. Most drivers report physical medium 14; some (and Hyper-V's synthetic NIC) report 0 = unspecified.
+        $_.MediaType -eq '802.3' -and $_.NdisPhysicalMedium -in 0, 14 -and
         $_.InterfaceDescription -notmatch 'Virtual NIC|RNDIS|Remote NDIS|USB|Bluetooth|Wi-?Fi|Wireless'
     })
     $groups = @($nics | Group-Object { $_.InterfaceDescription -replace '\s#\d+$', '' } | ForEach-Object {
@@ -438,7 +439,7 @@ function Invoke-ArcHostNetwork {
     foreach ($g in $groups) { Write-Host ("  [{0}] {1}  x{2} ({3} up{4})  {5}" -f $g.Number, $g.Model, $g.Count, $g.Up, $(if ($g.Speed) { ", $($g.Speed)" } else { '' }), ($g.Names -join ', ')) }
     Write-Host '  SET members must be the same make, model and speed. The suggested group is [1].'
     $pick = Read-Value 'Group number, or NIC names separated by commas' '1' { param($v) $v -match '^\d+$' -or $v -match '\S' }
-    $members = if ($pick -match '^\d+$') { @(($groups | Where-Object Number -eq [int]$pick).Names) } else { @($pick -split ',' | ForEach-Object Trim | Where-Object { $_ }) }
+    $members = if ($pick -match '^\d+$') { @(($groups | Where-Object Number -eq ([int]$pick)).Names) } else { @($pick -split ',' | ForEach-Object Trim | Where-Object { $_ }) }
     foreach ($m in $members) { if (-not (Get-NetAdapter -Name $m -ErrorAction SilentlyContinue)) { throw "NIC '$m' not found." } }
     if (-not $members) { throw 'No NICs chosen.' }
     $models = @($members | ForEach-Object { (Get-NetAdapter -Name $_).InterfaceDescription -replace '\s#\d+$', '' } | Sort-Object -Unique)
@@ -563,6 +564,20 @@ $OptTasks = @(
 # Rule groups a standalone Hyper-V host needs open before the firewall goes on.
 $FirewallGroups = @('Hyper-V', 'Windows Remote Management', 'File and Printer Sharing', 'Windows Management Instrumentation (WMI)', '@FirewallAPI.dll,-28752')
 
+# '@'-prefixed entries are resource-string group names (language independent).
+function Get-ArcFirewallGroupRules {
+    param([string]$Group)
+    if ($Group -like '@*') { return @(Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue) }
+    return @(Get-NetFirewallRule -DisplayGroup $Group -ErrorAction SilentlyContinue)
+}
+
+function Enable-ArcFirewallGroups {
+    foreach ($g in $FirewallGroups) {
+        $rules = @(Get-ArcFirewallGroupRules $g)
+        if ($rules) { $rules | Enable-NetFirewallRule; Write-Host "    firewall rules enabled: $($rules[0].DisplayGroup)" }
+    }
+}
+
 function Get-ArcSwitchMembers {
     $out = @()
     foreach ($sw in Get-VMSwitch -SwitchType External -ErrorAction SilentlyContinue) {
@@ -604,6 +619,10 @@ function Get-ArcHostFacts {
     } catch { }
     foreach ($f in Get-WindowsFeature -Name FS-SMB1, PowerShell-V2 -ErrorAction SilentlyContinue) { $c["Sec.Feature.$($f.Name)"] = if ($f.Installed) { 'Installed' } else { 'Not installed' } }
     try { foreach ($p in Get-NetFirewallProfile) { $c["Sec.Firewall.$($p.Name)"] = "$($p.Enabled)" } } catch { }
+    # A fresh install already has the firewall on, so the management rule groups are checked on their own.
+    $closed = @($FirewallGroups | Where-Object { $r = @(Get-ArcFirewallGroupRules $_); $r -and -not @($r | Where-Object Enabled -eq 'True') })
+    $closed = @($closed | ForEach-Object { if ($_ -like '@*') { @(Get-ArcFirewallGroupRules $_)[0].DisplayGroup } else { $_ } })
+    $c['Sec.FirewallRules'] = if ($closed) { "Off: $($closed -join '; ')" } else { 'All enabled' }
     try {
         $na = (net accounts) | Out-String
         if ($na -match 'Lockout threshold:\s+(\S+)') { $c['Sec.LockoutThreshold'] = if ($Matches[1] -eq 'Never') { '0' } else { $Matches[1] } }
@@ -627,8 +646,10 @@ function Get-ArcHostFacts {
     if ($members) {
         $pmOn = @($members | Where-Object { (Get-NetAdapterPowerManagement -Name $_.Name -ErrorAction SilentlyContinue).AllowComputerToTurnOffDevice -eq 'Enabled' })
         $c['Opt.NicPowerManagement'] = if ($pmOn) { "Enabled on $($pmOn.Name -join ', ')" } else { 'Disabled' }
-        $vmqOff = @($members | Where-Object { -not (Get-NetAdapterVmq -Name $_.Name -ErrorAction SilentlyContinue).Enabled })
-        $c['Opt.VMQ'] = if ($vmqOff) { "Disabled on $($vmqOff.Name -join ', ')" } else { 'Enabled' }
+        # A NIC with no VMQ settings doesn't support it (e.g. Hyper-V's synthetic NIC) - not drift.
+        $vmq = @($members | ForEach-Object { Get-NetAdapterVmq -Name $_.Name -ErrorAction SilentlyContinue })
+        $vmqOff = @($vmq | Where-Object { -not $_.Enabled })
+        $c['Opt.VMQ'] = if (-not $vmq) { 'Not supported' } elseif ($vmqOff) { "Disabled on $($vmqOff.Name -join ', ')" } else { 'Enabled' }
     }
     $wp = Get-ArcWorkloadProfile
     if ($wp) { $c['HPE.Bios.WorkloadProfile'] = $wp }
@@ -662,6 +683,7 @@ function Get-BaselinePlan {
     foreach ($p in 'Domain', 'Private', 'Public') {
         if ($c["Sec.Firewall.$p"] -eq 'False') { $items.Add((New-PlanItem 'Security' "Sec.Firewall.$p" "Firewall on ($p) - Hyper-V/WinRM/SMB/WMI/RDP rules enabled first" 'False' 'True' $false 'Firewall' @{ Profile = $p })) }
     }
+    if ($c['Sec.FirewallRules'] -and $c['Sec.FirewallRules'] -ne 'All enabled') { $items.Add((New-PlanItem 'Security' 'Sec.FirewallRules' 'Firewall rules for management (Hyper-V, WinRM, SMB, WMI, Remote Desktop) enabled' $c['Sec.FirewallRules'] 'All enabled' $false 'FirewallRules')) }
     # Lockout threshold is a maximum too: a lower non-zero value is stricter.
     $lt = "$($c['Sec.LockoutThreshold'])"
     if (-not ($lt -match '^\d+$' -and [int]$lt -gt 0 -and [int]$lt -le $Standard.LockoutThreshold)) {
@@ -675,7 +697,7 @@ function Get-BaselinePlan {
     if ($c['Opt.LastAccess'] -ne 'Disabled') { $items.Add((New-PlanItem 'Optimisation' 'Opt.LastAccess' 'NTFS last-access updates off' $c['Opt.LastAccess'] 'Disabled' $true 'LastAccess')) }
     if ($c['Opt.TelemetryTasks'] -ne 'All disabled') { $items.Add((New-PlanItem 'Optimisation' 'Opt.TelemetryTasks' 'Telemetry/CEIP/Maps/WER tasks off (defrag/retrim left on)' $c['Opt.TelemetryTasks'] 'All disabled' $false 'Tasks')) }
     if ($c['Opt.NicPowerManagement'] -and $c['Opt.NicPowerManagement'] -ne 'Disabled') { $items.Add((New-PlanItem 'Optimisation' 'Opt.NicPowerManagement' 'NIC power management off (switch members)' $c['Opt.NicPowerManagement'] 'Disabled' $false 'NicPower')) }
-    if ($c['Opt.VMQ'] -and $c['Opt.VMQ'] -ne 'Enabled') { $items.Add((New-PlanItem 'Optimisation' 'Opt.VMQ' 'VMQ on (switch members; adapter restarts - VMs lose network for a few seconds)' $c['Opt.VMQ'] 'Enabled' $false 'Vmq')) }
+    if ($c['Opt.VMQ'] -and $c['Opt.VMQ'] -notin 'Enabled', 'Not supported') { $items.Add((New-PlanItem 'Optimisation' 'Opt.VMQ' 'VMQ on (switch members; adapter restarts - VMs lose network for a few seconds)' $c['Opt.VMQ'] 'Enabled' $false 'Vmq')) }
 
     if ($c.ContainsKey('HPE.Bios.WorkloadProfile') -and $c['HPE.Bios.WorkloadProfile'] -ne $Standard.WorkloadProfile) {
         $items.Add((New-PlanItem 'HPE' 'HPE.WorkloadProfile' 'BIOS workload profile' $c['HPE.Bios.WorkloadProfile'] $Standard.WorkloadProfile $true 'WorkloadProfile' @{ Target = $Standard.WorkloadProfile }))
@@ -692,13 +714,8 @@ function Invoke-PlanItem {
         'RemoveFeature'    { Uninstall-WindowsFeature -Name $a.Name | Out-Null }
         'SmbServerSigning' { Set-SmbServerConfiguration -RequireSecuritySignature $true -Force }
         'SmbClientSigning' { Set-SmbClientConfiguration -RequireSecuritySignature $true -Force }
-        'Firewall' {
-            foreach ($g in $FirewallGroups) {
-                $rules = if ($g -like '@*') { Get-NetFirewallRule -Group $g -ErrorAction SilentlyContinue } else { Get-NetFirewallRule -DisplayGroup $g -ErrorAction SilentlyContinue }
-                if ($rules) { $rules | Enable-NetFirewallRule; Write-Host "    firewall rules enabled: $g" }
-            }
-            Set-NetFirewallProfile -Profile $a.Profile -Enabled True
-        }
+        'Firewall'         { Enable-ArcFirewallGroups; Set-NetFirewallProfile -Profile $a.Profile -Enabled True }
+        'FirewallRules'    { Enable-ArcFirewallGroups }
         'Lockout'          { net accounts /lockoutthreshold:$($a.Threshold) /lockoutduration:15 /lockoutwindow:15 | Out-Null }
         'GuestDisable'     { Disable-LocalUser -Name Guest }
         'SpoolerDisable'   { Stop-Service Spooler -Force -ErrorAction SilentlyContinue; Set-Service Spooler -StartupType Disabled }
@@ -712,7 +729,7 @@ function Invoke-PlanItem {
             }
         }
         'NicPower'         { foreach ($n in Get-ArcSwitchMembers) { Disable-NetAdapterPowerManagement -Name $n.Name -NoRestart -ErrorAction SilentlyContinue } }
-        'Vmq'              { foreach ($n in Get-ArcSwitchMembers) { if (-not (Get-NetAdapterVmq -Name $n.Name).Enabled) { Enable-NetAdapterVmq -Name $n.Name } } }
+        'Vmq'              { foreach ($n in Get-ArcSwitchMembers) { $q = Get-NetAdapterVmq -Name $n.Name -ErrorAction SilentlyContinue; if ($q -and -not $q.Enabled) { Enable-NetAdapterVmq -Name $n.Name -ErrorAction Stop } } }
         'WorkloadProfile'  { Set-ArcWorkloadProfile -Target $a.Target | Out-Null }
         default            { throw "Unknown plan item kind '$($Item.Kind)'." }
     }
@@ -1268,7 +1285,7 @@ function Invoke-Report {
     else { Add-Result PASS 'Microsoft Defender' $def }
     # The off-policy outlives the EDR. Name it, so whoever removes the EDR also removes it.
     if ((Get-ItemProperty $DefenderPolicy -Name DisableAntiSpyware -ErrorAction SilentlyContinue).DisableAntiSpyware -eq 1) {
-        Add-Result INFO 'Defender off-policy' "DisableAntiSpyware and Real-Time Protection\DisableRealtimeMonitoring = 1 under $($DefenderPolicy -replace '^HKLM:', 'HKLM'). If the EDR is ever removed, delete both values and reboot, or the host has no antivirus."
+        Add-Result INFO 'Defender off-policy' "DisableAntiSpyware and Real-Time Protection\DisableRealtimeMonitoring = 1 under $($DefenderPolicy -replace '^HKLM:', 'HKLM'). If the EDR is ever removed, delete both values and run Start-Service WinDefend (a reboot alone does not restart it), or the host has no antivirus."
     }
     if (Get-Service CagService -ErrorAction SilentlyContinue) { Add-Result PASS 'Datto RMM agent' "$((Get-Service CagService).Status)" } else { Add-Result FAIL 'Datto RMM agent' 'Not installed' }
     $builtin = Get-ArcBuiltinAdmin

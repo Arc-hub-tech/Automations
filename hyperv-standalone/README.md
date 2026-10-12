@@ -98,7 +98,7 @@ Defender **doesn't go passive by itself** on Windows Server when SentinelOne or 
 
 If the Sophos installer has already removed the Defender feature, the phase sees that and moves on.
 
-**The off-policy outlives the EDR.** If the customer later removes SentinelOne or Sophos (at contract end, say), Defender stays off and the host has **no antivirus**. To turn Defender back on, delete both values and reboot:
+**The off-policy outlives the EDR.** If the customer later removes SentinelOne or Sophos (at contract end, say), Defender stays off and the host has **no antivirus**. To turn Defender back on, delete both values, then run `Start-Service WinDefend`. A reboot alone doesn't bring it back: the policy leaves the service set to Manual, and starting it once sets it back to Automatic (checked on WS2025).
 
 - `DisableAntiSpyware` under `HKLM\SOFTWARE\Policies\Microsoft\Windows Defender`
 - `DisableRealtimeMonitoring` under `...\Windows Defender\Real-Time Protection`
@@ -115,7 +115,7 @@ The trade-off: anyone holding this host's local admin password, or its hash, can
 The Baseline is the cluster standard without the cluster, FC/MPIO and NUMA items:
 
 - **Security:** NTLMv2 only, WDigest off, LLMNR off, AutoRun off, UAC, a 900 s inactivity lock, RDP with NLA/TLS/high encryption, SSL 3.0/TLS 1.0/1.1 off, SMBv1 off, SMB signing required, firewall on, lockout after 10 attempts, Guest disabled, Print Spooler disabled.
-  - The firewall rules enabled first are Hyper-V, WinRM, file sharing, WMI and RDP.
+  - The firewall rules for Hyper-V, WinRM, file sharing, WMI and RDP are enabled. They're checked as their own item, because a fresh install already has the firewall on.
   - A stricter existing lock or lockout value is kept.
 - **Optimisation:** High Performance power plan, hibernation off, last-access updates off, 8.3 names off, telemetry tasks off (defrag/retrim left on), NIC power management off and VMQ on for the switch members.
 - **HPE:** BIOS workload profile `Virtualization-MaxPerformance`.

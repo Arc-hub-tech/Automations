@@ -12,13 +12,11 @@
 >
 > → **Ships with the standard in place:** the security baseline is applied in the workshop and checked again on site.
 
-> **Status:** pilot, version 0.1.0-dev on the develop branch. Both scripts have been tested with mocked data but have not yet run on HPE hardware. These need confirming on the first real builds:
+> **Status:** pilot, version 0.1.1-dev on the develop branch. Both scripts have run end to end on a Windows Server 2025 lab VM (everything except the HPE, iLO and Datto steps), but not yet on HPE hardware. These need confirming on the first real builds:
 >
-> → the iLO steps (password, IP, DNS, host name, protocols);
+> → the SPP, iLO steps (password, IP, DNS, host name, protocols) and the Datto agent install;
 >
-> → turning Defender off alongside SentinelOne and Sophos;
->
-> → the Windows Update loop;
+> → turning Defender off alongside SentinelOne and Sophos (the off-policy itself works on WS2025);
 >
 > → the automatic restart of the script after a reboot;
 >
@@ -213,7 +211,7 @@ On Windows Server, Defender **does not switch itself to passive mode** when Sent
 
 If the Sophos installer has already removed Defender, the phase sees that and moves on. If the customer has no SentinelOne or Sophos, choose "Defender stays as the antivirus" and Defender keeps running with its exclusions.
 
-**The off-policy outlives the agent.** If the customer later removes SentinelOne or Sophos, Defender stays off. The as-built report names the two registry values to delete, so this is on record in ITGlue. Keeping protection in place after that is part of the customer's own checks.
+**The off-policy outlives the agent.** If the customer later removes SentinelOne or Sophos, Defender stays off. The as-built report names the two registry values to delete, so this is on record in ITGlue. After deleting them, run `Start-Service WinDefend`; a reboot alone doesn't bring Defender back. Keeping protection in place after that is part of the customer's own checks.
 
 → `DisableAntiSpyware` under `HKLM\SOFTWARE\Policies\Microsoft\Windows Defender`
 
@@ -253,7 +251,7 @@ The trade-off is that anyone holding the host's local admin password, or its has
 
 → SSL 3.0, TLS 1.0 and TLS 1.1 off. SMBv1 off and its feature removed. SMB signing required. PowerShell 2.0 removed.
 
-→ Windows Firewall on for every profile. The Hyper-V, WinRM, file sharing, WMI and Remote Desktop rules are enabled first.
+→ Windows Firewall on for every profile, with the Hyper-V, WinRM, file sharing, WMI and Remote Desktop rules enabled. The rules are checked even when the firewall is already on, which it is on a fresh install.
 
 → Local accounts lock after 10 failed attempts, for 15 minutes. Guest account disabled. Print Spooler disabled.
 

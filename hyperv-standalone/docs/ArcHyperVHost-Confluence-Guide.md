@@ -81,12 +81,13 @@ The scripts share a state file on the host (`C:\ArcLogs\HyperVHost\state.json`).
 
 ## The pen drive
 
-One pen drive carries both scripts and the HPE media for every ProLiant generation. **Format it NTFS or exFAT, not FAT32**, because SPP ISOs are bigger than FAT32's 4 GB file limit.
+One pen drive carries the scripts and the HPE media for every ProLiant generation. **Format it NTFS or exFAT, not FAT32**, because SPP ISOs are bigger than FAT32's 4 GB file limit.
 
 ```
 E:\ArcHyperVHost\
   ArcHyperVHost-Workshop.ps1
   ArcHyperVHost-Site.ps1
+  ArcHyperVHost-Lite.ps1
   SPP\Gen10\<SPP>.iso
   SPP\Gen10Plus\<SPP>.iso      (optional: Gen10 Plus falls back to SPP\Gen10)
   SPP\Gen11\<SPP>.iso
@@ -119,6 +120,8 @@ $p="$env:SystemDrive\ArcLogs\HyperVHost\ArcHyperVHost-Workshop.ps1"; md (Split-P
 ```
 
 For the Site script, use the same commands with `ArcHyperVHost-Site.ps1`.
+
+For the Lite script, use `ArcHyperVHost-Lite.ps1` and `-Phase Check`. On Windows Server 2016-2022, put `[Net.ServicePointManager]::SecurityProtocol='Tls12';` at the front of the download command, or the download from GitHub can fail.
 
 → Each script copies itself to `C:\ArcLogs\HyperVHost\`, so it carries on after a reboot even once the pen drive is removed.
 
@@ -224,16 +227,17 @@ Use `ArcHyperVHost-Lite.ps1` when a host is already built and in service, and it
 | VMQ on | The switch NICs restart, so VMs and RDP lose network for a few seconds. It is applied last; use the iLO remote console. Say no if VMQ was turned off on purpose (some Broadcom 1GbE NICs) |
 
 → **Defender and EDR:** Apply always shows the endpoint protection state and asks the engineer about it:
-   - **Defender only:** "Will a third-party EDR be installed?" If yes, deploy the agent first, then run Apply again. Defender is removed only once the agent is running, so the host is never without antivirus.
-   - **EDR running with Defender still active:** offers to remove Defender. Removal finishes at the next reboot.
-   - **No active antivirus:** offers to put Defender back.
-   - The report warns if no decision is recorded, if an EDR was planned but isn't installed, if real-time protection is off, or if signatures are more than 7 days old.
+
+- **Defender only:** "Will a third-party EDR be installed?" If yes, deploy the agent first, then run Apply again. Defender is removed only once the agent is running, so the host is never without antivirus.
+- **EDR running with Defender still active:** offers to remove Defender. Removal finishes at the next reboot.
+- **No active antivirus:** offers to put Defender back.
+- The report warns if no decision is recorded, if an EDR was planned but isn't installed, if real-time protection is off, or if signatures are more than 7 days old.
 
 → **VM start and stop:** only VMs that differ are changed. A start delay the customer has already set (a staggered start order, for example) is kept; only VMs with no delay get the default. A running VM's stop action can't be changed, so it's reported to set at the VM's next shutdown.
 
 → **Afterwards** it writes `Lite-Apply-<host>-<time>.html`, lists anything declined or still different (a domain GPO wins over local settings), and says if a reboot is needed. Plan the reboot in a maintenance window.
 
-→ **What it adds to the checks:** clean shutdown and restart on every VM (as in the as-built report; Apply turns a disabled Shutdown integration service back on), old checkpoints (older than 7 days), VMs running on differencing disks with no checkpoint (usually a failed backup merge), VM files on the system drive, an LBFO team or single NIC under the switch, and Windows updates more than 45 days old.
+→ **What it adds to the checks:** clean shutdown and restart on every VM (as in the as-built report; Apply turns a disabled Shutdown integration service back on), old checkpoints (older than 7 days), VMs running on differencing disks with no checkpoint (usually a failed backup merge), VM files on the system drive, an LBFO team or single NIC under the switch, a Hyper-V Replica server with its listener firewall rules off, remote UAC still on for local accounts on a workgroup host, and Windows updates more than 45 days old.
 
 ## Endpoint protection and Defender
 

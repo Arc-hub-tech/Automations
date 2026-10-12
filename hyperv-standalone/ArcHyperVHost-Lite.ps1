@@ -27,9 +27,14 @@
 
        [Net.ServicePointManager]::SecurityProtocol='Tls12'; $p="$env:SystemDrive\ArcLogs\HyperVHost\ArcHyperVHost-Lite.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-standalone/ArcHyperVHost-Lite.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Check
 
-    OR from a USB stick:
+    OR, with no internet access, copy just this one file to the host (USB stick,
+    RDP clipboard, a file share) and run it from wherever it is:
 
-       Set-ExecutionPolicy Bypass -Scope Process -Force; & E:\ArcHyperVHost\ArcHyperVHost-Lite.ps1 -Phase Check
+       Set-ExecutionPolicy Bypass -Scope Process -Force; & E:\ArcHyperVHost-Lite.ps1 -Phase Check
+
+    Nothing else is needed: no pen drive, SPP, iLOrest or other HPE media. It
+    does not update firmware or drivers. If ilorest is already installed, the
+    BIOS workload profile is checked too; if not, that check is skipped.
 
  3. Read the plan and the HTML report it writes to C:\ArcLogs\HyperVHost\, get
     the change approved, then:

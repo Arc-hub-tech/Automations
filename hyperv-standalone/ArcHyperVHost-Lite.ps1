@@ -907,6 +907,41 @@ function Get-ArcVssWriters {
     return $out
 }
 
+# The Shutdown integration service, matched by its fixed GUID (the Name is localised).
+$ShutdownIcGuid = '9F8233AC-BE49-4C79-8EE3-E7E1985B2077'
+function Get-ArcShutdownIc {
+    param($VM)
+    return (Get-VMIntegrationService -VM $VM -ErrorAction SilentlyContinue | Where-Object { "$($_.Id)" -like "*\$ShutdownIcGuid" } | Select-Object -First 1)
+}
+
+# Restart and clean-shutdown checks for every VM. $Fix names the phase that sets them.
+# Automatic stop = Shut Down only works through the guest's Shutdown integration service.
+function Add-ArcVmPowerResults {
+    param($Vms, [string]$Fix)
+    $Vms = @($Vms)
+    if (-not $Vms) { return }
+    $noStart = @($Vms | Where-Object { "$($_.AutomaticStartAction)" -eq 'Nothing' })
+    if ($noStart) { Add-Result WARN 'VM automatic start' "Not started after a host reboot: $($noStart.Name -join ', '). Fix with $Fix (start if it was running)." }
+    else { Add-Result PASS 'VM automatic start' 'Every VM starts after a host reboot (if it was running, or always)' }
+
+    $disabled = @(); $silent = @(); $unread = @()
+    foreach ($vm in $Vms) {
+        $ic = Get-ArcShutdownIc $vm
+        if (-not $ic) { $unread += $vm.Name }
+        elseif (-not $ic.Enabled) { $disabled += $vm.Name }
+        elseif ("$($vm.State)" -eq 'Running' -and "$($ic.PrimaryOperationalStatus)" -ne 'Ok') {
+            $silent += "$($vm.Name) ($(if ($ic.PrimaryStatusDescription) { $ic.PrimaryStatusDescription } else { 'no status' }))"
+        }
+    }
+    if ($disabled) { Add-Result WARN 'VM clean shutdown' "Shutdown integration service disabled on: $($disabled -join ', ') - Hyper-V can't shut these down cleanly when the host stops. Fix with $Fix." }
+    if ($silent) { Add-Result WARN 'VM clean shutdown' "Guest not answering the Shutdown integration service: $($silent -join ', ') - check the integration services (Linux: the Hyper-V daemons) in the guest; until then it won't shut down cleanly when the host stops." }
+    if ($unread) { Add-Result WARN 'VM clean shutdown' "Could not read the Shutdown integration service on: $($unread -join ', ')" }
+    if (-not ($disabled -or $silent -or $unread)) {
+        $running = @($Vms | Where-Object { "$($_.State)" -eq 'Running' }).Count
+        Add-Result PASS 'VM clean shutdown' "Shutdown integration service enabled on every VM$(if ($running) { ", and answering on the $running running" })"
+    }
+}
+
 # ---- end of report helpers ----
 
 # ---------------------------------------------------------------------------
@@ -1009,6 +1044,10 @@ function Get-LiteVmPlan {
         if ($vm.AutomaticStartDelay -eq 0 -and $Delay -gt 0) {
             $rows += [pscustomobject]@{ VM = $vm.Name; Setting = 'Start delay'; Current = '0 s'; Desired = "$Delay s"; Value = $Delay; Apply = $true; Note = '' }
         }
+        $ic = Get-ArcShutdownIc $vm
+        if ($ic -and -not $ic.Enabled) {
+            $rows += [pscustomobject]@{ VM = $vm.Name; Setting = 'Shutdown service'; Current = 'Disabled'; Desired = 'Enabled'; Value = 'Enabled'; Apply = $true; Note = 'Lets Hyper-V shut the guest down cleanly (safe while it runs)' }
+        }
         if ("$($vm.AutomaticStopAction)" -ne 'ShutDown') {
             $off = "$($vm.State)" -eq 'Off'
             $rows += [pscustomobject]@{ VM = $vm.Name; Setting = 'Automatic stop'; Current = "$($vm.AutomaticStopAction)"; Desired = 'ShutDown'; Value = 'ShutDown'; Apply = $off
@@ -1029,6 +1068,7 @@ function Invoke-LiteVmItem {
         'Automatic start' { Set-VM -Name $Row.VM -AutomaticStartAction StartIfRunning -ErrorAction Stop }
         'Start delay'     { Set-VM -Name $Row.VM -AutomaticStartDelay ([int]$Row.Value) -ErrorAction Stop }
         'Automatic stop'  { Set-VM -Name $Row.VM -AutomaticStopAction ShutDown -ErrorAction Stop }
+        'Shutdown service' { Get-ArcShutdownIc (Get-VM -Name $Row.VM) | Enable-VMIntegrationService -ErrorAction Stop }
     }
 }
 
@@ -1448,6 +1488,7 @@ function Invoke-LiteReport {
     if (-not $vms) { Add-Result INFO 'VMs' 'None on this host' }
     elseif ($notShutdown) { Add-Result WARN 'VM automatic stop' "Not Shut Down: $($notShutdown.Name -join ', ')" }
     else { Add-Result PASS 'VM automatic stop' 'Shut Down on every VM' }
+    Add-ArcVmPowerResults -Vms $vms -Fix '-Phase Apply'
     $vmRows = @($vms | Sort-Object Name | ForEach-Object {
         [pscustomobject]@{ Name = $_.Name; State = "$($_.State)"; Generation = $_.Generation; Version = $_.Version; vCPU = $_.ProcessorCount; StartupGB = [math]::Round($_.MemoryStartup / 1GB, 1); Start = "$($_.AutomaticStartAction) +$($_.AutomaticStartDelay)s"; Stop = "$($_.AutomaticStopAction)" }
     })

@@ -181,7 +181,7 @@ Connect the host to the customer network. Log on at the console or the iLO remot
 | Edr | Yes to a third-party EDR removes Microsoft Defender (reboot). No keeps Defender with the Hyper-V exclusions | Whether a third-party EDR will be installed |
 | Admin | Creates a new local admin, checks its password works, then disables the built-in Administrator | Account name and password |
 | Baseline | Re-checks the standard and applies anything that differs, such as settings changed by a domain policy after the join | Confirm the plan, if anything differs |
-| HostSettings | On every VM: automatic stop is Shut Down, automatic start is "start if it was running" after the delay | The start delay |
+| HostSettings | On every VM: the Shutdown integration service is turned on (Shut Down depends on it), automatic stop is Shut Down, automatic start is "start if it was running" after the delay | The start delay |
 | Report | Runs the checks and writes the as-built report | Nothing |
 
 **Gate.** The script stops with an `ACTION NEEDED` line when a person is needed. Do the step, then run `-Phase Next` again. The gate is: you are logged on as the built-in Administrator, which can't be disabled from its own session. Log off and log on as the new account, and the script carries on.
@@ -233,7 +233,7 @@ Use `ArcHyperVHost-Lite.ps1` when a host is already built and in service, and it
 
 → **Afterwards** it writes `Lite-Apply-<host>-<time>.html`, lists anything declined or still different (a domain GPO wins over local settings), and says if a reboot is needed. Plan the reboot in a maintenance window.
 
-→ **What it adds to the checks:** old checkpoints (older than 7 days), VMs running on differencing disks with no checkpoint (usually a failed backup merge), VM files on the system drive, an LBFO team or single NIC under the switch, and Windows updates more than 45 days old.
+→ **What it adds to the checks:** clean shutdown and restart on every VM (as in the as-built report; Apply turns a disabled Shutdown integration service back on), old checkpoints (older than 7 days), VMs running on differencing disks with no checkpoint (usually a failed backup merge), VM files on the system drive, an LBFO team or single NIC under the switch, and Windows updates more than 45 days old.
 
 ## Endpoint protection and Defender
 
@@ -337,7 +337,7 @@ It contains:
 | Storage | VM path off the system drive, disk health, free space below 15% |
 | Protection | Endpoint protection running, Defender state (and how to put it back if it was removed), Datto agent, built-in Administrator disabled, local admin account, baseline differences, remote UAC on workgroup hosts |
 | Backup and power | Hyper-V VSS writer stable, other VSS writers, firewall rules Veeam needs, Veeam components present, UPS shutdown agent (PowerChute, Eaton IPP and similar) |
-| VMs | Automatic stop action is Shut Down on every VM |
+| VMs | Automatic stop is Shut Down and automatic start isn't "Nothing" on every VM. Clean shutdown: the Shutdown integration service is on for every VM, and running guests answer it (a guest that doesn't, such as Linux without the Hyper-V daemons, won't shut down cleanly when the host stops) |
 
 ## Safety controls
 
@@ -385,6 +385,7 @@ Every phase is safe to re-run. To repeat a single step, run that phase by name, 
 | Admin: stops at the built-in Administrator | Log off, log on as the new account; the script carries on |
 | Report: still on workshop DHCP | Run `-Phase Network` on site |
 | Report: remote UAC warning on a workgroup host | Run `-Phase Identity` |
+| Report: "VM clean shutdown" warning | Service disabled: run `-Phase HostSettings` (Site) or `-Phase Apply` (Lite). Guest not answering: update the integration services in the guest (Linux: install and start the Hyper-V daemons), then re-run the report |
 | Lite: stops with "Failover Clustering is installed" | Use the Hyper-V cluster standard; its Baseline drains the node first |
 | Lite: "Disk chain" warning | The VM runs on .avhdx files with no checkpoint, usually after a failed backup merge. Check the backup job and merge the chain in a maintenance window |
 

@@ -31,6 +31,13 @@ _Work in progress on the `develop` branch. `$ScriptVersion` is `0.2.0-dev`; the 
     - The Site Report re-run after the refactor below.
   - Not yet tested: VMQ on real NICs, the BIOS profile through ilorest, and WS2016-2022.
 
+- **Clean shutdown and restart checks for VMs, in the Site Report and the Lite report.** Both run from one shared helper (`Add-ArcVmPowerResults`).
+  - **VM automatic start:** WARN for any VM set to Nothing.
+  - **VM clean shutdown:** WARN when the Shutdown integration service is disabled. On running VMs, also WARN when the guest doesn't answer it (e.g. Linux without the Hyper-V daemons). Either way, automatic stop = Shut Down can't shut the VM down cleanly when the host stops.
+  - The service is matched by its fixed GUID, because its name is localised.
+  - Site `HostSettings` and Lite `Apply` now turn a disabled Shutdown service back on. This is safe while the VM runs.
+  - Tested in the lab VM: a disabled service, a running guest with no OS (No Contact), and a VM set to Nothing. Lite Apply and Site HostSettings both fixed the first and last.
+
 ### Changed (0.2.0-dev)
 - The Site script's report helpers (EDR/Defender detection, the built-in admin lookup, the VSS writer list, the time source and the HTML builder) now sit together in a second marked block, `start of report helpers` / `end of report helpers`. That block is identical in the Site and Lite scripts. The HTML footer names the script that wrote it, and the title takes a report kind.
 - The shared helper block is now identical in all three scripts. All three share `$ScriptVersion`.

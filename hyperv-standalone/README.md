@@ -88,7 +88,7 @@ Run it on the iLO remote console or a local console, with internet access.
 | `Edr` | Asks one question: **will a third-party EDR (SentinelOne, Sophos) be installed?** Yes **removes Microsoft Defender** (feature uninstall, reboot). No keeps Defender as the antivirus, with the Hyper-V exclusions. It never installs the EDR. If an EDR turns up later while Defender is still installed, it asks again. |
 | `Admin` | Creates a **new local admin** (name and password prompted, password typed twice), checks the password works, then **disables the built-in Administrator** (RID 500). If you're logged on as the built-in account, it stops and resumes when you log on as the new one. |
 | `Baseline` | Re-checks the standard on site (the same code as the workshop) and applies anything that differs, after showing the plan. On an existing host, this is where the standard is first applied. |
-| `HostSettings` | On every VM: automatic stop = **Shut Down**, automatic start = start if it was running, with **one start delay** (prompted, default 120 s). Hyper-V has no host-wide default for these, so re-run it after creating VMs. |
+| `HostSettings` | On every VM: the **Shutdown integration service** on (Shut Down depends on it), automatic stop = **Shut Down**, automatic start = start if it was running, with **one start delay** (prompted, default 120 s). Hyper-V has no host-wide default for these, so re-run it after creating VMs. |
 | `Report` | Runs the checks, then writes `C:\ArcLogs\HyperVHost\AsBuilt-<host>-<time>.html` for the engineer to **attach to the host's Configuration in ITGlue**. |
 
 **On an existing customer host,** run the Site script only. It shows each plan and asks before changing anything. It never rebuilds a switch or moves an IP, and it warns before any reboot that running VMs will be stopped. If the host only needs the security and Hyper-V standard, with no network, identity or account work and no reboots, use the [Lite script](#lite-archypervhost-liteps1) instead.
@@ -127,7 +127,7 @@ The Baseline is the cluster standard without the cluster, FC/MPIO and NUMA items
 | Storage | VM path off the system drive, disk health, free space |
 | Protection | EDR running, Defender state, Datto agent, built-in Administrator disabled, the local admin account, baseline differences, remote UAC off on workgroup hosts |
 | Backup and power | Hyper-V VSS writer and other writers, firewall groups Veeam needs, Veeam components (INFO only), **UPS shutdown agent** (PowerChute, Eaton IPP etc.) |
-| VMs | Automatic stop action on each VM |
+| VMs | Automatic stop is Shut Down, automatic start isn't Nothing, and clean shutdown: the Shutdown integration service is enabled on each VM and, on running VMs, the guest answers it |
 
 The HTML is self-contained, so it opens offline. It's **deliberately unbranded**: this repo is public, so no logo or brand assets live in it.
 
@@ -170,6 +170,7 @@ Unlike the Site script's Edr phase, **Lite removes Defender only once an EDR age
 **VM start and stop on a live host:** only VMs that differ are changed. An automatic start action of `Nothing` becomes `StartIfRunning`. A start delay the customer already set (a staggered DC-first order, for example) is kept; only VMs with no delay get the default (prompted, 120 s). A running VM's stop action can't be changed, so it's reported to set at its next shutdown.
 
 **Checks** are the Site Report's, minus the build-only ones (local admin "created by these scripts", workshop DHCP). Datto is a WARN rather than a FAIL. They add the following for live hosts:
+- Clean shutdown and restart on every VM, as in the Site Report (Apply enables a disabled Shutdown integration service; it's safe while the VM runs).
 - Checkpoints older than 7 days.
 - VMs running on differencing disks (`.avhdx`) with no checkpoint, which usually means a backup merge failed.
 - VM files on the system drive.

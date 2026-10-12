@@ -910,6 +910,41 @@ function Get-ArcVssWriters {
     return $out
 }
 
+# The Shutdown integration service, matched by its fixed GUID (the Name is localised).
+$ShutdownIcGuid = '9F8233AC-BE49-4C79-8EE3-E7E1985B2077'
+function Get-ArcShutdownIc {
+    param($VM)
+    return (Get-VMIntegrationService -VM $VM -ErrorAction SilentlyContinue | Where-Object { "$($_.Id)" -like "*\$ShutdownIcGuid" } | Select-Object -First 1)
+}
+
+# Restart and clean-shutdown checks for every VM. $Fix names the phase that sets them.
+# Automatic stop = Shut Down only works through the guest's Shutdown integration service.
+function Add-ArcVmPowerResults {
+    param($Vms, [string]$Fix)
+    $Vms = @($Vms)
+    if (-not $Vms) { return }
+    $noStart = @($Vms | Where-Object { "$($_.AutomaticStartAction)" -eq 'Nothing' })
+    if ($noStart) { Add-Result WARN 'VM automatic start' "Not started after a host reboot: $($noStart.Name -join ', '). Fix with $Fix (start if it was running)." }
+    else { Add-Result PASS 'VM automatic start' 'Every VM starts after a host reboot (if it was running, or always)' }
+
+    $disabled = @(); $silent = @(); $unread = @()
+    foreach ($vm in $Vms) {
+        $ic = Get-ArcShutdownIc $vm
+        if (-not $ic) { $unread += $vm.Name }
+        elseif (-not $ic.Enabled) { $disabled += $vm.Name }
+        elseif ("$($vm.State)" -eq 'Running' -and "$($ic.PrimaryOperationalStatus)" -ne 'Ok') {
+            $silent += "$($vm.Name) ($(if ($ic.PrimaryStatusDescription) { $ic.PrimaryStatusDescription } else { 'no status' }))"
+        }
+    }
+    if ($disabled) { Add-Result WARN 'VM clean shutdown' "Shutdown integration service disabled on: $($disabled -join ', ') - Hyper-V can't shut these down cleanly when the host stops. Fix with $Fix." }
+    if ($silent) { Add-Result WARN 'VM clean shutdown' "Guest not answering the Shutdown integration service: $($silent -join ', ') - check the integration services (Linux: the Hyper-V daemons) in the guest; until then it won't shut down cleanly when the host stops." }
+    if ($unread) { Add-Result WARN 'VM clean shutdown' "Could not read the Shutdown integration service on: $($unread -join ', ')" }
+    if (-not ($disabled -or $silent -or $unread)) {
+        $running = @($Vms | Where-Object { "$($_.State)" -eq 'Running' }).Count
+        Add-Result PASS 'VM clean shutdown' "Shutdown integration service enabled on every VM$(if ($running) { ", and answering on the $running running" })"
+    }
+}
+
 # ---- end of report helpers ----
 
 # ---------------------------------------------------------------------------
@@ -1135,6 +1170,12 @@ function Invoke-HostSettings {
     $vms = @(Get-VM -ErrorAction SilentlyContinue)
     if (-not $vms) { Write-Host '  No VMs yet. Re-run -Phase HostSettings after the VMs are created (Hyper-V has no host-wide default for these).' -ForegroundColor Yellow }
     foreach ($vm in $vms) {
+        # Shut Down needs the guest's Shutdown integration service (safe to enable while the VM runs).
+        $ic = Get-ArcShutdownIc $vm
+        if ($ic -and -not $ic.Enabled) {
+            try { $ic | Enable-VMIntegrationService -ErrorAction Stop; Write-Host "  OK   $($vm.Name): Shutdown integration service enabled" -ForegroundColor Green }
+            catch { Write-Warning "$($vm.Name): could not enable the Shutdown integration service - $($_.Exception.Message)" }
+        }
         try {
             Set-VM -VM $vm -AutomaticStartAction StartIfRunning -AutomaticStartDelay ([int]$delay) -ErrorAction Stop
             if ($vm.AutomaticStopAction -ne 'ShutDown') { Set-VM -VM $vm -AutomaticStopAction ShutDown -ErrorAction Stop }
@@ -1310,6 +1351,7 @@ function Invoke-Report {
     if (-not $vms) { Add-Result INFO 'VM start/stop' 'No VMs yet - run -Phase HostSettings after creating them' }
     elseif ($notShutdown) { Add-Result WARN 'VM automatic stop' "Not Shut Down: $($notShutdown.Name -join ', ')" }
     else { Add-Result PASS 'VM automatic stop' 'Shut Down on every VM' }
+    Add-ArcVmPowerResults -Vms $vms -Fix '-Phase HostSettings'
     $sections += @{ Title = 'Virtual machines'; Html = (New-ArcTable $vmRows @('Name', 'State', 'Generation', 'vCPU', 'StartupGB', 'Start', 'Stop')) }
 
     # Build record

@@ -14,7 +14,7 @@
 >
 > → **Ships with the standard in place:** the security baseline is applied in the workshop and checked again on site.
 
-> **Status:** pilot, version 0.2.0-dev on the develop branch. The Workshop and Site scripts have run end to end on a Windows Server 2025 lab VM (everything except the HPE, iLO and Datto steps), and the Lite script's Check and Apply on the same VM, but none of them on HPE hardware yet. These need confirming on the first real builds:
+> **Status:** pilot, version 0.2.1-dev on the develop branch (latest release: v0.2.0 on main). The Workshop and Site scripts have run end to end on a Windows Server 2025 lab VM (everything except the HPE, iLO and Datto steps), and the Lite script's Check and Apply on the same VM, but none of them on HPE hardware yet. These need confirming on the first real builds:
 >
 > → the SPP, iLO steps (password, IP, DNS, host name, protocols) and the Datto agent install;
 >

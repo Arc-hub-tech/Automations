@@ -4,7 +4,20 @@ All notable changes to `ArcHyperVHost-Workshop.ps1`, `ArcHyperVHost-Site.ps1` an
 
 ## [Unreleased]
 
-_Work in progress on the `develop` branch. `$ScriptVersion` is `0.2.0-dev`; the download one-liners point at `/develop/`._
+_Work in progress on the `develop` branch. `$ScriptVersion` is `0.2.1-dev`; the download one-liners point at `/develop/`. Nothing yet since v0.2.0._
+
+## [v0.2.0] - 2026-10-12
+
+First release of the standalone Hyper-V host scripts to `main`: Workshop, Site and Lite. The download one-liners now point at `/main/`.
+
+**Pilot status:** every phase has run on a Windows Server 2025 lab VM, but nothing has run on HPE hardware yet. Still to confirm on the first real builds:
+- the SPP, the iLO steps and the Datto install;
+- Defender removal alongside SentinelOne or Sophos;
+- the resume-at-logon task;
+- Gen11/Gen12 iLO behaviour;
+- for Lite: VMQ on real NICs, the BIOS profile through ilorest, and WS2016-2022.
+
+The sections below include the development history (0.1.0-dev to 0.2.0-dev).
 
 ### Added (0.2.0-dev)
 - **`ArcHyperVHost-Lite.ps1`: lite standardisation for a live host that is already built.** It applies only the security and Hyper-V optimisation standard, from the same shared baseline code. It never touches the network, domain membership or accounts, never installs an EDR, and it **never reboots**. It stops when Failover Clustering is installed (pointing to `hyperv-cluster/`, even with the cluster service stopped) and on a host without the Hyper-V role. It warns on anything older than WS2025 (untested), and its one-liner forces TLS 1.2 for older builds.
@@ -60,7 +73,7 @@ Both scripts were run phase by phase on a nested Hyper-V VM: every Workshop phas
 - **The report's advice for bringing Defender back was wrong.** Deleting the two policy values and rebooting leaves WinDefend stopped (startup Manual). The advice now says to run `Start-Service WinDefend` after deleting them, which restores it (checked on WS2025).
 - PreFlight names a remote PowerShell session as such, instead of calling it RDP.
 
-### Added
+### Added (0.1.0-dev)
 - **Standalone Hyper-V host build for customer sites (0.1.0-dev).** Two prompt-only scripts that share a state file (`C:\ArcLogs\HyperVHost\state.json`, no secrets) and a duplicated helper block.
   - **`ArcHyperVHost-Workshop.ps1`** runs PreFlight → Hpe → Base → Storage → Agents → Updates → Network → Baseline → Ship:
     - SPP through SUM in online mode, mounted from the pen drive. The ISO is chosen by ProLiant generation from `SPP\Gen10`, `SPP\Gen10Plus` (which falls back to `Gen10`), `SPP\Gen11` or `SPP\Gen12`, with a warning if the file name names another generation. PreFlight reports whether the stick has an SPP for the server.

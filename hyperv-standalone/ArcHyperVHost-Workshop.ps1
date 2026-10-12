@@ -79,7 +79,7 @@ param(
 
 # Version of this script, surfaced in the banner/transcript. All three standalone
 # scripts share one version; '-dev' suffix while work accumulates under [Unreleased].
-$ScriptVersion = '0.2.0-dev'
+$ScriptVersion = '0.2.1-dev'
 $ScriptRole    = 'Workshop'   # which half of the build; names the state entries and the logon task
 
 $ErrorActionPreference = 'Stop'

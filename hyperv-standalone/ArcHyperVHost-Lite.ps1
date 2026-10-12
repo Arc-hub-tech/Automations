@@ -65,7 +65,7 @@ param(
 
 # Version of this script, surfaced in the banner/transcript. All three standalone
 # scripts share one version; '-dev' suffix while work accumulates under [Unreleased].
-$ScriptVersion = '0.2.0-dev'
+$ScriptVersion = '0.2.1-dev'
 $ScriptRole    = 'Lite'   # names the state entries, logs and report
 
 $ErrorActionPreference = 'Stop'

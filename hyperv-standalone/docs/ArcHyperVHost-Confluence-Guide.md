@@ -14,7 +14,7 @@
 >
 > → **Ships with the standard in place:** the security baseline is applied in the workshop and checked again on site.
 
-> **Status:** pilot, version 0.2.0, released on the main branch. The Workshop and Site scripts have run end to end on a Windows Server 2025 lab VM (everything except the HPE, iLO and Datto steps), and the Lite script's Check and Apply on the same VM, but none of them on HPE hardware yet. These need confirming on the first real builds:
+> **Status:** pilot, version 0.2.1, released on the main branch. The Workshop and Site scripts have run end to end on a Windows Server 2025 lab VM (everything except the HPE, iLO and Datto steps), and the Lite script's Check and Apply on the same VM, but none of them on HPE hardware yet. These need confirming on the first real builds:
 >
 > → the SPP, iLO steps (password, IP, DNS, host name, protocols) and the Datto agent install;
 >
@@ -81,7 +81,7 @@ The scripts share a state file on the host (`C:\ArcLogs\HyperVHost\state.json`).
 
 ## The pen drive
 
-One pen drive carries the scripts and the HPE media for every ProLiant generation. **Format it NTFS or exFAT, not FAT32**, because SPP ISOs are bigger than FAT32's 4 GB file limit.
+One pen drive carries the scripts and the HPE media for every ProLiant generation. **Format it NTFS or exFAT, not FAT32**, because SPP ISOs are bigger than FAT32's 4 GB file limit. The pen drive is for the Workshop and Site builds. **The Lite script doesn't need it** (see Process 4); a copy on the stick is just a convenience.
 
 ```
 E:\ArcHyperVHost\
@@ -121,7 +121,7 @@ $p="$env:SystemDrive\ArcLogs\HyperVHost\ArcHyperVHost-Workshop.ps1"; md (Split-P
 
 For the Site script, use the same commands with `ArcHyperVHost-Site.ps1`.
 
-For the Lite script, use `ArcHyperVHost-Lite.ps1` and `-Phase Check`. On Windows Server 2016-2022, put `[Net.ServicePointManager]::SecurityProtocol='Tls12';` at the front of the download command, or the download from GitHub can fail.
+For the Lite script, use `ArcHyperVHost-Lite.ps1` and `-Phase Check`. It's a single file and needs no pen drive or HPE media. On Windows Server 2016-2022, put `[Net.ServicePointManager]::SecurityProtocol='Tls12';` at the front of the download command, or the download from GitHub can fail.
 
 → Each script copies itself to `C:\ArcLogs\HyperVHost\`, so it carries on after a reboot even once the pen drive is removed.
 
@@ -208,6 +208,14 @@ Run only the Site script, with `-Phase Next`, in a maintenance window.
 ## Process 4: lite standardisation of a live host
 
 Use `ArcHyperVHost-Lite.ps1` when a host is already built and in service, and it only needs the security and Hyper-V optimisation standard. It uses the same standard as the Baseline phase, and the same code. It never touches the network, domain membership or accounts, never installs an EDR, and **it never reboots**. It stops if Failover Clustering is installed; use the Hyper-V cluster standard for those. It's tested on Windows Server 2025; on 2016-2022 it warns, so run Check first and read the plan.
+
+**What you need:** an administrator logon and the one script file. **No pen drive, SPP, iLOrest or other HPE media.** Lite doesn't update firmware or drivers; if the host's SPP is out of date, plan that separately.
+
+→ **With internet access:** run the download command (see Getting the scripts).
+
+→ **Without internet access:** copy `ArcHyperVHost-Lite.ps1` to the host by any means (USB stick, RDP clipboard, a file share), then run `Set-ExecutionPolicy Bypass -Scope Process -Force; & <path>\ArcHyperVHost-Lite.ps1 -Phase Check`.
+
+→ **iLOrest:** if it's already on the host, the BIOS workload profile is checked as well. If it isn't, that check is skipped. Lite never installs it.
 
 1. **Check** (read-only): `-Phase Check` shows what Apply would change and runs the live-host checks, then writes `Lite-Check-<host>-<time>.html`. Attach that to the change request.
 2. **Apply**, once the change is approved: `-Phase Apply` shows the plan again and asks every question before it changes anything:

@@ -16,7 +16,7 @@
 >
 > → the SPP, iLO steps (password, IP, DNS, host name, protocols) and the Datto agent install;
 >
-> → turning Defender off alongside SentinelOne and Sophos (the off-policy itself works on WS2025);
+> → removing Defender alongside SentinelOne and Sophos (removal itself is tested on WS2025);
 >
 > → the automatic restart of the script after a reboot;
 >
@@ -31,7 +31,7 @@
 | Servers | HPE ProLiant Gen10, Gen10 Plus, Gen11 and Gen12, standalone (not clustered) |
 | Operating system | Windows Server 2025 Standard or Datacenter, Desktop Experience |
 | Identity | Domain-joined or workgroup |
-| Endpoint protection | SentinelOne or Sophos, deployed by Datto policy or the customer. The scripts detect it and never install it. Defender is kept if the customer has neither. |
+| Endpoint protection | SentinelOne or Sophos, deployed by Datto policy or the customer. The scripts never install it. Defender is removed when one is planned, and kept otherwise. |
 | Networking | One SET switch over a matching group of NICs, with a Management host adapter |
 | Storage | Local RAID: a boot array plus a data volume for VMs |
 | Management | No SCVMM. Datto RMM is installed on every host |
@@ -70,7 +70,7 @@ The two scripts share a state file on the host (`C:\ArcLogs\HyperVHost\state.jso
 | Management VLAN, static IP, prefix, gateway, DNS | Site, Network phase | The workshop uses DHCP; the static address is set on site |
 | Domain name and OU, or workgroup name and NTP servers | Site, Identity phase | |
 | iLO IP, mask, gateway, DNS, host name | Workshop (Ship) or site | Optional. Can also be set in the iLO web UI |
-| Endpoint protection product | Site, Edr phase | SentinelOne or Sophos, in the policy with the Hyper-V exclusions |
+| Whether a third-party EDR will be installed | Site, Edr phase | SentinelOne or Sophos. Yes removes Defender. Put the host in the EDR policy with the Hyper-V exclusions |
 | Name for the new local admin account | Site, Admin phase | Its password must be unique to this host; record it in ITGlue |
 | VM start delay | Site, HostSettings phase | One delay for every VM, in seconds. The default is 120 |
 
@@ -173,17 +173,13 @@ Connect the host to the customer network. Log on at the console or the iLO remot
 |---|---|---|
 | Network | Sets the customer VLAN and static IP on the Management adapter the workshop left on DHCP. Builds the switch if there is none | VLAN, IP, prefix, gateway, DNS |
 | Identity | Domain: checks DNS can find the domain controllers, then joins. Workgroup: workgroup name, NTP servers, private network profile, WinRM, and remote UAC off for local accounts | Domain, OU and join account; or workgroup and NTP servers |
-| Edr | Detects SentinelOne or Sophos, then turns Defender off once you confirm the agent is connected. Checks after the reboot that Defender is really off | Confirm the agent is connected and in the right policy |
+| Edr | Yes to a third-party EDR removes Microsoft Defender (reboot). No keeps Defender with the Hyper-V exclusions | Whether a third-party EDR will be installed |
 | Admin | Creates a new local admin, checks its password works, then disables the built-in Administrator | Account name and password |
 | Baseline | Re-checks the standard and applies anything that differs, such as settings changed by a domain policy after the join | Confirm the plan, if anything differs |
 | HostSettings | On every VM: automatic stop is Shut Down, automatic start is "start if it was running" after the delay | The start delay |
 | Report | Runs the checks and writes the as-built report | Nothing |
 
-**Gates.** The script stops with an `ACTION NEEDED` line when a person is needed. Do the step, then run `-Phase Next` again. The gates are:
-
-→ the endpoint protection agent isn't installed or connected yet;
-
-→ you are logged on as the built-in Administrator, which can't be disabled from its own session. Log off and log on as the new account, and the script carries on.
+**Gate.** The script stops with an `ACTION NEEDED` line when a person is needed. Do the step, then run `-Phase Next` again. The gate is: you are logged on as the built-in Administrator, which can't be disabled from its own session. Log off and log on as the new account, and the script carries on.
 
 **After the VMs are created,** run `-Phase HostSettings` again. Hyper-V has no host-wide default for VM start and stop actions, so they're set per VM. Then run `-Phase Report` for a fresh as-built.
 
@@ -203,21 +199,21 @@ Run only the Site script, with `-Phase Next`, in a maintenance window.
 
 ## Endpoint protection and Defender
 
-On Windows Server, Defender **does not switch itself to passive mode** when SentinelOne or Sophos is installed. That only happens on hosts onboarded to Defender for Endpoint. Two antivirus products scanning VM disks at once hurts performance, so the Edr phase:
+On Windows Server, Defender **does not switch itself to passive mode** when SentinelOne or Sophos is installed. That only happens on hosts onboarded to Defender for Endpoint. Two antivirus products scanning VM disks at once hurts performance.
 
-1. Leaves Defender on, with the Hyper-V exclusions, until the agent is confirmed connected, so the host is never unprotected, including in transit.
-2. Sets the "Turn off Microsoft Defender Antivirus" policy and reboots.
-3. After the reboot, checks Defender's state. If Defender is still active, the phase and the report say so. Likely causes are tamper protection, a domain policy, or the agent switching it back on.
+So the Edr phase asks one question: **will a third-party EDR be installed on this host?**
 
-If the Sophos installer has already removed Defender, the phase sees that and moves on. If the customer has no SentinelOne or Sophos, choose "Defender stays as the antivirus" and Defender keeps running with its exclusions.
+→ **Yes:** Microsoft Defender is removed (the Windows feature is uninstalled), followed by a reboot.
 
-**The off-policy outlives the agent.** If the customer later removes SentinelOne or Sophos, Defender stays off. The as-built report names the two registry values to delete, so this is on record in ITGlue. After deleting them, run `Start-Service WinDefend`; a reboot alone doesn't bring Defender back. Keeping protection in place after that is part of the customer's own checks.
+→ **No:** Defender stays as the antivirus, with the Hyper-V exclusions.
 
-→ `DisableAntiSpyware` under `HKLM\SOFTWARE\Policies\Microsoft\Windows Defender`
+If an EDR agent turns up later while Defender is still installed, the phase asks again. If the Sophos installer has already removed Defender, the phase sees that and moves on.
 
-→ `DisableRealtimeMonitoring` under `HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection`
+**From the removal until the EDR is installed, the host has no antivirus.** The phase warns when no agent is on the host yet. Deploy the EDR straight after, through Datto policy or the customer. The report FAILs a host that has neither.
 
-Before confirming the agent, make sure the host is in the SentinelOne or Sophos policy that carries the Hyper-V exclusions:
+**If the EDR is ever uninstalled,** for example at contract end, put Defender back first: run `Install-WindowsFeature Windows-Defender`, then reboot. The as-built report says this, so it's on record in ITGlue. Keeping protection in place after that is part of the customer's own checks.
+
+The host must be in the SentinelOne or Sophos policy that carries the Hyper-V exclusions:
 
 → the VM folders;
 
@@ -301,7 +297,7 @@ It contains:
 | Windows | Activation, Desktop Experience, licensing (Standard edition with more than 2 VMs is a warning), time source, pending reboot |
 | Network | SET switch, member links up, still on the workshop DHCP address |
 | Storage | VM path off the system drive, disk health, free space below 15% |
-| Protection | Endpoint protection running, Defender state and the off-policy note, Datto agent, built-in Administrator disabled, local admin account, baseline differences, remote UAC on workgroup hosts |
+| Protection | Endpoint protection running, Defender state (and how to put it back if it was removed), Datto agent, built-in Administrator disabled, local admin account, baseline differences, remote UAC on workgroup hosts |
 | Backup and power | Hyper-V VSS writer stable, other VSS writers, firewall rules Veeam needs, Veeam components present, UPS shutdown agent (PowerChute, Eaton IPP and similar) |
 | VMs | Automatic stop action is Shut Down on every VM |
 
@@ -321,7 +317,7 @@ It contains:
 
 → Passwords are typed at hidden prompts and never written to disk or the logs. One exception: the iLO password is passed to iLOrest on its command line for the moment it runs, because that is the only way iLOrest accepts it.
 
-→ Defender stays on until the endpoint protection agent is confirmed connected.
+→ Defender is removed only when the engineer says a third-party EDR will be installed, with a warning if no agent is on the host yet.
 
 ## Logs and records
 
@@ -345,7 +341,7 @@ Every phase is safe to re-run. To repeat a single step, run that phase by name, 
 | Storage: "disk is not empty" | Pick the existing volume by drive letter, or clear the disk by hand if it should be reused |
 | Updates keeps stopping | An update fails every time. Check the warnings and the Windows Update log; hide or install that update by hand |
 | Network: lost connection | Expected over RDP. Use the iLO remote console. The new address is printed once DHCP or the static address is set |
-| Edr: Defender still active after the reboot | Check tamper protection and any domain policy, then run `-Phase Edr` again. Remove the Defender feature by hand only once the agent is confirmed protecting the host |
+| Report: Defender still active alongside the EDR | Run `-Phase Edr` and answer yes to remove it |
 | Admin: stops at the built-in Administrator | Log off, log on as the new account; the script carries on |
 | Report: still on workshop DHCP | Run `-Phase Network` on site |
 | Report: remote UAC warning on a workgroup host | Run `-Phase Identity` |

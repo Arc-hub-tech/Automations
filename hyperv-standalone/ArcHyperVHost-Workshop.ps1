@@ -79,7 +79,7 @@ param(
 
 # Version of this script, surfaced in the banner/transcript. Both standalone
 # scripts share one version; '-dev' suffix while work accumulates under [Unreleased].
-$ScriptVersion = '0.1.1-dev'
+$ScriptVersion = '0.1.2-dev'
 $ScriptRole    = 'Workshop'   # which half of the build; names the state entries and the logon task
 
 $ErrorActionPreference = 'Stop'
@@ -1143,7 +1143,7 @@ function Invoke-Storage {
 }
 
 # ---------------------------------------------------------------------------
-# Phase: Agents (Datto RMM; Defender stays on until the Site script confirms the EDR)
+# Phase: Agents (Datto RMM; Defender stays on - the Site script removes it if an EDR is planned)
 # ---------------------------------------------------------------------------
 
 function Install-ArcDattoAgent {
@@ -1185,7 +1185,7 @@ function Invoke-Agents {
         Install-ArcDattoAgent -Platform $platform -SiteID $siteId
     }
 
-    Write-Step 'Microsoft Defender (stays on until the Site script confirms the EDR)'
+    Write-Step 'Microsoft Defender (stays on - the Site script removes it if an EDR is planned)'
     Set-ArcDefenderHyperVExclusions
 
     Save-PhaseComplete 'Agents'

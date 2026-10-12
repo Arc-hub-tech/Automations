@@ -4,7 +4,14 @@ All notable changes to `ArcHyperVHost-Workshop.ps1` and `ArcHyperVHost-Site.ps1`
 
 ## [Unreleased]
 
-_Work in progress on the `develop` branch. `$ScriptVersion` is `0.1.1-dev`; the download one-liners point at `/develop/`._
+_Work in progress on the `develop` branch. `$ScriptVersion` is `0.1.2-dev`; the download one-liners point at `/develop/`._
+
+### Changed (0.1.2-dev)
+- **The Edr phase is now one question:** will a third-party EDR (SentinelOne, Sophos) be installed? **Yes removes the Microsoft Defender feature** (reboot needed). **No keeps Defender** as the antivirus, with the Hyper-V exclusions.
+  - This replaces the old flow: wait for the agent, confirm it in the console, turn Defender off by policy, then check after the reboot. That flow left a policy that outlived the EDR.
+  - The phase asks again if an EDR turns up later while Defender is still installed. It warns that the host has no antivirus between the removal and the EDR install.
+  - The Report FAILs a host with neither Defender nor an EDR. It also says how to put Defender back (`Install-WindowsFeature Windows-Defender`, then reboot) if the EDR is ever uninstalled, and still flags the old off-policy on existing hosts.
+  - Tested in the lab VM: No, then a rerun without a prompt; a dummy SentinelAgent service triggering the question again; Yes removing Defender across the reboot; and the Report with and without an agent.
 
 ### Fixed (0.1.1-dev, from a lab run on a Windows Server 2025 VM)
 Both scripts were run phase by phase on a nested Hyper-V VM: every Workshop phase except Hpe and Agents, and every Site phase on the workgroup path with Defender as the antivirus.
@@ -51,7 +58,7 @@ Both scripts were run phase by phase on a nested Hyper-V VM: every Workshop phas
     - The Defender off-policy turning Defender off on WS2025 after a reboot.
   - **To confirm on the first real build:**
     - The SPP, the Datto agent install, and the iLOrest calls: `iloaccounts changepass`, `ethernet --network_ipv4/--nameservers`, and `rawpatch` for the host name and protocols.
-    - The Defender off-policy alongside SentinelOne and alongside Sophos.
+    - Removing Defender alongside SentinelOne and alongside Sophos (removal itself is lab-tested).
     - The domain join path.
     - The any-administrator logon task (GroupId principal, AtLogOn trigger) opening its interactive window after a reboot and after the switch to the new admin account.
     - **Each ProLiant generation.** The iLO steps and the workload profile name were written against iLO 5 (Gen10). Gen11 (iLO 6) and especially Gen12 (iLO 7, which changes how in-band ilorest authenticates) need their own first build.

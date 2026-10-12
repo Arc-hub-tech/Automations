@@ -42,9 +42,9 @@
                     Verifies an existing switch and never moves any other address.
       Identity      Domain join, or workgroup: NTP, private network profile, WinRM,
                     and remote UAC off for local accounts (Veeam with a local admin).
-      Edr           Detects SentinelOne or Sophos (never installs them). Once the
-                    engineer confirms it is connected, turns Defender off by
-                    policy and checks after the reboot that it really is off.
+      Edr           Asks whether a third-party EDR (SentinelOne, Sophos) will be
+                    installed. Yes removes Microsoft Defender (reboot); no keeps
+                    Defender with the Hyper-V exclusions. Never installs the EDR.
       Admin         Creates a new local administrator (name and password asked),
                     checks it works, then disables the built-in Administrator.
       Baseline      Security defaults + host optimisations + BIOS workload profile.
@@ -68,7 +68,7 @@ param(
 
 # Version of this script, surfaced in the banner/transcript. Both standalone
 # scripts share one version; '-dev' suffix while work accumulates under [Unreleased].
-$ScriptVersion = '0.1.1-dev'
+$ScriptVersion = '0.1.2-dev'
 $ScriptRole    = 'Site'   # which half of the build; names the state entries and the logon task
 
 $ErrorActionPreference = 'Stop'
@@ -882,7 +882,7 @@ function Invoke-Identity {
 }
 
 # ---------------------------------------------------------------------------
-# Phase: Edr (detect SentinelOne/Sophos, then turn Defender off and verify)
+# Phase: Edr (third-party EDR planned? then remove Defender; otherwise keep it)
 # ---------------------------------------------------------------------------
 
 function Get-ArcEdr {
@@ -911,85 +911,50 @@ function Get-ArcDefenderState {
     return 'Active'
 }
 
+# Older builds turned Defender off by policy instead of removing it. The Report still
+# looks for that policy on existing hosts.
 $DefenderPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
 
-# Returns 'Done', 'Reboot' or 'Gate'.
+# One question: will a third-party EDR be installed? Yes removes the Defender feature
+# (two real-time scanners on VM disks hurt performance, and Defender doesn't go passive
+# on Server). No keeps Defender as the antivirus, with the Hyper-V exclusions.
+# Returns 'Done' or 'Reboot'.
 function Invoke-Edr {
     Write-Step 'Endpoint protection'
-    if ((Get-Answer 'EdrProduct') -eq 'Defender') {
-        Write-Host '  Recorded choice: Microsoft Defender is the antivirus on this host.' -ForegroundColor Green
+    $edr = Get-ArcEdr
+    $def = Get-ArcDefenderState
+    if ($edr) { Write-Host "  Detected: $($edr.Product) ($(if ($edr.Running) { 'running' } else { 'not all services running' }))" }
+    Write-Host "  Microsoft Defender: $def"
+
+    if ($def -eq 'Removed') {
+        Set-Answer 'EdrPlanned' $true
+        if ($edr) { Write-Host "  Defender is removed - $($edr.Product) is the antivirus." -ForegroundColor Green }
+        else { Write-Warning 'Defender is removed and no SentinelOne or Sophos agent is installed yet. The host has NO antivirus until the EDR is deployed - the Report flags it.' }
+        Save-PhaseComplete 'Edr'
+        return 'Done'
+    }
+
+    # Ask once, and again if an EDR has turned up while Defender is still installed.
+    $planned = Get-Answer 'EdrPlanned'
+    if ($null -eq $planned -or ($edr -and -not $planned)) {
+        Write-Host '  If a third-party EDR will protect this host, Microsoft Defender is removed now (reboot needed).' -ForegroundColor Yellow
+        if (-not $edr) { Write-Host '  No EDR agent is installed yet - the host has no antivirus from the reboot until the EDR is deployed.' -ForegroundColor Yellow }
+        $planned = Confirm-Action 'Will a third-party EDR (e.g. SentinelOne or Sophos) be installed on this host'
+        Set-Answer 'EdrPlanned' $planned
+    }
+
+    if (-not $planned) {
+        Write-Host '  Microsoft Defender stays as the antivirus.' -ForegroundColor Green
         Set-ArcDefenderHyperVExclusions
         Save-PhaseComplete 'Edr'
         return 'Done'
     }
 
-    $edr = Get-ArcEdr
-    if (-not $edr) {
-        Write-Warning 'Neither SentinelOne nor Sophos is installed. This script does not install them - deploy through Datto policy or the customer.'
-        $c = Read-Value '[W]ait - deploy it, then -Phase Next  /  [D]efender stays as the antivirus' 'W' { param($v) $v -match '^[WwDd]$' }
-        if ($c -match '^[Dd]$') {
-            Set-Answer 'EdrProduct' 'Defender'
-            Set-ArcDefenderHyperVExclusions
-            Save-PhaseComplete 'Edr'
-            return 'Done'
-        }
-        Stop-Next 'Deploy SentinelOne or Sophos to this host. Defender stays on meanwhile.'
-        return 'Gate'
-    }
-
-    Write-Host "  Detected: $($edr.Product)"
-    $edr.Services | Format-Table Name, DisplayName, Status, StartType -AutoSize | Out-String -Width 200 | Write-Host
-    if ($edr.Product -eq 'SentinelOne') {
-        $ctl = Get-ChildItem "$env:ProgramFiles\SentinelOne\Sentinel Agent*\SentinelCtl.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
-        if ($ctl) {
-            $ErrorActionPreference = 'Continue'   # SentinelCtl writes to stderr; must not throw
-            & $ctl.FullName status 2>&1 | ForEach-Object { "$_" } | Out-String | Write-Host
-            $ErrorActionPreference = 'Stop'
-        }
-    }
-    if (-not $edr.Running) { Stop-Next "$($edr.Product) services are not all running. Check the install (a reboot may be needed), then run Next again. Defender stays on meanwhile."; return 'Gate' }
-    Set-Answer 'EdrProduct' $edr.Product
-
-    if ((Get-Answer 'EdrConfirmed') -ne $edr.Product) {
-        Write-Host "  In the $($edr.Product) console, the host must show as connected, in the group/policy that carries the Hyper-V exclusions" -ForegroundColor Yellow
-        Write-Host '  (VM folders, *.vhdx/*.avhdx/*.vmcx/*.vmrs/*.vmgs, vmms.exe, vmwp.exe, vmcompute.exe).' -ForegroundColor Yellow
-        if (-not (Confirm-Action "Is $env:COMPUTERNAME connected in the $($edr.Product) console, in the right policy")) {
-            Stop-Next "Get the host connected in the $($edr.Product) console and into the policy with the Hyper-V exclusions. Defender stays on meanwhile."
-            return 'Gate'
-        }
-        Set-Answer 'EdrConfirmed' $edr.Product
-    }
-
-    Write-Step 'Microsoft Defender'
-    $def = Get-ArcDefenderState
-    Write-Host "  Defender: $def"
-    if ($def -in 'Removed', 'Off', 'Passive') {
-        Write-Host "  Defender is $($def.ToLower()) - $($edr.Product) is the only active antivirus." -ForegroundColor Green
-        Save-PhaseComplete 'Edr'
-        return 'Done'
-    }
-
-    $requested = (Get-State).PSObject.Properties['DefenderOffRequestedAt']
-    if ($requested -and $requested.Value -and (Get-CimInstance Win32_OperatingSystem).LastBootUpTime -gt [datetime]$requested.Value) {
-        # Policy set and the host has rebooted since, but Defender is still active.
-        Write-Warning 'Defender is still active after the policy and a reboot. Likely causes: tamper protection, a domain GPO setting it back, or the EDR re-enabling it.'
-        Write-Warning 'Fix the cause, or remove the feature by hand (Uninstall-WindowsFeature Windows-Defender) once you are sure the EDR is protecting the host. The Report flags it until then.'
-        Save-PhaseComplete 'Edr'
-        return 'Done'
-    }
-
-    try { if ((Get-MpComputerStatus -ErrorAction Stop).IsTamperProtected) { Write-Warning 'Defender tamper protection is on - it may ignore the policy. If so, turn tamper protection off first.' } } catch { }
-    # "Turn off Microsoft Defender Antivirus" policy. On a Server not onboarded to
-    # Defender for Endpoint this disables Defender (it does not go passive on its own).
-    if (-not (Confirm-Action "Turn Microsoft Defender off now (policy, applies at reboot) - $($edr.Product) becomes the only antivirus")) {
-        Stop-Next 'Defender left on. Run Next again when ready to turn it off.'
-        return 'Gate'
-    }
-    Set-RegistryValue $DefenderPolicy 'DisableAntiSpyware' 1
-    Set-RegistryValue "$DefenderPolicy\Real-Time Protection" 'DisableRealtimeMonitoring' 1
-    Set-StateValue 'DefenderOffRequestedAt' (Get-Date -Format 's')
-    Write-Host '  Defender off-policy set. After the reboot this phase checks it really is off.' -ForegroundColor Green
-    Request-RebootFlag
+    $r = Uninstall-WindowsFeature -Name Windows-Defender
+    if (-not $r.Success) { throw "Removing Microsoft Defender failed (exit code $($r.ExitCode))." }
+    Write-Host '  Microsoft Defender removed - completes at the reboot.' -ForegroundColor Green
+    Write-Host '  Put the host in the EDR policy that carries the Hyper-V exclusions (VM folders, *.vhdx/*.avhdx/*.vmcx/*.vmrs/*.vmgs, vmms.exe, vmwp.exe, vmcompute.exe).' -ForegroundColor Yellow
+    Save-PhaseComplete 'Edr' $true
     return 'Reboot'
 }
 
@@ -1276,16 +1241,18 @@ function Invoke-Report {
     # Security and protection
     $edr = Get-ArcEdr
     $def = Get-ArcDefenderState
-    $edrChoice = Get-Answer 'EdrProduct'
+    $planned = Get-Answer 'EdrPlanned'
     if ($edr) { if ($edr.Running) { Add-Result PASS 'EDR' "$($edr.Product) running" } else { Add-Result FAIL 'EDR' "$($edr.Product) installed but not all services running" } }
-    elseif ($edrChoice -eq 'Defender') { Add-Result INFO 'EDR' 'None - Microsoft Defender is the antivirus (engineer choice)' }
+    elseif ($planned -eq $false) { Add-Result INFO 'EDR' 'None - Microsoft Defender is the antivirus (no third-party EDR planned)' }
+    elseif ($planned) { Add-Result FAIL 'EDR' 'Planned but not installed yet - deploy SentinelOne or Sophos' }
     else { Add-Result FAIL 'EDR' 'Neither SentinelOne nor Sophos found' }
-    if ($edr -and $def -eq 'Active') { Add-Result WARN 'Microsoft Defender' "Still active alongside $($edr.Product) - two real-time scanners (see the Edr phase)" }
+    if ($edr -and $def -eq 'Active') { Add-Result WARN 'Microsoft Defender' "Still active alongside $($edr.Product) - two real-time scanners. Run -Phase Edr to remove it." }
     elseif (-not $edr -and $def -ne 'Active') { Add-Result FAIL 'Microsoft Defender' "$def, and no EDR found - the host has no active antivirus" }
     else { Add-Result PASS 'Microsoft Defender' $def }
-    # The off-policy outlives the EDR. Name it, so whoever removes the EDR also removes it.
+    if ($def -eq 'Removed') { Add-Result INFO 'Defender removed' 'If the EDR is ever uninstalled, put Defender back first: Install-WindowsFeature Windows-Defender, then reboot.' }
+    # Older builds (or someone by hand) may have turned Defender off by policy instead.
     if ((Get-ItemProperty $DefenderPolicy -Name DisableAntiSpyware -ErrorAction SilentlyContinue).DisableAntiSpyware -eq 1) {
-        Add-Result INFO 'Defender off-policy' "DisableAntiSpyware and Real-Time Protection\DisableRealtimeMonitoring = 1 under $($DefenderPolicy -replace '^HKLM:', 'HKLM'). If the EDR is ever removed, delete both values and run Start-Service WinDefend (a reboot alone does not restart it), or the host has no antivirus."
+        Add-Result INFO 'Defender off-policy' "DisableAntiSpyware = 1 under $($DefenderPolicy -replace '^HKLM:', 'HKLM') (and possibly Real-Time Protection\DisableRealtimeMonitoring). If the EDR is ever removed, delete the values and run Start-Service WinDefend (a reboot alone does not restart it), or the host has no antivirus."
     }
     if (Get-Service CagService -ErrorAction SilentlyContinue) { Add-Result PASS 'Datto RMM agent' "$((Get-Service CagService).Status)" } else { Add-Result FAIL 'Datto RMM agent' 'Not installed' }
     $builtin = Get-ArcBuiltinAdmin
@@ -1300,7 +1267,7 @@ function Invoke-Report {
         else { Add-Result WARN 'Remote UAC (workgroup)' 'On - Veeam admin-share/WMI access and remote Hyper-V Manager with the local admin account will be refused. Run -Phase Identity.' }
     }
     $secRows = [ordered]@{
-        'EDR'                    = $(if ($edr) { $edr.Product } elseif ($edrChoice) { $edrChoice } else { 'None' })
+        'EDR'                    = $(if ($edr) { $edr.Product } elseif ($planned -eq $false) { 'None (Microsoft Defender)' } elseif ($planned) { 'Planned, not installed yet' } else { 'None' })
         'Microsoft Defender'     = $def
         'Datto RMM agent'        = $(if (Get-Service CagService -ErrorAction SilentlyContinue) { 'Installed' } else { 'Not installed' })
         'Local admin account'    = $(if ($adminName) { $adminName } else { 'Not recorded' })
@@ -1406,7 +1373,7 @@ try {
         'Next'         { Invoke-Next }
         'Network'      { if (-not (Invoke-Network)) { Write-Host 'Host network not built.' -ForegroundColor Yellow } }
         'Identity'     { if ((Invoke-Identity) -eq 'Reboot') { Write-Host "`nREBOOT REQUIRED." -ForegroundColor Yellow } }
-        'Edr'          { if ((Invoke-Edr) -eq 'Reboot') { Write-Host "`nREBOOT REQUIRED, then run -Phase Edr again to check Defender is off." -ForegroundColor Yellow } }
+        'Edr'          { if ((Invoke-Edr) -eq 'Reboot') { Write-Host "`nREBOOT REQUIRED to finish removing Defender." -ForegroundColor Yellow } }
         'Admin'        { $null = Invoke-Admin }
         'Baseline'     { $null = Invoke-Baseline; if ((Get-State).RebootPending) { Write-Host "`nREBOOT REQUIRED for some items." -ForegroundColor Yellow } }
         'HostSettings' { Invoke-HostSettings }

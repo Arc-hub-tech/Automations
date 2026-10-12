@@ -5,7 +5,7 @@ Two scripts build a **standalone HPE ProLiant Hyper-V host** for a customer site
 | Script | Where | What |
 |---|---|---|
 | `ArcHyperVHost-Workshop.ps1` | At Arc, before the host ships | HPE firmware and iLO, host name, Hyper-V, VM volume, Datto RMM, Windows Update, **SET switch on the workshop DHCP**, **security baseline**, then ships |
-| `ArcHyperVHost-Site.ps1` | On site, and on existing customer hosts | Customer static address (or the full network, if there's no switch), domain or workgroup, EDR check and Defender, new local admin, security baseline, VM start/stop, HTML as-built report |
+| `ArcHyperVHost-Site.ps1` | On site, and on existing customer hosts | Customer static address (or the full network, if there's no switch), domain or workgroup, EDR question (removes Defender if one is planned), new local admin, security baseline, VM start/stop, HTML as-built report |
 
 Both are run by an engineer, interactively. They are not Datto components. There is **no config file**: everything is prompted. Answers that are not secret (host name, Datto site, IPs, VM volume) are kept in `C:\ArcLogs\HyperVHost\state.json` on the host, so a re-run and the Site script don't ask again. Passwords are never stored or logged.
 
@@ -80,7 +80,7 @@ Run it on the iLO remote console or a local console, with internet access.
 |---|---|
 | `Network` | **Workshop-built host:** sets the customer **VLAN and static IP** (DHCP is offered too) on the `Management` vNIC that the workshop left on DHCP. **No switch yet:** builds the SET switch, then asks for the address. Needs the console (or the iLO remote console); over RDP you must type `REMOTE`. **An existing switch is never rebuilt, and an address the workshop didn't leave on DHCP is never moved**, so existing customer hosts are only verified. |
 | `Identity` | **Domain:** checks the DC SRV records, then joins (with an optional OU, and a credential prompt). **Workgroup:** asks before changing the workgroup name (the default is the current one), the NTP servers, the Private network profile on the management vNIC and WinRM. It also turns remote UAC off for local accounts (see below). |
-| `Edr` | **Detects** SentinelOne or Sophos; it never installs them. If neither is there, you choose to wait, or record Defender as the antivirus. Once the services run and you confirm the host is connected in the console, in the policy with the Hyper-V exclusions, it **turns Defender off by policy** and reboots. After the reboot it **checks Defender really is off**. |
+| `Edr` | Asks one question: **will a third-party EDR (SentinelOne, Sophos) be installed?** Yes **removes Microsoft Defender** (feature uninstall, reboot). No keeps Defender as the antivirus, with the Hyper-V exclusions. It never installs the EDR. If an EDR turns up later while Defender is still installed, it asks again. |
 | `Admin` | Creates a **new local admin** (name and password prompted, password typed twice), checks the password works, then **disables the built-in Administrator** (RID 500). If you're logged on as the built-in account, it stops and resumes when you log on as the new one. |
 | `Baseline` | Re-checks the standard on site (the same code as the workshop) and applies anything that differs, after showing the plan. On an existing host, this is where the standard is first applied. |
 | `HostSettings` | On every VM: automatic stop = **Shut Down**, automatic start = start if it was running, with **one start delay** (prompted, default 120 s). Hyper-V has no host-wide default for these, so re-run it after creating VMs. |
@@ -90,20 +90,12 @@ Run it on the iLO remote console or a local console, with internet access.
 
 ### Defender on Windows Server
 
-Defender **doesn't go passive by itself** on Windows Server when SentinelOne or Sophos is installed. Passive mode is only for hosts onboarded to Defender for Endpoint. The Edr phase therefore:
+Defender **doesn't go passive by itself** on Windows Server when SentinelOne or Sophos is installed. Passive mode is only for hosts onboarded to Defender for Endpoint, and two real-time scanners on VM disks hurt performance. So when an EDR is planned, the Edr phase **removes the Defender feature** (`Uninstall-WindowsFeature Windows-Defender`, then a reboot).
 
-1. Leaves Defender on until the EDR is confirmed connected, so the host is never unprotected, including while it's being shipped.
-2. Sets the "Turn off Microsoft Defender Antivirus" policy (`DisableAntiSpyware`, plus real-time monitoring off), then reboots.
-3. After the reboot, reads `Get-MpComputerStatus`. If Defender is still active (tamper protection, a domain GPO, or the EDR re-enabling it), it says so and the Report flags it. It doesn't remove the feature by itself.
-
-If the Sophos installer has already removed the Defender feature, the phase sees that and moves on.
-
-**The off-policy outlives the EDR.** If the customer later removes SentinelOne or Sophos (at contract end, say), Defender stays off and the host has **no antivirus**. To turn Defender back on, delete both values, then run `Start-Service WinDefend`. A reboot alone doesn't bring it back: the policy leaves the service set to Manual, and starting it once sets it back to Automatic (checked on WS2025).
-
-- `DisableAntiSpyware` under `HKLM\SOFTWARE\Policies\Microsoft\Windows Defender`
-- `DisableRealtimeMonitoring` under `...\Windows Defender\Real-Time Protection`
-
-The as-built report names both values, so this is on record in ITGlue.
+- **Removal leaves no antivirus until the EDR is installed.** The phase warns when no agent is there yet. Deploy the EDR straight after, through Datto policy or the customer. The Report FAILs a host with neither.
+- If the Sophos installer has already removed Defender, the phase sees that and moves on.
+- **If the EDR is ever uninstalled** (at contract end, say), put Defender back first: `Install-WindowsFeature Windows-Defender`, then reboot. The as-built report says so, so this is on record in ITGlue.
+- The Report still flags the older "Turn off Microsoft Defender Antivirus" policy (`DisableAntiSpyware`) if it finds it on an existing host. To undo that policy, delete its values and run `Start-Service WinDefend`; a reboot alone doesn't bring Defender back (checked on WS2025).
 
 ### Workgroup hosts and remote UAC
 

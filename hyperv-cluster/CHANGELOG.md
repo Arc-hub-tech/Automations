@@ -4,7 +4,12 @@ All notable changes to `ArcHyperVCluster.ps1` (originally `Add-ArcHyperVClusterN
 
 ## [Unreleased]
 
-_Work in progress on the `develop` branch. `$ScriptVersion` is `0.4.0-dev`; the download one-liner points at `/develop/`._
+_Work in progress on the `develop` branch. `$ScriptVersion` is `0.4.1-dev`; the download one-liner points at `/develop/`._
+
+### Fixed (0.4.1-dev, lessons from the standalone script's lab run)
+The standalone Hyper-V scripts' baseline was lifted from this one, and a lab run on WS2025 found two bugs that are also here:
+- **The management firewall rules were only opened when Baseline turned a firewall profile on.** A fresh install already has the firewall on, so the rule groups were never opened: Remote Desktop, file sharing and WMI stayed blocked. The rule groups (Failover Clusters, Hyper-V, WinRM, file sharing, WMI, Remote Desktop) are now a baseline item of their own (`Sec.FirewallRules`). The fingerprint check stays self-contained, because it also runs on peer nodes over WinRM; the group list is passed in as a parameter.
+- **VMQ on a NIC that doesn't support it was planned as drift, and "enabling" it reported OK.** It's now "Not supported", and an enable failure is raised.
 
 ### Changed
 - **SCVMM owns host networking, cluster join and workloads (0.4.0-dev).** The script now stops at "VMM-ready" for a new node and checks what SCVMM builds.

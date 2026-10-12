@@ -503,7 +503,7 @@ These match the Arc gold-image security baseline, with one addition for Hyper-V 
 |---|---|
 | SMB version 1 | Off and removed |
 | SMB signing | Required, server and client |
-| Windows Firewall | On for all profiles. The cluster, Hyper-V, WinRM, file sharing, WMI and Remote Desktop rules are enabled first so cluster traffic is not interrupted |
+| Windows Firewall | On for all profiles, with the cluster, Hyper-V, WinRM, file sharing, WMI and Remote Desktop rules enabled so cluster traffic is not interrupted. The rules are checked even when the firewall is already on, which it is on a fresh install |
 | SSL 3.0, TLS 1.0, TLS 1.1 | Off, server and client. Restart needed |
 | NTLM | NTLMv2 only; WDigest plaintext credentials off |
 | LLMNR, AutoRun, AutoPlay | Off |

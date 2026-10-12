@@ -110,7 +110,7 @@ param(
 
 # Version of this script, surfaced in the banner/transcript. Independent of the
 # gold-image version; '-dev' suffix while work accumulates under [Unreleased].
-$ScriptVersion = '0.4.0-dev'
+$ScriptVersion = '0.4.1-dev'
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
@@ -390,7 +390,7 @@ $OptTasks = @(
 # ---------------------------------------------------------------------------
 
 $FingerprintBlock = {
-    param($RegItems, $TaskList)
+    param($RegItems, $TaskList, $FwGroups)
     $ErrorActionPreference = 'Stop'
     $c = @{}
     $d = @{}
@@ -416,6 +416,16 @@ $FingerprintBlock = {
         }
     } catch { }
     try { foreach ($p in Get-NetFirewallProfile) { $c["Sec.Firewall.$($p.Name)"] = "$($p.Enabled)" } } catch { }
+    # A fresh install already has the firewall on, so the management rule groups are checked on their own.
+    # Self-contained: this block also runs on peer nodes over WinRM.
+    if ($FwGroups) {
+        $closed = @()
+        foreach ($g in @($FwGroups)) {
+            try { $r = if ($g -like '@*') { @(Get-NetFirewallRule -Group $g -ErrorAction SilentlyContinue) } else { @(Get-NetFirewallRule -DisplayGroup $g -ErrorAction SilentlyContinue) } } catch { $r = @() }
+            if ($r -and -not @($r | Where-Object Enabled -eq 'True')) { $closed += $r[0].DisplayGroup }
+        }
+        $c['Sec.FirewallRules'] = if ($closed) { "Off: $($closed -join '; ')" } else { 'All enabled' }
+    }
     try {
         $na = (net accounts) | Out-String
         if ($na -match 'Lockout threshold:\s+(\S+)') { $c['Sec.LockoutThreshold'] = if ($Matches[1] -eq 'Never') { '0' } else { $Matches[1] } }
@@ -538,8 +548,10 @@ $FingerprintBlock = {
                 } catch { }
                 $pmOn = @($members | Where-Object { (Get-NetAdapterPowerManagement -Name $_.Name -ErrorAction SilentlyContinue).AllowComputerToTurnOffDevice -eq 'Enabled' })
                 $c['Opt.NicPowerManagement'] = if ($pmOn) { "Enabled on $($pmOn.Name -join ', ')" } else { 'Disabled' }
-                $vmqOff = @($members | Where-Object { -not (Get-NetAdapterVmq -Name $_.Name -ErrorAction SilentlyContinue).Enabled })
-                $c['Opt.VMQ'] = if ($vmqOff) { "Disabled on $($vmqOff.Name -join ', ')" } else { 'Enabled' }
+                # A NIC with no VMQ settings doesn't support it - not drift.
+                $vmq = @($members | ForEach-Object { Get-NetAdapterVmq -Name $_.Name -ErrorAction SilentlyContinue })
+                $vmqOff = @($vmq | Where-Object { -not $_.Enabled })
+                $c['Opt.VMQ'] = if (-not $vmq) { 'Not supported' } elseif ($vmqOff) { "Disabled on $($vmqOff.Name -join ', ')" } else { 'Enabled' }
             } catch { }
         }
         foreach ($v in Get-VMNetworkAdapter -ManagementOS) {
@@ -619,14 +631,14 @@ $FingerprintBlock = {
     @{ ComputerName = $env:COMPUTERNAME; Compare = $c; Detail = $d }
 }
 
-function Get-LocalFingerprint { & $FingerprintBlock $RegCatalogue $OptTasks }
+function Get-LocalFingerprint { & $FingerprintBlock $RegCatalogue $OptTasks $FirewallGroups }
 
 # Fingerprint any node over WinRM (the peer, or every node during Capture).
 function Get-RemoteFingerprint {
     param([Parameter(Mandatory)][string]$ComputerName)
     $p = @{ ComputerName = $ComputerName }
     if ($PeerCredential) { $p.Credential = $PeerCredential }
-    try { return Invoke-Command @p -ScriptBlock $FingerprintBlock -ArgumentList $RegCatalogue, $OptTasks }
+    try { return Invoke-Command @p -ScriptBlock $FingerprintBlock -ArgumentList $RegCatalogue, $OptTasks, $FirewallGroups }
     catch { throw "Could not read $ComputerName over WinRM: $($_.Exception.Message)" }
 }
 
@@ -1445,6 +1457,7 @@ function Get-BaselinePlan {
         foreach ($p in 'Domain', 'Private', 'Public') {
             if ($c["Sec.Firewall.$p"] -eq 'False') { $items.Add((New-PlanItem 'Security' "Sec.Firewall.$p" "Firewall on ($p) - cluster/Hyper-V/WinRM/SMB/RDP rules enabled first" 'False' 'True' $false 'Firewall' @{ Profile = $p })) }
         }
+        if ($c['Sec.FirewallRules'] -and $c['Sec.FirewallRules'] -ne 'All enabled') { $items.Add((New-PlanItem 'Security' 'Sec.FirewallRules' 'Firewall rules for management (cluster, Hyper-V, WinRM, SMB, WMI, Remote Desktop) enabled' $c['Sec.FirewallRules'] 'All enabled' $false 'FirewallRules')) }
         # Lockout threshold is a maximum too: a lower non-zero value (locks out sooner) is stricter.
         $lt = "$($c['Sec.LockoutThreshold'])"
         $ltOk = $lt -match '^\d+$' -and [int]$lt -gt 0 -and $null -ne $sec.LockoutThreshold -and [int]$lt -le [int]$sec.LockoutThreshold
@@ -1470,7 +1483,7 @@ function Get-BaselinePlan {
         if ($c['Opt.LastAccess'] -ne 'Disabled') { $items.Add((New-PlanItem 'Optimisation' 'Opt.LastAccess' 'NTFS last-access updates off' $c['Opt.LastAccess'] 'Disabled' $true 'LastAccess')) }
         if ($c['Opt.TelemetryTasks'] -and $c['Opt.TelemetryTasks'] -ne 'All disabled') { $items.Add((New-PlanItem 'Optimisation' 'Opt.TelemetryTasks' 'Telemetry/CEIP/Maps/WER tasks off (defrag/retrim left on)' $c['Opt.TelemetryTasks'] 'All disabled' $false 'Tasks')) }
         if ($c['Opt.NicPowerManagement'] -and $c['Opt.NicPowerManagement'] -ne 'Disabled') { $items.Add((New-PlanItem 'Optimisation' 'Opt.NicPowerManagement' 'NIC power management off (SET members)' $c['Opt.NicPowerManagement'] 'Disabled' $false 'NicPower')) }
-        if ($c['Opt.VMQ'] -and $c['Opt.VMQ'] -ne 'Enabled') { $items.Add((New-PlanItem 'Optimisation' 'Opt.VMQ' 'VMQ on (SET members; adapter restarts)' $c['Opt.VMQ'] 'Enabled' $false 'Vmq')) }
+        if ($c['Opt.VMQ'] -and $c['Opt.VMQ'] -notin 'Enabled', 'Not supported') { $items.Add((New-PlanItem 'Optimisation' 'Opt.VMQ' 'VMQ on (SET members; adapter restarts)' $c['Opt.VMQ'] 'Enabled' $false 'Vmq')) }
     }
 
     # HPE BIOS workload profile (needs ilorest to read)
@@ -1525,6 +1538,20 @@ function Get-BaselinePlan {
 # only where the group exists on this host.
 $FirewallGroups = @('Failover Clusters', 'Hyper-V', 'Windows Remote Management', 'File and Printer Sharing', 'Windows Management Instrumentation (WMI)', '@FirewallAPI.dll,-28752')
 
+# '@'-prefixed entries are resource-string group names (language independent).
+function Get-ArcFirewallGroupRules {
+    param([string]$Group)
+    if ($Group -like '@*') { return @(Get-NetFirewallRule -Group $Group -ErrorAction SilentlyContinue) }
+    return @(Get-NetFirewallRule -DisplayGroup $Group -ErrorAction SilentlyContinue)
+}
+
+function Enable-ArcFirewallGroups {
+    foreach ($g in $FirewallGroups) {
+        $rules = @(Get-ArcFirewallGroupRules $g)
+        if ($rules) { $rules | Enable-NetFirewallRule; Write-Host "    firewall rules enabled: $($rules[0].DisplayGroup)" }
+    }
+}
+
 function Invoke-PlanItem {
     param([Parameter(Mandatory)]$Item)
     $a = $Item.Arguments
@@ -1534,13 +1561,8 @@ function Invoke-PlanItem {
         'RemoveFeature'    { Uninstall-WindowsFeature -Name $a.Name | Out-Null }
         'SmbServerSigning' { Set-SmbServerConfiguration -RequireSecuritySignature $true -Force }
         'SmbClientSigning' { Set-SmbClientConfiguration -RequireSecuritySignature $true -Force }
-        'Firewall' {
-            foreach ($g in $FirewallGroups) {
-                $rules = if ($g -like '@*') { Get-NetFirewallRule -Group $g -ErrorAction SilentlyContinue } else { Get-NetFirewallRule -DisplayGroup $g -ErrorAction SilentlyContinue }
-                if ($rules) { $rules | Enable-NetFirewallRule; Write-Host "    firewall rules enabled: $g" }
-            }
-            Set-NetFirewallProfile -Profile $a.Profile -Enabled True
-        }
+        'Firewall'         { Enable-ArcFirewallGroups; Set-NetFirewallProfile -Profile $a.Profile -Enabled True }
+        'FirewallRules'    { Enable-ArcFirewallGroups }
         'Lockout'          { net accounts /lockoutthreshold:$($a.Threshold) /lockoutduration:15 /lockoutwindow:15 | Out-Null }
         'GuestDisable'     { Disable-LocalUser -Name Guest }
         'SpoolerDisable'   { Stop-Service Spooler -Force -ErrorAction SilentlyContinue; Set-Service Spooler -StartupType Disabled }
@@ -1566,7 +1588,7 @@ function Invoke-PlanItem {
             foreach ($n in Get-ArcSwitchMembers) { Disable-NetAdapterPowerManagement -Name $n.Name -NoRestart -ErrorAction SilentlyContinue }
         }
         'Vmq' {
-            foreach ($n in Get-ArcSwitchMembers) { if (-not (Get-NetAdapterVmq -Name $n.Name).Enabled) { Enable-NetAdapterVmq -Name $n.Name } }
+            foreach ($n in Get-ArcSwitchMembers) { $q = Get-NetAdapterVmq -Name $n.Name -ErrorAction SilentlyContinue; if ($q -and -not $q.Enabled) { Enable-NetAdapterVmq -Name $n.Name -ErrorAction Stop } }
         }
         'WorkloadProfile'  { Set-ArcWorkloadProfile -Target $a.Target | Out-Null }
         'MpioClaim'        { New-MSDSMSupportedHW -VendorId $a.VendorId -ProductId $a.ProductId | Out-Null }

@@ -6,8 +6,9 @@ Two scripts build a **standalone HPE ProLiant Hyper-V host** for a customer site
 |---|---|---|
 | `ArcHyperVHost-Workshop.ps1` | At Arc, before the host ships | HPE firmware and iLO, host name, Hyper-V, VM volume, Datto RMM, Windows Update, **SET switch on the workshop DHCP**, **security baseline**, then ships |
 | `ArcHyperVHost-Site.ps1` | On site, and on existing customer hosts | Customer static address (or the full network, if there's no switch), domain or workgroup, EDR question (removes Defender if one is planned), new local admin, security baseline, VM start/stop, HTML as-built report |
+| `ArcHyperVHost-Lite.ps1` | On a live host that is already built | **Security and Hyper-V optimisation standard only**: a read-only Check, then an Apply that asks separately before anything that could interrupt service. No network, identity, EDR or account changes, and **never reboots** |
 
-Both are run by an engineer, interactively. They are not Datto components. There is **no config file**: everything is prompted. Answers that are not secret (host name, Datto site, IPs, VM volume) are kept in `C:\ArcLogs\HyperVHost\state.json` on the host, so a re-run and the Site script don't ask again. Passwords are never stored or logged.
+All three are run by an engineer, interactively. They are not Datto components. There is **no config file**: everything is prompted. Answers that are not secret (host name, Datto site, IPs, VM volume) are kept in `C:\ArcLogs\HyperVHost\state.json` on the host, so a re-run and the Site script don't ask again. Passwords are never stored or logged.
 
 Unlike `hyperv-cluster/`, there's no SCVMM and no peer node. The scripts build the host networking themselves. **The workshop network is DHCP:** the host builds its SET switch there, keeps internet access on a DHCP address, and ships that way. The Site script then sets the customer static address. **Hosts ship with the standard in place:** the Workshop script applies the baseline before shipping, and the Site script re-checks it on site (a domain GPO can change things after the join).
 
@@ -21,6 +22,10 @@ $p="$env:SystemDrive\ArcLogs\HyperVHost\ArcHyperVHost-Workshop.ps1"; md (Split-P
 
 ```powershell
 $p="$env:SystemDrive\ArcLogs\HyperVHost\ArcHyperVHost-Site.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-standalone/ArcHyperVHost-Site.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Next
+```
+
+```powershell
+$p="$env:SystemDrive\ArcLogs\HyperVHost\ArcHyperVHost-Lite.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-standalone/ArcHyperVHost-Lite.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Check
 ```
 
 **The pen drive (recommended):** one stick carries both scripts and the HPE media for every ProLiant generation. Format it **NTFS or exFAT**, because SPP ISOs are bigger than FAT32's 4 GB limit.
@@ -86,7 +91,7 @@ Run it on the iLO remote console or a local console, with internet access.
 | `HostSettings` | On every VM: automatic stop = **Shut Down**, automatic start = start if it was running, with **one start delay** (prompted, default 120 s). Hyper-V has no host-wide default for these, so re-run it after creating VMs. |
 | `Report` | Runs the checks, then writes `C:\ArcLogs\HyperVHost\AsBuilt-<host>-<time>.html` for the engineer to **attach to the host's Configuration in ITGlue**. |
 
-**On an existing customer host,** run the Site script only. It shows each plan and asks before changing anything. It never rebuilds a switch or moves an IP, and it warns before any reboot that running VMs will be stopped.
+**On an existing customer host,** run the Site script only. It shows each plan and asks before changing anything. It never rebuilds a switch or moves an IP, and it warns before any reboot that running VMs will be stopped. If the host only needs the security and Hyper-V standard, with no identity, EDR or account work and no reboots, use the [Lite script](#lite-archypervhost-liteps1) instead.
 
 ### Defender on Windows Server
 
@@ -126,9 +131,41 @@ The Baseline is the cluster standard without the cluster, FC/MPIO and NUMA items
 
 The HTML is self-contained, so it opens offline. It's **deliberately unbranded**: this repo is public, so no logo or brand assets live in it.
 
+## Lite: `ArcHyperVHost-Lite.ps1`
+
+For a host that is **already built and in service** (Hyper-V role in, SPP done, network and VMs running) that only needs the security and Hyper-V optimisation standard. It applies the same standard as `Baseline`, from the same shared code, and adds Defender's Hyper-V exclusions and the VM start/stop settings. It never touches the network, domain membership, EDR or accounts, and **it never reboots**. It stops on a failover cluster node (use `hyperv-cluster/`, whose Baseline drains the node first) and on a host without the Hyper-V role.
+
+| Phase | What it does |
+|---|---|
+| `Check` (default) | Read-only. Shows what Apply would change, runs the live-host checks and writes `Lite-Check-<host>-<time>.html` to attach to the change request. |
+| `Apply` | Shows the same plan and asks **every question before changing anything**: once for the live-safe items (**Now**), once for the items that take effect at the next reboot (**At reboot**), then **separately for each change that could interrupt service**, with the risk stated. Then the VM start/stop changes. It applies VMQ last, lists anything declined or still different (a domain GPO wins), writes `Lite-Apply-<host>-<time>.html`, and says if a reboot is needed. |
+
+The changes that are asked for separately:
+
+| Change | Risk on a live host |
+|---|---|
+| Firewall profile on | Inbound traffic outside the Hyper-V, WinRM, file sharing, WMI and RDP rules is blocked: Veeam data movers, UPS agent, SNMP, monitoring |
+| NTLMv2 only | Devices that authenticate with LM or NTLMv1 are refused |
+| SSL 3.0, TLS 1.0 and 1.1 off | Software that only speaks the old protocols stops connecting (from the next reboot) |
+| SMB signing required | SMB connections that can't sign are refused, in both directions; check older NAS backup repositories |
+| SMBv1 and PowerShell 2.0 removed | Anything still using them stops working (finishes at the reboot) |
+| BIOS workload profile | Power and processor settings change at the next reboot (only checked when ilorest is installed) |
+| VMQ on | The switch NICs restart: VMs and RDP lose network for a few seconds. Applied last; use the iLO remote console |
+
+**VM start and stop on a live host:** only VMs that differ are changed. An automatic start action of `Nothing` becomes `StartIfRunning`. A start delay the customer already set (a staggered DC-first order, for example) is kept; only VMs with no delay get the default (prompted, 120 s). A running VM's stop action can't be changed, so it's reported to set at its next shutdown.
+
+**Checks** are the Site Report's, minus the build-only ones (local admin "created by these scripts", workshop DHCP). Datto is a WARN rather than a FAIL. They add the following for live hosts:
+- Checkpoints older than 7 days.
+- VMs running on differencing disks (`.avhdx`) with no checkpoint, which usually means a backup merge failed.
+- VM files on the system drive.
+- An LBFO team or a single NIC under the switch.
+- Windows updates more than 45 days old.
+- A reboot these scripts asked for that hasn't happened yet.
+
 ## Maintenance
 
-- **Shared helpers are duplicated on purpose.** The block between `start of shared helpers` and `end of shared helpers` is identical in both scripts, so each file stays self-contained for `irm` and USB use. It includes the network build and the whole baseline. Change it in both.
-- **Versioning:** both scripts share one version (`$ScriptVersion`) and one [CHANGELOG](CHANGELOG.md). They follow the repo's `develop` / `main` workflow: the one-liners point at `/develop/` and the version carries `-dev` until release.
+- **Shared helpers are duplicated on purpose.** The block between `start of shared helpers` and `end of shared helpers` is identical in all three scripts, so each file stays self-contained for `irm` and USB use. It includes the network build and the whole baseline. Change it in all three.
+- **Report helpers too.** The block between `start of report helpers` and `end of report helpers` (EDR/Defender detection, the VSS writer list, the HTML builder) is identical in `ArcHyperVHost-Site.ps1` and `ArcHyperVHost-Lite.ps1`. Change it in both.
+- **Versioning:** all three scripts share one version (`$ScriptVersion`) and one [CHANGELOG](CHANGELOG.md). They follow the repo's `develop` / `main` workflow: the one-liners point at `/develop/` and the version carries `-dev` until release.
 - **Logs:** a transcript per run, the check CSVs and the as-built HTML go to `C:\ArcLogs\HyperVHost\`.
 - **Engineer guide:** [docs/ArcHyperVHost-Confluence-Guide.md](docs/ArcHyperVHost-Confluence-Guide.md) is the source of the Confluence page "Standalone Hyper-V host build" in the Data Center space. Keep the two in step.

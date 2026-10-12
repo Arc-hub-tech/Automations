@@ -2,17 +2,19 @@
 
 > **What this guide covers**
 >
-> Two scripts build a standalone HPE ProLiant Hyper-V host for a customer site, and bring an existing customer host up to the same Arc standard.
+> Two scripts build a standalone HPE ProLiant Hyper-V host for a customer site, and bring an existing customer host up to the same Arc standard. A third, lite script applies only the security and Hyper-V standard to a host that is already in service.
 >
 > → **Workshop script** (`ArcHyperVHost-Workshop.ps1`): runs at Arc before the host ships. It covers firmware, iLO, Hyper-V, the VM disk, Datto, Windows Update, the network switch and the security baseline.
 >
 > → **Site script** (`ArcHyperVHost-Site.ps1`): runs on site. It covers the customer IP address, domain or workgroup, endpoint protection, the local admin account and VM start/stop, then produces the as-built report for ITGlue.
 >
+> → **Lite script** (`ArcHyperVHost-Lite.ps1`): for a live host that is already built. It applies only the security and Hyper-V optimisation standard, asks separately before anything that could interrupt service, and never reboots. See Process 4.
+>
 > → **One command, every time:** an engineer runs `-Phase Next` repeatedly. The script works out what comes next, stops whenever a person is needed, and asks before every reboot.
 >
 > → **Ships with the standard in place:** the security baseline is applied in the workshop and checked again on site.
 
-> **Status:** pilot, version 0.1.2-dev on the develop branch. Both scripts have run end to end on a Windows Server 2025 lab VM (everything except the HPE, iLO and Datto steps), but not yet on HPE hardware. These need confirming on the first real builds:
+> **Status:** pilot, version 0.2.0-dev on the develop branch. The Workshop and Site scripts have run end to end on a Windows Server 2025 lab VM (everything except the HPE, iLO and Datto steps), and the Lite script's Check and Apply on the same VM, but none of them on HPE hardware yet. These need confirming on the first real builds:
 >
 > → the SPP, iLO steps (password, IP, DNS, host name, protocols) and the Datto agent install;
 >
@@ -46,8 +48,9 @@ For hosts in the Arc platform clusters, use the Hyper-V cluster standard guide i
 | Workshop | At Arc, on the workshop network (DHCP, with internet) | `ArcHyperVHost-Workshop.ps1` | Firmware (SPP), iLO password, host name, Hyper-V, VM disk, Datto, Windows Update, SET switch on DHCP, security baseline, then shut down |
 | Site | At the customer, on their network | `ArcHyperVHost-Site.ps1` | Customer IP address, domain or workgroup, endpoint protection, local admin account, baseline re-check, VM start/stop, as-built report |
 | Existing host | At the customer | `ArcHyperVHost-Site.ps1` only | Brings a running customer host up to the standard, showing each change and asking first |
+| Existing host, standard only | On a live host | `ArcHyperVHost-Lite.ps1` | Security and Hyper-V optimisation standard only: no network, identity, EDR or account changes, and no reboots |
 
-The two scripts share a state file on the host (`C:\ArcLogs\HyperVHost\state.json`). Answers given in the workshop, such as the host name and Datto site, are not asked again on site. Passwords are never stored.
+The scripts share a state file on the host (`C:\ArcLogs\HyperVHost\state.json`). Answers given in the workshop, such as the host name and Datto site, are not asked again on site. Passwords are never stored.
 
 ## Before you start
 
@@ -197,6 +200,32 @@ Run only the Site script, with `-Phase Next`, in a maintenance window.
 
 → **Local admin:** if a suitable local admin account already exists, you can choose to use it. Its password is not changed.
 
+## Process 4: lite standardisation of a live host
+
+Use `ArcHyperVHost-Lite.ps1` when a host is already built and in service, and it only needs the security and Hyper-V optimisation standard. It uses the same standard as the Baseline phase, and the same code. It never touches the network, domain membership, endpoint protection or accounts, and **it never reboots**. It stops on a failover cluster node; use the Hyper-V cluster standard for those.
+
+1. **Check** (read-only): `-Phase Check` shows what Apply would change and runs the live-host checks, then writes `Lite-Check-<host>-<time>.html`. Attach that to the change request.
+2. **Apply**, once the change is approved: `-Phase Apply` shows the plan again and asks every question before it changes anything:
+   - once for the live-safe changes (marked **Now**);
+   - once for the changes that only take effect at the next reboot (marked **At reboot**);
+   - **separately for each change that could interrupt service**, with the risk stated:
+
+| Change | Risk on a live host |
+|---|---|
+| Firewall profile on | Inbound traffic outside the Hyper-V, WinRM, file sharing, WMI and RDP rules is blocked (Veeam data movers, UPS agent, SNMP, monitoring) |
+| NTLMv2 only | Devices that authenticate with LM or NTLMv1 are refused |
+| SSL 3.0, TLS 1.0 and 1.1 off | Software that only speaks the old protocols stops connecting, from the next reboot |
+| SMB signing required | SMB connections that can't sign are refused, including older NAS backup repositories |
+| SMBv1 and PowerShell 2.0 removed | Anything still using them stops working |
+| BIOS workload profile | Power and processor settings change at the next reboot |
+| VMQ on | The switch NICs restart, so VMs and RDP lose network for a few seconds. It is applied last; use the iLO remote console |
+
+→ **VM start and stop:** only VMs that differ are changed. A start delay the customer has already set (a staggered start order, for example) is kept; only VMs with no delay get the default. A running VM's stop action can't be changed, so it's reported to set at the VM's next shutdown.
+
+→ **Afterwards** it writes `Lite-Apply-<host>-<time>.html`, lists anything declined or still different (a domain GPO wins over local settings), and says if a reboot is needed. Plan the reboot in a maintenance window.
+
+→ **What it adds to the checks:** old checkpoints (older than 7 days), VMs running on differencing disks with no checkpoint (usually a failed backup merge), VM files on the system drive, an LBFO team or single NIC under the switch, and Windows updates more than 45 days old.
+
 ## Endpoint protection and Defender
 
 On Windows Server, Defender **does not switch itself to passive mode** when SentinelOne or Sophos is installed. That only happens on hosts onboarded to Defender for Endpoint. Two antivirus products scanning VM disks at once hurts performance.
@@ -324,9 +353,10 @@ It contains:
 | File | What it is |
 |---|---|
 | `C:\ArcLogs\HyperVHost\state.json` | Phases completed, with dates and script versions, and the non-secret answers |
-| `Workshop-<phase>-<time>.log`, `Site-<phase>-<time>.log` | A full transcript of each run |
-| `*-checks-<time>.csv` | The check results from PreFlight and Report |
+| `Workshop-<phase>-<time>.log`, `Site-<phase>-<time>.log`, `Lite-<phase>-<time>.log` | A full transcript of each run |
+| `*-checks-<time>.csv` | The check results from PreFlight, Report and the Lite script |
 | `AsBuilt-<host>-<time>.html` | The as-built report for ITGlue |
+| `Lite-Check-<host>-<time>.html`, `Lite-Apply-<host>-<time>.html` | The Lite script's standards report, before and after changes |
 
 Every phase is safe to re-run. To repeat a single step, run that phase by name, for example `-Phase Storage` or `-Phase Report`.
 
@@ -346,6 +376,8 @@ Every phase is safe to re-run. To repeat a single step, run that phase by name, 
 | Admin: stops at the built-in Administrator | Log off, log on as the new account; the script carries on |
 | Report: still on workshop DHCP | Run `-Phase Network` on site |
 | Report: remote UAC warning on a workgroup host | Run `-Phase Identity` |
+| Lite: stops with "failover cluster node" | Use the Hyper-V cluster standard; its Baseline drains the node first |
+| Lite: "Disk chain" warning | The VM runs on .avhdx files with no checkpoint, usually after a failed backup merge. Check the backup job and merge the chain in a maintenance window |
 
 ## Reference
 

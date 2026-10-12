@@ -66,9 +66,9 @@ param(
     [string]$Phase
 )
 
-# Version of this script, surfaced in the banner/transcript. Both standalone
+# Version of this script, surfaced in the banner/transcript. All three standalone
 # scripts share one version; '-dev' suffix while work accumulates under [Unreleased].
-$ScriptVersion = '0.1.2-dev'
+$ScriptVersion = '0.2.0-dev'
 $ScriptRole    = 'Site'   # which half of the build; names the state entries and the logon task
 
 $ErrorActionPreference = 'Stop'
@@ -87,8 +87,8 @@ $ScriptCopy = Join-Path $LogRoot "ArcHyperVHost-$ScriptRole.ps1"
 if ($PSCommandPath -and $PSCommandPath -ne $ScriptCopy) { Copy-Item $PSCommandPath $ScriptCopy -Force }
 
 # ---- start of shared helpers ----
-# Everything down to "end of shared helpers" is identical in ArcHyperVHost-Workshop.ps1
-# and ArcHyperVHost-Site.ps1 (each file is self-contained). Change both together.
+# Everything down to "end of shared helpers" is identical in ArcHyperVHost-Workshop.ps1,
+# ArcHyperVHost-Site.ps1 and ArcHyperVHost-Lite.ps1 (each file is self-contained). Change all three together.
 # ---------------------------------------------------------------------------
 
 function Write-Step { param([string]$Text) Write-Host "`n== $Text ==" -ForegroundColor Cyan }
@@ -769,6 +769,149 @@ function Invoke-Baseline {
 
 # ---- end of shared helpers ----
 
+# ---- start of report helpers ----
+# Everything down to "end of report helpers" is identical in ArcHyperVHost-Site.ps1
+# and ArcHyperVHost-Lite.ps1 (the Workshop script has no report). Change both together.
+# ---------------------------------------------------------------------------
+
+function Get-ArcTimeSource {
+    $ErrorActionPreference = 'Continue'   # native stderr must not throw (function scope only)
+    return (w32tm /query /source 2>&1 | ForEach-Object { "$_" } | Out-String).Trim()
+}
+
+function Get-ArcEdr {
+    $s1 = @(Get-Service -Name SentinelAgent -ErrorAction SilentlyContinue)
+    if ($s1) { return [pscustomobject]@{ Product = 'SentinelOne'; Services = $s1; Running = ($s1[0].Status -eq 'Running') } }
+    $so = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Sophos*' })
+    if ($so) {
+        $core = @($so | Where-Object { $_.DisplayName -like 'Sophos Endpoint Defense*' -or $_.DisplayName -like 'Sophos MCS*' })
+        $check = if ($core) { $core } else { $so }
+        return [pscustomobject]@{ Product = 'Sophos'; Services = $so; Running = -not @($check | Where-Object Status -ne 'Running') }
+    }
+    return $null
+}
+
+# 'Removed', 'Off', 'Passive' or 'Active'.
+function Get-ArcDefenderState {
+    $f = Get-WindowsFeature Windows-Defender -ErrorAction SilentlyContinue
+    if ($f -and -not $f.Installed) { return 'Removed' }
+    $svc = Get-Service WinDefend -ErrorAction SilentlyContinue
+    if (-not $svc -or $svc.Status -ne 'Running') { return 'Off' }
+    try {
+        $st = Get-MpComputerStatus -ErrorAction Stop
+        if ("$($st.AMRunningMode)" -match 'Passive') { return 'Passive' }
+        if ("$($st.AMRunningMode)" -eq 'Not running') { return 'Off' }
+    } catch { }
+    return 'Active'
+}
+
+# Older builds turned Defender off by policy instead of removing it. The reports still
+# look for that policy on existing hosts.
+$DefenderPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
+
+function Get-ArcBuiltinAdmin { return (Get-LocalUser | Where-Object { $_.SID.Value -match '^S-1-5-21-.*-500$' } | Select-Object -First 1) }
+
+function ConvertTo-Html-Safe { param($Value) return [System.Net.WebUtility]::HtmlEncode("$Value") }
+
+function New-ArcKvTable {
+    param([System.Collections.IDictionary]$Rows)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<table class="kv"><tbody>')
+    foreach ($k in $Rows.Keys) { [void]$sb.Append("<tr><td>$(ConvertTo-Html-Safe $k)</td><td>$(ConvertTo-Html-Safe $Rows[$k])</td></tr>") }
+    [void]$sb.Append('</tbody></table>')
+    return $sb.ToString()
+}
+
+function New-ArcTable {
+    param($Objects, [string[]]$Columns, [string]$StatusColumn)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('<table><thead><tr>')
+    foreach ($c in $Columns) { [void]$sb.Append("<th>$(ConvertTo-Html-Safe $c)</th>") }
+    [void]$sb.Append('</tr></thead><tbody>')
+    foreach ($o in @($Objects)) {
+        [void]$sb.Append('<tr>')
+        foreach ($c in $Columns) {
+            $v = ConvertTo-Html-Safe $o.$c
+            if ($c -eq $StatusColumn) { [void]$sb.Append("<td><span class=`"status $v`">$v</span></td>") } else { [void]$sb.Append("<td>$v</td>") }
+        }
+        [void]$sb.Append('</tr>')
+    }
+    if (-not @($Objects).Count) { [void]$sb.Append("<tr><td colspan=`"$($Columns.Count)`">None</td></tr>") }
+    [void]$sb.Append('</tbody></table>')
+    return $sb.ToString()
+}
+
+# Sections: ordered list of @{ Title; Html }. Self-contained page with no external fonts or
+# scripts (it may be opened offline). Deliberately unbranded - no logo or brand assets in a public repo.
+function New-ArcAsBuiltHtml {
+    param([string]$HostName, [string]$Subtitle, $Checks, [object[]]$Sections, [string]$Kind = 'as-built')
+    $fails = @($Checks | Where-Object Status -eq 'FAIL').Count
+    $warns = @($Checks | Where-Object Status -eq 'WARN').Count
+    $passes = @($Checks | Where-Object Status -eq 'PASS').Count
+    $body = New-Object System.Text.StringBuilder
+    [void]$body.Append("<section><h2>Summary</h2><div class=`"summary`"><strong>$passes passed, $warns warnings, $fails failed.</strong> Warnings and failures are listed first in the checks below.</div></section>")
+    $ordered = @($Checks | Sort-Object @{ e = { @{ FAIL = 0; WARN = 1; PASS = 2; INFO = 3 }[$_.Status] } })
+    [void]$body.Append("<section><h2>Checks</h2>$(New-ArcTable $ordered @('Status', 'Check', 'Detail') 'Status')</section>")
+    foreach ($s in $Sections) { [void]$body.Append("<section><h2>$(ConvertTo-Html-Safe $s.Title)</h2>$($s.Html)</section>") }
+    $title = ConvertTo-Html-Safe "$HostName $Kind"
+    return @"
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$title</title>
+<style>
+:root { --dark:#1F2933; --accent:#3E7CB1; --pale:#F4F6F8; --pass:#2E9E5B; --warn:#E0A800; --fail:#D64545; --grid:#D9DCE1; }
+* { box-sizing:border-box; }
+body { margin:0; background:#FFFFFF; color:var(--dark); font-family:'Segoe UI', Arial, sans-serif; font-size:14px; line-height:1.5; }
+header { background:var(--dark); color:#FFFFFF; padding:28px 40px 30px; }
+h1 { font-weight:700; font-size:28px; line-height:1.2; margin:0; }
+header p { margin:8px 0 0; }
+main { padding:8px 40px 40px; max-width:1100px; }
+h2 { font-weight:700; font-size:19px; margin:32px 0 10px; padding-bottom:6px; border-bottom:2px solid var(--accent); }
+table { border-collapse:collapse; width:100%; margin:6px 0 4px; }
+th { background:var(--dark); color:#FFFFFF; font-weight:700; text-align:left; padding:7px 10px; }
+td { padding:6px 10px; border-bottom:1px solid var(--grid); vertical-align:top; text-align:left; overflow-wrap:anywhere; }
+tbody tr:nth-child(even) td { background:var(--pale); }
+table.kv td:first-child { width:32%; font-weight:600; }
+.status { font-weight:700; white-space:nowrap; }
+.status::before { content:''; display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:7px; background:var(--grid); }
+.status.PASS::before { background:var(--pass); }
+.status.WARN::before { background:var(--warn); }
+.status.FAIL::before { background:var(--fail); }
+.summary { background:var(--pale); padding:14px 18px; }
+footer { padding:16px 40px 28px; font-size:12px; border-top:1px solid var(--grid); }
+@media (max-width:640px) { header, main, footer { padding-left:16px; padding-right:16px; } table { display:block; overflow-x:auto; } }
+@media print { header, th, tbody tr:nth-child(even) td, .status::before { -webkit-print-color-adjust:exact; print-color-adjust:exact; } }
+</style>
+</head>
+<body>
+<header>
+<h1>$title</h1>
+<p>$(ConvertTo-Html-Safe $Subtitle)</p>
+</header>
+<main>
+$($body.ToString())
+</main>
+<footer>Generated by ArcHyperVHost-$ScriptRole.ps1 v$(ConvertTo-Html-Safe $ScriptVersion) on $(ConvertTo-Html-Safe (Get-Date -Format 'd MMMM yyyy HH:mm')). Attach to the host's Configuration in ITGlue.</footer>
+</body>
+</html>
+"@
+}
+
+function Get-ArcVssWriters {
+    $ErrorActionPreference = 'Continue'
+    $raw = (vssadmin list writers 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    $out = @()
+    foreach ($m in [regex]::Matches($raw, "Writer name: '([^']+)'[\s\S]*?State: \[\d+\] (\w+)[\s\S]*?Last error: ([^\n]+)")) {
+        $out += [pscustomobject]@{ Writer = $m.Groups[1].Value; State = $m.Groups[2].Value; LastError = $m.Groups[3].Value.Trim() }
+    }
+    return $out
+}
+
+# ---- end of report helpers ----
+
 # ---------------------------------------------------------------------------
 # Phase: Network
 # ---------------------------------------------------------------------------
@@ -782,11 +925,6 @@ function Invoke-Network {
 # ---------------------------------------------------------------------------
 # Phase: Identity (domain or workgroup)
 # ---------------------------------------------------------------------------
-
-function Get-ArcTimeSource {
-    $ErrorActionPreference = 'Continue'   # native stderr must not throw (function scope only)
-    return (w32tm /query /source 2>&1 | ForEach-Object { "$_" } | Out-String).Trim()
-}
 
 # Returns 'Done', 'Reboot' or 'Gate'.
 function Invoke-Identity {
@@ -885,36 +1023,6 @@ function Invoke-Identity {
 # Phase: Edr (third-party EDR planned? then remove Defender; otherwise keep it)
 # ---------------------------------------------------------------------------
 
-function Get-ArcEdr {
-    $s1 = @(Get-Service -Name SentinelAgent -ErrorAction SilentlyContinue)
-    if ($s1) { return [pscustomobject]@{ Product = 'SentinelOne'; Services = $s1; Running = ($s1[0].Status -eq 'Running') } }
-    $so = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Sophos*' })
-    if ($so) {
-        $core = @($so | Where-Object { $_.DisplayName -like 'Sophos Endpoint Defense*' -or $_.DisplayName -like 'Sophos MCS*' })
-        $check = if ($core) { $core } else { $so }
-        return [pscustomobject]@{ Product = 'Sophos'; Services = $so; Running = -not @($check | Where-Object Status -ne 'Running') }
-    }
-    return $null
-}
-
-# 'Removed', 'Off', 'Passive' or 'Active'.
-function Get-ArcDefenderState {
-    $f = Get-WindowsFeature Windows-Defender -ErrorAction SilentlyContinue
-    if ($f -and -not $f.Installed) { return 'Removed' }
-    $svc = Get-Service WinDefend -ErrorAction SilentlyContinue
-    if (-not $svc -or $svc.Status -ne 'Running') { return 'Off' }
-    try {
-        $st = Get-MpComputerStatus -ErrorAction Stop
-        if ("$($st.AMRunningMode)" -match 'Passive') { return 'Passive' }
-        if ("$($st.AMRunningMode)" -eq 'Not running') { return 'Off' }
-    } catch { }
-    return 'Active'
-}
-
-# Older builds turned Defender off by policy instead of removing it. The Report still
-# looks for that policy on existing hosts.
-$DefenderPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
-
 # One question: will a third-party EDR be installed? Yes removes the Defender feature
 # (two real-time scanners on VM disks hurt performance, and Defender doesn't go passive
 # on Server). No keeps Defender as the antivirus, with the Hyper-V exclusions.
@@ -961,8 +1069,6 @@ function Invoke-Edr {
 # ---------------------------------------------------------------------------
 # Phase: Admin (new local admin, then disable the built-in Administrator)
 # ---------------------------------------------------------------------------
-
-function Get-ArcBuiltinAdmin { return (Get-LocalUser | Where-Object { $_.SID.Value -match '^S-1-5-21-.*-500$' } | Select-Object -First 1) }
 
 function Test-ArcLocalCredential {
     param([string]$User, [securestring]$Password)
@@ -1043,105 +1149,6 @@ function Invoke-HostSettings {
 # ---------------------------------------------------------------------------
 # Phase: Report (checks + HTML as-built)
 # ---------------------------------------------------------------------------
-
-function ConvertTo-Html-Safe { param($Value) return [System.Net.WebUtility]::HtmlEncode("$Value") }
-
-function New-ArcKvTable {
-    param([System.Collections.IDictionary]$Rows)
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('<table class="kv"><tbody>')
-    foreach ($k in $Rows.Keys) { [void]$sb.Append("<tr><td>$(ConvertTo-Html-Safe $k)</td><td>$(ConvertTo-Html-Safe $Rows[$k])</td></tr>") }
-    [void]$sb.Append('</tbody></table>')
-    return $sb.ToString()
-}
-
-function New-ArcTable {
-    param($Objects, [string[]]$Columns, [string]$StatusColumn)
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.Append('<table><thead><tr>')
-    foreach ($c in $Columns) { [void]$sb.Append("<th>$(ConvertTo-Html-Safe $c)</th>") }
-    [void]$sb.Append('</tr></thead><tbody>')
-    foreach ($o in @($Objects)) {
-        [void]$sb.Append('<tr>')
-        foreach ($c in $Columns) {
-            $v = ConvertTo-Html-Safe $o.$c
-            if ($c -eq $StatusColumn) { [void]$sb.Append("<td><span class=`"status $v`">$v</span></td>") } else { [void]$sb.Append("<td>$v</td>") }
-        }
-        [void]$sb.Append('</tr>')
-    }
-    if (-not @($Objects).Count) { [void]$sb.Append("<tr><td colspan=`"$($Columns.Count)`">None</td></tr>") }
-    [void]$sb.Append('</tbody></table>')
-    return $sb.ToString()
-}
-
-# Sections: ordered list of @{ Title; Html }. Self-contained page with no external fonts or
-# scripts (it may be opened offline). Deliberately unbranded - no logo or brand assets in a public repo.
-function New-ArcAsBuiltHtml {
-    param([string]$HostName, [string]$Subtitle, $Checks, [object[]]$Sections)
-    $fails = @($Checks | Where-Object Status -eq 'FAIL').Count
-    $warns = @($Checks | Where-Object Status -eq 'WARN').Count
-    $passes = @($Checks | Where-Object Status -eq 'PASS').Count
-    $body = New-Object System.Text.StringBuilder
-    [void]$body.Append("<section><h2>Summary</h2><div class=`"summary`"><strong>$passes passed, $warns warnings, $fails failed.</strong> Warnings and failures are listed first in the checks below.</div></section>")
-    $ordered = @($Checks | Sort-Object @{ e = { @{ FAIL = 0; WARN = 1; PASS = 2; INFO = 3 }[$_.Status] } })
-    [void]$body.Append("<section><h2>Checks</h2>$(New-ArcTable $ordered @('Status', 'Check', 'Detail') 'Status')</section>")
-    foreach ($s in $Sections) { [void]$body.Append("<section><h2>$(ConvertTo-Html-Safe $s.Title)</h2>$($s.Html)</section>") }
-    $title = ConvertTo-Html-Safe "$HostName as-built"
-    return @"
-<!doctype html>
-<html lang="en-GB">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>$title</title>
-<style>
-:root { --dark:#1F2933; --accent:#3E7CB1; --pale:#F4F6F8; --pass:#2E9E5B; --warn:#E0A800; --fail:#D64545; --grid:#D9DCE1; }
-* { box-sizing:border-box; }
-body { margin:0; background:#FFFFFF; color:var(--dark); font-family:'Segoe UI', Arial, sans-serif; font-size:14px; line-height:1.5; }
-header { background:var(--dark); color:#FFFFFF; padding:28px 40px 30px; }
-h1 { font-weight:700; font-size:28px; line-height:1.2; margin:0; }
-header p { margin:8px 0 0; }
-main { padding:8px 40px 40px; max-width:1100px; }
-h2 { font-weight:700; font-size:19px; margin:32px 0 10px; padding-bottom:6px; border-bottom:2px solid var(--accent); }
-table { border-collapse:collapse; width:100%; margin:6px 0 4px; }
-th { background:var(--dark); color:#FFFFFF; font-weight:700; text-align:left; padding:7px 10px; }
-td { padding:6px 10px; border-bottom:1px solid var(--grid); vertical-align:top; text-align:left; overflow-wrap:anywhere; }
-tbody tr:nth-child(even) td { background:var(--pale); }
-table.kv td:first-child { width:32%; font-weight:600; }
-.status { font-weight:700; white-space:nowrap; }
-.status::before { content:''; display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:7px; background:var(--grid); }
-.status.PASS::before { background:var(--pass); }
-.status.WARN::before { background:var(--warn); }
-.status.FAIL::before { background:var(--fail); }
-.summary { background:var(--pale); padding:14px 18px; }
-footer { padding:16px 40px 28px; font-size:12px; border-top:1px solid var(--grid); }
-@media (max-width:640px) { header, main, footer { padding-left:16px; padding-right:16px; } table { display:block; overflow-x:auto; } }
-@media print { header, th, tbody tr:nth-child(even) td, .status::before { -webkit-print-color-adjust:exact; print-color-adjust:exact; } }
-</style>
-</head>
-<body>
-<header>
-<h1>$(ConvertTo-Html-Safe $HostName) as-built</h1>
-<p>$(ConvertTo-Html-Safe $Subtitle)</p>
-</header>
-<main>
-$($body.ToString())
-</main>
-<footer>Generated by ArcHyperVHost-Site.ps1 v$(ConvertTo-Html-Safe $ScriptVersion) on $(ConvertTo-Html-Safe (Get-Date -Format 'd MMMM yyyy HH:mm')). Attach to the host's Configuration in ITGlue.</footer>
-</body>
-</html>
-"@
-}
-
-function Get-ArcVssWriters {
-    $ErrorActionPreference = 'Continue'
-    $raw = (vssadmin list writers 2>&1 | ForEach-Object { "$_" }) -join "`n"
-    $out = @()
-    foreach ($m in [regex]::Matches($raw, "Writer name: '([^']+)'[\s\S]*?State: \[\d+\] (\w+)[\s\S]*?Last error: ([^\n]+)")) {
-        $out += [pscustomobject]@{ Writer = $m.Groups[1].Value; State = $m.Groups[2].Value; LastError = $m.Groups[3].Value.Trim() }
-    }
-    return $out
-}
 
 function Invoke-Report {
     Write-Step 'Gathering'

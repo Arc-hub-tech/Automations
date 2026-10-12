@@ -77,9 +77,9 @@ param(
     [string]$MediaPath
 )
 
-# Version of this script, surfaced in the banner/transcript. Both standalone
+# Version of this script, surfaced in the banner/transcript. All three standalone
 # scripts share one version; '-dev' suffix while work accumulates under [Unreleased].
-$ScriptVersion = '0.1.2-dev'
+$ScriptVersion = '0.2.0-dev'
 $ScriptRole    = 'Workshop'   # which half of the build; names the state entries and the logon task
 
 $ErrorActionPreference = 'Stop'
@@ -98,8 +98,8 @@ $ScriptCopy = Join-Path $LogRoot "ArcHyperVHost-$ScriptRole.ps1"
 if ($PSCommandPath -and $PSCommandPath -ne $ScriptCopy) { Copy-Item $PSCommandPath $ScriptCopy -Force }
 
 # ---- start of shared helpers ----
-# Everything down to "end of shared helpers" is identical in ArcHyperVHost-Workshop.ps1
-# and ArcHyperVHost-Site.ps1 (each file is self-contained). Change both together.
+# Everything down to "end of shared helpers" is identical in ArcHyperVHost-Workshop.ps1,
+# ArcHyperVHost-Site.ps1 and ArcHyperVHost-Lite.ps1 (each file is self-contained). Change all three together.
 # ---------------------------------------------------------------------------
 
 function Write-Step { param([string]$Text) Write-Host "`n== $Text ==" -ForegroundColor Cyan }

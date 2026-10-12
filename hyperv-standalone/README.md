@@ -6,7 +6,7 @@ Two scripts build a **standalone HPE ProLiant Hyper-V host** for a customer site
 |---|---|---|
 | `ArcHyperVHost-Workshop.ps1` | At Arc, before the host ships | HPE firmware and iLO, host name, Hyper-V, VM volume, Datto RMM, Windows Update, **SET switch on the workshop DHCP**, **security baseline**, then ships |
 | `ArcHyperVHost-Site.ps1` | On site, and on existing customer hosts | Customer static address (or the full network, if there's no switch), domain or workgroup, EDR question (removes Defender if one is planned), new local admin, security baseline, VM start/stop, HTML as-built report |
-| `ArcHyperVHost-Lite.ps1` | On a live host that is already built | **Security and Hyper-V optimisation standard only**: a read-only Check, then an Apply that asks separately before anything that could interrupt service. No network, identity, EDR or account changes, and **never reboots** |
+| `ArcHyperVHost-Lite.ps1` | On a live host that is already built | **Security and Hyper-V optimisation standard only**: a read-only Check, then an Apply that asks separately before anything that could interrupt service. Always asks about **Defender and EDR**. No network, identity or account changes, and **never reboots** |
 
 All three are run by an engineer, interactively. They are not Datto components. There is **no config file**: everything is prompted. Answers that are not secret (host name, Datto site, IPs, VM volume) are kept in `C:\ArcLogs\HyperVHost\state.json` on the host, so a re-run and the Site script don't ask again. Passwords are never stored or logged.
 
@@ -91,7 +91,7 @@ Run it on the iLO remote console or a local console, with internet access.
 | `HostSettings` | On every VM: automatic stop = **Shut Down**, automatic start = start if it was running, with **one start delay** (prompted, default 120 s). Hyper-V has no host-wide default for these, so re-run it after creating VMs. |
 | `Report` | Runs the checks, then writes `C:\ArcLogs\HyperVHost\AsBuilt-<host>-<time>.html` for the engineer to **attach to the host's Configuration in ITGlue**. |
 
-**On an existing customer host,** run the Site script only. It shows each plan and asks before changing anything. It never rebuilds a switch or moves an IP, and it warns before any reboot that running VMs will be stopped. If the host only needs the security and Hyper-V standard, with no identity, EDR or account work and no reboots, use the [Lite script](#lite-archypervhost-liteps1) instead.
+**On an existing customer host,** run the Site script only. It shows each plan and asks before changing anything. It never rebuilds a switch or moves an IP, and it warns before any reboot that running VMs will be stopped. If the host only needs the security and Hyper-V standard, with no network, identity or account work and no reboots, use the [Lite script](#lite-archypervhost-liteps1) instead.
 
 ### Defender on Windows Server
 
@@ -133,7 +133,7 @@ The HTML is self-contained, so it opens offline. It's **deliberately unbranded**
 
 ## Lite: `ArcHyperVHost-Lite.ps1`
 
-For a host that is **already built and in service** (Hyper-V role in, SPP done, network and VMs running) that only needs the security and Hyper-V optimisation standard. It applies the same standard as `Baseline`, from the same shared code, and adds Defender's Hyper-V exclusions and the VM start/stop settings. It never touches the network, domain membership, EDR or accounts, and **it never reboots**. It stops when Failover Clustering is installed (use `hyperv-cluster/`, whose Baseline drains the node first) and on a host without the Hyper-V role.
+For a host that is **already built and in service** (Hyper-V role in, SPP done, network and VMs running) that only needs the security and Hyper-V optimisation standard. It applies the same standard as `Baseline`, from the same shared code, and adds an endpoint protection step, Defender's Hyper-V exclusions and the VM start/stop settings. It never touches the network, domain membership or accounts, never installs an EDR, and **it never reboots**. It stops when Failover Clustering is installed (use `hyperv-cluster/`, whose Baseline drains the node first) and on a host without the Hyper-V role.
 
 **Tested on WS2025 only.** Existing customer hosts may run 2016-2022; those are untested, and the script warns. Its one-liner forces TLS 1.2 so the download works on older builds. Run `Check` first there and read the plan.
 
@@ -154,6 +154,18 @@ The changes that are asked for separately:
 | SMBv1 and PowerShell 2.0 removed | Anything still using them stops working (finishes at the reboot) |
 | BIOS workload profile | Power and processor settings change at the next reboot (only checked when ilorest is installed) |
 | VMQ on | The switch NICs restart: VMs and RDP lose network for a few seconds. Applied last; use the iLO remote console. Say no if VMQ was turned off deliberately (some Broadcom 1GbE NICs) |
+
+**Endpoint protection (Defender and EDR):** Check shows the state, and Apply always asks the engineer the question that fits it:
+
+| State | What Apply asks |
+|---|---|
+| Defender only, no EDR | **Will a third-party EDR (SentinelOne, Sophos) be installed?** The answer is recorded. Yes keeps Defender until the agent is running: deploy the EDR, then run Apply again. No keeps Defender, with the Hyper-V exclusions. Asked on every Apply, so it gets thought about each time. |
+| EDR running and Defender still active | **Remove Microsoft Defender?** (feature uninstall, finishes at the next reboot) |
+| EDR installed but not all services running | Nothing is removed. Check the EDR in its console |
+| EDR running, Defender removed or off | Nothing to ask |
+| Neither | **No active antivirus.** Offers to put Defender back: reinstall the feature (reboot), or remove the old off-policy and start the service |
+
+Unlike the Site script's Edr phase, **Lite removes Defender only once an EDR agent is installed and running.** A host already in service is never left without antivirus while it waits for the EDR. The report also WARNs when no decision is recorded, when an EDR was planned but isn't installed, when Defender's real-time protection is off, and when its signatures are more than 7 days old.
 
 **VM start and stop on a live host:** only VMs that differ are changed. An automatic start action of `Nothing` becomes `StartIfRunning`. A start delay the customer already set (a staggered DC-first order, for example) is kept; only VMs with no delay get the default (prompted, 120 s). A running VM's stop action can't be changed, so it's reported to set at its next shutdown.
 

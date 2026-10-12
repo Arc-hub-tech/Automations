@@ -7,7 +7,7 @@ All notable changes to `ArcHyperVHost-Workshop.ps1`, `ArcHyperVHost-Site.ps1` an
 _Work in progress on the `develop` branch. `$ScriptVersion` is `0.2.0-dev`; the download one-liners point at `/develop/`._
 
 ### Added (0.2.0-dev)
-- **`ArcHyperVHost-Lite.ps1`: lite standardisation for a live host that is already built.** It applies only the security and Hyper-V optimisation standard, from the same shared baseline code. It never touches the network, domain membership, EDR or accounts, and it **never reboots**. It stops when Failover Clustering is installed (pointing to `hyperv-cluster/`, even with the cluster service stopped) and on a host without the Hyper-V role. It warns on anything older than WS2025 (untested), and its one-liner forces TLS 1.2 for older builds.
+- **`ArcHyperVHost-Lite.ps1`: lite standardisation for a live host that is already built.** It applies only the security and Hyper-V optimisation standard, from the same shared baseline code. It never touches the network, domain membership or accounts, never installs an EDR, and it **never reboots**. It stops when Failover Clustering is installed (pointing to `hyperv-cluster/`, even with the cluster service stopped) and on a host without the Hyper-V role. It warns on anything older than WS2025 (untested), and its one-liner forces TLS 1.2 for older builds.
   - **`-Phase Check`** (the default) is read-only. It shows what Apply would change, runs the live-host checks, and writes `Lite-Check-<host>-<time>.html` for the change request.
   - **`-Phase Apply`** asks every question first, then applies:
     - once for the live-safe items;
@@ -15,11 +15,18 @@ _Work in progress on the `develop` branch. `$ScriptVersion` is `0.2.0-dev`; the 
     - separately, with the risk stated, for each change that could interrupt service: firewall profile on (naming Hyper-V Replica), UAC turned back on (remote UAC on workgroup hosts), NTLMv2 only, SSL/TLS 1.0/1.1 off, SMB signing, SMBv1/PowerShell 2.0 removal, the BIOS workload profile, and VMQ (say no if it was turned off on purpose). VMQ is applied last.
     - Afterwards it lists anything declined or still different, and writes `Lite-Apply-<host>-<time>.html`.
   - Also plans Defender's Hyper-V exclusions (when Defender is the antivirus).
+  - **Endpoint protection step:** Check shows the Defender and EDR state, and Apply always asks about it.
+    - With Defender only, it asks whether a third-party EDR will be installed, and records the answer.
+    - With an EDR running and Defender still active, it offers to remove Defender.
+    - With no active antivirus, it offers to put Defender back. That also forgets any earlier EDR decision.
+    - Unlike the Site Edr phase, Defender is removed only once an EDR agent is running, so a live host is never left without antivirus.
+    - The report WARNs on: no decision recorded, an EDR planned but not installed, real-time protection off, and signatures more than 7 days old.
   - **VM start/stop changes only VMs that differ.** A customer's existing non-zero start delays are kept. A running VM's stop action is reported to set at its next shutdown.
   - **Extra checks for live hosts:** checkpoints older than 7 days, VMs on `.avhdx` disks with no checkpoint (a failed backup merge), VM files on the system drive, an LBFO team or single NIC under the switch, a Replica server with its listener rules off, remote UAC still on for local accounts on workgroup hosts, updates more than 45 days old, and a reboot that was asked for but hasn't happened.
   - Tested on the WS2025 lab VM:
     - Check on a built host (nothing to change).
     - Check and Apply after deliberate drift: safe, at-reboot and risk items, yes and no answers, a missing Defender exclusion, and a running VM with non-standard start/stop settings.
+    - Endpoint protection: no EDR planned, a running EDR (simulated) with Defender removed, and no antivirus with Defender reinstalled.
     - The checkpoint check, the UAC risk group, the Replica warning, and the stop when Failover Clustering is installed.
     - The Site Report re-run after the refactor below.
   - Not yet tested: VMQ on real NICs, the BIOS profile through ilorest, and WS2016-2022.

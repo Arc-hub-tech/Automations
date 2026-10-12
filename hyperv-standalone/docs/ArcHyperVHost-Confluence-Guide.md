@@ -50,7 +50,7 @@ For hosts in the Arc platform clusters, use the Hyper-V cluster standard guide i
 | Workshop | At Arc, on the workshop network (DHCP, with internet) | `ArcHyperVHost-Workshop.ps1` | Firmware (SPP), iLO password, host name, Hyper-V, VM disk, Datto, Windows Update, SET switch on DHCP, security baseline, then shut down |
 | Site | At the customer, on their network | `ArcHyperVHost-Site.ps1` | Customer IP address, domain or workgroup, endpoint protection, local admin account, baseline re-check, VM start/stop, as-built report |
 | Existing host | At the customer | `ArcHyperVHost-Site.ps1` only | Brings a running customer host up to the standard, showing each change and asking first |
-| Existing host, standard only | On a live host | `ArcHyperVHost-Lite.ps1` | Security and Hyper-V optimisation standard only: no network, identity, EDR or account changes, and no reboots |
+| Existing host, standard only | On a live host | `ArcHyperVHost-Lite.ps1` | Security and Hyper-V optimisation standard, plus a Defender and EDR question. No network, identity or account changes, and no reboots |
 
 The scripts share a state file on the host (`C:\ArcLogs\HyperVHost\state.json`). Answers given in the workshop, such as the host name and Datto site, are not asked again on site. Passwords are never stored.
 
@@ -204,7 +204,7 @@ Run only the Site script, with `-Phase Next`, in a maintenance window.
 
 ## Process 4: lite standardisation of a live host
 
-Use `ArcHyperVHost-Lite.ps1` when a host is already built and in service, and it only needs the security and Hyper-V optimisation standard. It uses the same standard as the Baseline phase, and the same code. It never touches the network, domain membership, endpoint protection or accounts, and **it never reboots**. It stops if Failover Clustering is installed; use the Hyper-V cluster standard for those. It's tested on Windows Server 2025; on 2016-2022 it warns, so run Check first and read the plan.
+Use `ArcHyperVHost-Lite.ps1` when a host is already built and in service, and it only needs the security and Hyper-V optimisation standard. It uses the same standard as the Baseline phase, and the same code. It never touches the network, domain membership or accounts, never installs an EDR, and **it never reboots**. It stops if Failover Clustering is installed; use the Hyper-V cluster standard for those. It's tested on Windows Server 2025; on 2016-2022 it warns, so run Check first and read the plan.
 
 1. **Check** (read-only): `-Phase Check` shows what Apply would change and runs the live-host checks, then writes `Lite-Check-<host>-<time>.html`. Attach that to the change request.
 2. **Apply**, once the change is approved: `-Phase Apply` shows the plan again and asks every question before it changes anything:
@@ -222,6 +222,12 @@ Use `ArcHyperVHost-Lite.ps1` when a host is already built and in service, and it
 | SMBv1 and PowerShell 2.0 removed | Anything still using them stops working |
 | BIOS workload profile | Power and processor settings change at the next reboot |
 | VMQ on | The switch NICs restart, so VMs and RDP lose network for a few seconds. It is applied last; use the iLO remote console. Say no if VMQ was turned off on purpose (some Broadcom 1GbE NICs) |
+
+→ **Defender and EDR:** Apply always shows the endpoint protection state and asks the engineer about it:
+   - **Defender only:** "Will a third-party EDR be installed?" If yes, deploy the agent first, then run Apply again. Defender is removed only once the agent is running, so the host is never without antivirus.
+   - **EDR running with Defender still active:** offers to remove Defender. Removal finishes at the next reboot.
+   - **No active antivirus:** offers to put Defender back.
+   - The report warns if no decision is recorded, if an EDR was planned but isn't installed, if real-time protection is off, or if signatures are more than 7 days old.
 
 → **VM start and stop:** only VMs that differ are changed. A start delay the customer has already set (a staggered start order, for example) is kept; only VMs with no delay get the default. A running VM's stop action can't be changed, so it's reported to set at the VM's next shutdown.
 

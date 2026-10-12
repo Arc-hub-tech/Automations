@@ -7,7 +7,9 @@
  running). It brings the host up to the same security and Hyper-V
  optimisation standard as the Workshop and Site scripts, but:
 
-   - it never touches the network, domain membership, EDR or accounts;
+   - it never touches the network, domain membership or accounts, and never installs an EDR;
+   - it always asks about endpoint protection (EDR planned? Defender alongside an EDR?
+     no antivirus at all?), but only removes Defender once an EDR agent is running;
    - it NEVER reboots - anything that needs one is listed for a maintenance window;
    - anything that can interrupt service is asked for on its own, with the risk stated.
 
@@ -45,8 +47,8 @@
               and writes an HTML report. Changes nothing.
       Apply   Shows the same plan, then asks: once for the live-safe items, once for
               the items that only take effect at a reboot, and separately for each
-              item that can interrupt service. Then the VM automatic start/stop
-              changes. Applies VMQ last, never reboots, and writes the report again.
+              item that can interrupt service. Then endpoint protection (Defender
+              and EDR) and the VM automatic start/stop changes. Applies VMQ last, never reboots, and writes the report again.
 
 .NOTES
     Same standard (and the same code) as ArcHyperVHost-Workshop.ps1 and
@@ -1043,6 +1045,98 @@ function Save-LiteRun {
 }
 
 # ---------------------------------------------------------------------------
+# Endpoint protection - always shown, and Apply always asks the engineer about it.
+# Unlike the Site Edr phase, Defender is only removed once an EDR agent is installed and
+# running: a live host should never be left without antivirus while the EDR is awaited.
+# ---------------------------------------------------------------------------
+
+function Get-LiteEndpointState {
+    $edr = Get-ArcEdr
+    $def = Get-ArcDefenderState
+    $case = if ($edr -and -not $edr.Running) { 'EdrUnhealthy' }
+            elseif ($edr -and $def -eq 'Active') { 'Both' }
+            elseif ($edr) { 'EdrOnly' }
+            elseif ($def -in 'Active', 'Passive') { 'DefenderOnly' }
+            else { 'None' }
+    return [pscustomobject]@{
+        Edr       = $edr
+        Defender  = $def
+        PolicyOff = ((Get-ItemProperty $DefenderPolicy -Name DisableAntiSpyware -ErrorAction SilentlyContinue).DisableAntiSpyware -eq 1)
+        Planned   = Get-Answer 'EdrPlanned'
+        Case      = $case
+    }
+}
+
+function Show-LiteEndpoint {
+    param($S)
+    Write-Host "  EDR: $(if ($S.Edr) { "$($S.Edr.Product) ($(if ($S.Edr.Running) { 'running' } else { 'not all services running' }))" } else { 'none found (SentinelOne / Sophos)' })"
+    Write-Host "  Microsoft Defender: $($S.Defender)$(if ($S.PolicyOff) { ' (turned off by the DisableAntiSpyware policy)' })"
+    switch ($S.Case) {
+        'Both'         { Write-Host "  Defender is still active alongside $($S.Edr.Product) - two real-time scanners on the VM disks. Apply offers to remove Defender (finishes at the next reboot)." -ForegroundColor Yellow }
+        'EdrOnly'      { Write-Host "  $($S.Edr.Product) is the antivirus. Make sure its policy carries the Hyper-V exclusions." -ForegroundColor Green }
+        'EdrUnhealthy' { Write-Host "  Check $($S.Edr.Product) in its console. Nothing is removed while the EDR isn't healthy." -ForegroundColor Yellow }
+        'DefenderOnly' {
+            if ($S.Planned -eq $true) { Write-Host '  An EDR was recorded as planned but is not installed yet. Deploy it, then run Apply again to remove Defender.' -ForegroundColor Yellow }
+            else { Write-Host '  Defender is the antivirus. Apply asks whether a third-party EDR will be installed - decide that with the customer''s contract in mind.' -ForegroundColor Cyan }
+        }
+        'None'         { Write-Host '  NO ACTIVE ANTIVIRUS on this host. Apply offers to put Microsoft Defender back.' -ForegroundColor Red }
+    }
+}
+
+# Asked with the other questions. Returns 'RemoveDefender', 'RestoreDefender' or $null.
+function Read-LiteEndpointChoice {
+    param($S)
+    Write-Step 'Endpoint protection'
+    Show-LiteEndpoint $S
+    switch ($S.Case) {
+        'Both' {
+            if (Confirm-Action "Remove Microsoft Defender ($($S.Edr.Product) stays the antivirus; finishes at the next reboot)") { return 'RemoveDefender' }
+            Write-Host '  Defender left in place - the report keeps flagging it.' -ForegroundColor Yellow
+        }
+        'DefenderOnly' {
+            Write-Host '  If SentinelOne or Sophos is coming, deploy the agent first and run Apply again: Defender is removed only once the agent is running, so the host is never unprotected.' -ForegroundColor Cyan
+            $planned = Confirm-Action 'Will a third-party EDR (e.g. SentinelOne or Sophos) be installed on this host'
+            Set-Answer 'EdrPlanned' $planned
+            if ($planned) { Write-Host '  Recorded as planned. Defender stays, with the Hyper-V exclusions, until the EDR is running.' -ForegroundColor Yellow }
+            else { Write-Host '  Recorded: no EDR planned. Defender stays as the antivirus, with the Hyper-V exclusions.' -ForegroundColor Green }
+        }
+        'None' {
+            if (Confirm-Action 'Put Microsoft Defender back now') { return 'RestoreDefender' }
+            Write-Warning 'The host stays WITHOUT active antivirus. Deploy the EDR, or run Apply again to restore Defender.'
+        }
+    }
+    return $null
+}
+
+# Returns $true when the change finishes at a reboot.
+function Invoke-LiteEndpointAction {
+    param([Parameter(Mandatory)][string]$Action)
+    if ($Action -eq 'RemoveDefender') {
+        $r = Uninstall-WindowsFeature -Name Windows-Defender
+        if (-not $r.Success) { throw "Removing Microsoft Defender failed (exit code $($r.ExitCode))." }
+        Set-Answer 'EdrPlanned' $true
+        Write-Host '  OK   Microsoft Defender removed - completes at the next reboot. If the EDR is ever uninstalled, put Defender back first (Install-WindowsFeature Windows-Defender, then reboot).' -ForegroundColor Green
+        return $true
+    }
+    # RestoreDefender: the feature was removed, or it was turned off (by the old policy, or the service stopped).
+    # Any earlier EDR decision is stale now - forget it, so the next Apply asks again.
+    Set-Answer 'EdrPlanned' $null
+    $f = Get-WindowsFeature Windows-Defender -ErrorAction SilentlyContinue
+    if ($f -and -not $f.Installed) {
+        $r = Install-WindowsFeature -Name Windows-Defender
+        if (-not $r.Success) { throw "Installing Microsoft Defender failed (exit code $($r.ExitCode))." }
+        Write-Host '  OK   Microsoft Defender installed - active after the next reboot. Run Apply again afterwards for the Hyper-V exclusions.' -ForegroundColor Green
+        return $true
+    }
+    Remove-ItemProperty $DefenderPolicy -Name DisableAntiSpyware -ErrorAction SilentlyContinue
+    Remove-ItemProperty "$DefenderPolicy\Real-Time Protection" -Name DisableRealtimeMonitoring -ErrorAction SilentlyContinue
+    Start-Service WinDefend   # deleting the policy and rebooting does not bring it back (checked on WS2025)
+    Write-Host '  OK   Microsoft Defender started. If a domain GPO turns it off again, fix it there.' -ForegroundColor Green
+    Set-ArcDefenderHyperVExclusions
+    return $false
+}
+
+# ---------------------------------------------------------------------------
 # Phase: Check (read-only)
 # ---------------------------------------------------------------------------
 
@@ -1052,6 +1146,8 @@ function Invoke-LiteCheck {
     if ($plan) { Show-LitePlan $plan } else { Write-Host '  The host matches the security and optimisation standard.' -ForegroundColor Green }
     $vmPlan = @(Get-LiteVmPlan -Delay (Get-LiteDefaultDelay))
     if ($vmPlan) { Write-Host '  VM automatic start/stop:'; Show-LiteVmPlan $vmPlan }
+    Write-Step 'Endpoint protection'
+    Show-LiteEndpoint (Get-LiteEndpointState)
     Invoke-LiteReport -Stage 'Check' -Plan $plan -VmPlan $vmPlan
     Write-Host "`n  Nothing was changed. When the change is approved, run:  -Phase Apply" -ForegroundColor Cyan
 }
@@ -1088,6 +1184,12 @@ function Invoke-LiteApply {
         if (Confirm-Action "  Apply '$($g.Title)'") { foreach ($i in $items) { $chosen.Add($i) } } else { $declined.Add($g.Title) }
     }
 
+    $endpoint = Read-LiteEndpointChoice (Get-LiteEndpointState)
+    if ($endpoint -eq 'RemoveDefender') {
+        # No point adding exclusions to a Defender that is being removed.
+        $keep = @($chosen | Where-Object Kind -ne 'DefenderExclusions'); $chosen.Clear(); foreach ($i in $keep) { $chosen.Add($i) }
+    }
+
     Write-Step 'VM automatic start and stop'
     $delay = Get-LiteDefaultDelay
     if (@(Get-VM -ErrorAction SilentlyContinue | Where-Object AutomaticStartDelay -eq 0)) {
@@ -1103,7 +1205,7 @@ function Invoke-LiteApply {
         if ($vmApply -and -not (Confirm-Action "Apply the $($vmApply.Count) VM setting change(s)")) { $vmApply = @(); $declined.Add('VM start/stop') }
     }
 
-    if (-not $chosen.Count -and -not $vmApply) {
+    if (-not $chosen.Count -and -not $vmApply -and -not $endpoint) {
         Write-Host "`n  Nothing chosen - no changes made." -ForegroundColor Yellow
         Invoke-LiteReport -Stage 'Apply' -Plan $plan -VmPlan $vmPlan
         return
@@ -1114,6 +1216,11 @@ function Invoke-LiteApply {
     foreach ($i in @($chosen | Where-Object RiskGroup -ne 'Vmq' | Sort-Object Area, Id)) {
         try { Invoke-LiteItem $i; Write-Host "  OK   $($i.Desc)" -ForegroundColor Green }
         catch { $failed++; Write-Host "  FAIL $($i.Desc) - $($_.Exception.Message)" -ForegroundColor Red }
+    }
+    $endpointReboot = $false
+    if ($endpoint) {
+        try { $endpointReboot = Invoke-LiteEndpointAction $endpoint }
+        catch { $failed++; Write-Host "  FAIL Endpoint protection - $($_.Exception.Message)" -ForegroundColor Red }
     }
     foreach ($r in $vmApply) {
         try { Invoke-LiteVmItem $r; Write-Host "  OK   $($r.VM): $($r.Setting) = $($r.Desired)" -ForegroundColor Green }
@@ -1136,7 +1243,7 @@ function Invoke-LiteApply {
     if ($failed) { Write-Warning "$failed change(s) failed - see above. The report lists anything still different." }
     if ($declined.Count) { Write-Host "  Left as they were (declined): $($declined -join '; ')" -ForegroundColor Yellow }
 
-    $reboot = [bool]@($chosen | Where-Object Restart).Count
+    $reboot = [bool]@($chosen | Where-Object Restart).Count -or [bool]$endpointReboot
     Save-LiteRun $reboot
     Invoke-LiteReport -Stage 'Apply' -Plan $planAfter -VmPlan @(Get-LiteVmPlan -Delay $delay)
     if (@($script:Results | Where-Object { $_.Check -eq 'Pending reboot' })) { Write-Host "`nREBOOT NEEDED for some changes to take effect. Plan it in a maintenance window - this script does not reboot." -ForegroundColor Yellow }
@@ -1256,14 +1363,27 @@ function Invoke-LiteReport {
     if ($bad) { Add-Result FAIL 'Disk health' "Not healthy: $(($bad | ForEach-Object { "disk $($_.Disk) $($_.Health)" }) -join ', ')" } else { Add-Result PASS 'Disk health' 'All healthy' }
     foreach ($v in $vols | Where-Object { $_.SizeGB -gt 0 -and ($_.FreeGB / $_.SizeGB) -lt 0.15 }) { Add-Result WARN "Free space $($v.Volume)" "$($v.FreeGB) GB of $($v.SizeGB) GB free" }
 
-    # Protection (reported only - removing Defender for an EDR is the Site script's Edr phase)
+    # Protection (Apply's Endpoint protection step asks about these)
     $edr = Get-ArcEdr
     $def = Get-ArcDefenderState
-    if ($edr) { if ($edr.Running) { Add-Result PASS 'EDR' "$($edr.Product) running" } else { Add-Result FAIL 'EDR' "$($edr.Product) installed but not all services running" } }
-    elseif ($def -eq 'Active') { Add-Result INFO 'EDR' 'None - Microsoft Defender is the antivirus' }
-    if ($edr -and $def -eq 'Active') { Add-Result WARN 'Microsoft Defender' "Still active alongside $($edr.Product) - two real-time scanners on the VM disks. Run ArcHyperVHost-Site.ps1 -Phase Edr to remove it." }
-    elseif (-not $edr -and $def -ne 'Active') { Add-Result FAIL 'Microsoft Defender' "$def, and no EDR found - the host has no active antivirus" }
+    $planned = Get-Answer 'EdrPlanned'
+    if ($edr) { if ($edr.Running) { Add-Result PASS 'EDR' "$($edr.Product) running" } else { Add-Result FAIL 'EDR' "$($edr.Product) installed but not all services running - check it in its console" } }
+    elseif ($planned -eq $true) { Add-Result WARN 'EDR' 'Recorded as planned but not installed yet - deploy SentinelOne or Sophos, then run Apply again to remove Defender' }
+    elseif ($planned -eq $false) { Add-Result INFO 'EDR' 'None - Microsoft Defender is the antivirus (no EDR planned)' }
+    else { Add-Result WARN 'EDR' 'None, and no decision recorded - Apply asks whether a third-party EDR will be installed' }
+    if ($edr -and $def -eq 'Active') { Add-Result WARN 'Microsoft Defender' "Still active alongside $($edr.Product) - two real-time scanners on the VM disks. Apply offers to remove it." }
+    elseif (-not $edr -and $def -eq 'Passive') { Add-Result WARN 'Microsoft Defender' 'Passive, and no SentinelOne or Sophos found - check which product is the antivirus' }
+    elseif (-not $edr -and $def -ne 'Active') { Add-Result FAIL 'Microsoft Defender' "$def, and no EDR found - the host has no active antivirus. Apply offers to put Defender back." }
     else { Add-Result PASS 'Microsoft Defender' $def }
+    if ($def -eq 'Active' -and -not $edr) {
+        try {
+            $ms = Get-MpComputerStatus -ErrorAction Stop
+            if (-not $ms.RealTimeProtectionEnabled) { Add-Result WARN 'Defender real-time protection' 'Off - the host is not being scanned on access' }
+            if ($ms.AntivirusSignatureAge -gt 7) { Add-Result WARN 'Defender signatures' "$($ms.AntivirusSignatureAge) days old - check Windows Update / signature updates" }
+            else { Add-Result PASS 'Defender signatures' "$($ms.AntivirusSignatureAge) day(s) old" }
+        } catch { Add-Result WARN 'Defender status' "Could not read: $($_.Exception.Message)" }
+    }
+    if ($def -eq 'Removed') { Add-Result INFO 'Defender removed' 'If the EDR is ever uninstalled, put Defender back first: Install-WindowsFeature Windows-Defender, then reboot.' }
     if ((Get-ItemProperty $DefenderPolicy -Name DisableAntiSpyware -ErrorAction SilentlyContinue).DisableAntiSpyware -eq 1) {
         Add-Result INFO 'Defender off-policy' "DisableAntiSpyware = 1 under $($DefenderPolicy -replace '^HKLM:', 'HKLM'). If the EDR is ever removed, delete the value and run Start-Service WinDefend (a reboot alone does not restart it)."
     }
@@ -1276,7 +1396,7 @@ function Invoke-LiteReport {
         else { Add-Result WARN 'Remote UAC (workgroup)' 'On (or will be once UAC is on) - Veeam and remote Hyper-V Manager with a local account are refused. ArcHyperVHost-Site.ps1 -Phase Identity sets the Arc standard.' }
     }
     $secRows = [ordered]@{
-        'EDR'                    = $(if ($edr) { $edr.Product } else { 'None' })
+        'EDR'                    = $(if ($edr) { $edr.Product } elseif ($planned -eq $true) { 'Planned, not installed yet' } elseif ($planned -eq $false) { 'None (Microsoft Defender)' } else { 'None (no decision recorded)' })
         'Microsoft Defender'     = $def
         'Datto RMM agent'        = $(if (Get-Service CagService -ErrorAction SilentlyContinue) { 'Installed' } else { 'Not installed' })
         'Built-in Administrator' = $(if ($builtin -and $builtin.Enabled) { 'Enabled' } else { 'Disabled' })

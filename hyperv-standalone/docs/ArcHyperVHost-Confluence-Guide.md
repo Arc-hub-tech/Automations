@@ -12,7 +12,7 @@
 >
 > → **Ships with the standard in place:** the security baseline is applied in the workshop and checked again on site.
 
-> **Status:** pilot, version 0.1.1-dev on the develop branch. Both scripts have run end to end on a Windows Server 2025 lab VM (everything except the HPE, iLO and Datto steps), but not yet on HPE hardware. These need confirming on the first real builds:
+> **Status:** pilot, version 0.1.2-dev on the develop branch. Both scripts have run end to end on a Windows Server 2025 lab VM (everything except the HPE, iLO and Datto steps), but not yet on HPE hardware. These need confirming on the first real builds:
 >
 > → the SPP, iLO steps (password, IP, DNS, host name, protocols) and the Datto agent install;
 >
@@ -342,6 +342,7 @@ Every phase is safe to re-run. To repeat a single step, run that phase by name, 
 | Updates keeps stopping | An update fails every time. Check the warnings and the Windows Update log; hide or install that update by hand |
 | Network: lost connection | Expected over RDP. Use the iLO remote console. The new address is printed once DHCP or the static address is set |
 | Report: Defender still active alongside the EDR | Run `-Phase Edr` and answer yes to remove it |
+| Report: no active antivirus | Deploy the EDR. If none is coming after all, run `Install-WindowsFeature Windows-Defender` and reboot |
 | Admin: stops at the built-in Administrator | Log off, log on as the new account; the script carries on |
 | Report: still on workshop DHCP | Run `-Phase Network` on site |
 | Report: remote UAC warning on a workgroup host | Run `-Phase Identity` |

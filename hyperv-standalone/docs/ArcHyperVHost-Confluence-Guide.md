@@ -22,7 +22,9 @@
 >
 > → the automatic restart of the script after a reboot;
 >
-> → each ProLiant generation, particularly Gen11 (iLO 6) and Gen12 (iLO 7).
+> → each ProLiant generation, particularly Gen11 (iLO 6) and Gen12 (iLO 7);
+>
+> → for the Lite script: VMQ on real NICs, the BIOS profile through iLOrest, whether an iLO login prompt appears during the read-only Check, and Windows Server 2016-2022 hosts.
 >
 > Report anything unexpected to the script owner.
 
@@ -202,7 +204,7 @@ Run only the Site script, with `-Phase Next`, in a maintenance window.
 
 ## Process 4: lite standardisation of a live host
 
-Use `ArcHyperVHost-Lite.ps1` when a host is already built and in service, and it only needs the security and Hyper-V optimisation standard. It uses the same standard as the Baseline phase, and the same code. It never touches the network, domain membership, endpoint protection or accounts, and **it never reboots**. It stops on a failover cluster node; use the Hyper-V cluster standard for those.
+Use `ArcHyperVHost-Lite.ps1` when a host is already built and in service, and it only needs the security and Hyper-V optimisation standard. It uses the same standard as the Baseline phase, and the same code. It never touches the network, domain membership, endpoint protection or accounts, and **it never reboots**. It stops if Failover Clustering is installed; use the Hyper-V cluster standard for those. It's tested on Windows Server 2025; on 2016-2022 it warns, so run Check first and read the plan.
 
 1. **Check** (read-only): `-Phase Check` shows what Apply would change and runs the live-host checks, then writes `Lite-Check-<host>-<time>.html`. Attach that to the change request.
 2. **Apply**, once the change is approved: `-Phase Apply` shows the plan again and asks every question before it changes anything:
@@ -212,13 +214,14 @@ Use `ArcHyperVHost-Lite.ps1` when a host is already built and in service, and it
 
 | Change | Risk on a live host |
 |---|---|
-| Firewall profile on | Inbound traffic outside the Hyper-V, WinRM, file sharing, WMI and RDP rules is blocked (Veeam data movers, UPS agent, SNMP, monitoring) |
+| Firewall profile on | Inbound traffic outside the Hyper-V, WinRM, file sharing, WMI and RDP rules is blocked (Hyper-V Replica listeners, Veeam data movers, UPS agent, SNMP, monitoring) |
+| UAC turned back on | From the reboot, Veeam and remote Hyper-V Manager with a local admin can get access denied on a workgroup host, unless remote UAC is off for local accounts (Site script, Identity phase) |
 | NTLMv2 only | Devices that authenticate with LM or NTLMv1 are refused |
 | SSL 3.0, TLS 1.0 and 1.1 off | Software that only speaks the old protocols stops connecting, from the next reboot |
 | SMB signing required | SMB connections that can't sign are refused, including older NAS backup repositories |
 | SMBv1 and PowerShell 2.0 removed | Anything still using them stops working |
 | BIOS workload profile | Power and processor settings change at the next reboot |
-| VMQ on | The switch NICs restart, so VMs and RDP lose network for a few seconds. It is applied last; use the iLO remote console |
+| VMQ on | The switch NICs restart, so VMs and RDP lose network for a few seconds. It is applied last; use the iLO remote console. Say no if VMQ was turned off on purpose (some Broadcom 1GbE NICs) |
 
 → **VM start and stop:** only VMs that differ are changed. A start delay the customer has already set (a staggered start order, for example) is kept; only VMs with no delay get the default. A running VM's stop action can't be changed, so it's reported to set at the VM's next shutdown.
 
@@ -376,7 +379,7 @@ Every phase is safe to re-run. To repeat a single step, run that phase by name, 
 | Admin: stops at the built-in Administrator | Log off, log on as the new account; the script carries on |
 | Report: still on workshop DHCP | Run `-Phase Network` on site |
 | Report: remote UAC warning on a workgroup host | Run `-Phase Identity` |
-| Lite: stops with "failover cluster node" | Use the Hyper-V cluster standard; its Baseline drains the node first |
+| Lite: stops with "Failover Clustering is installed" | Use the Hyper-V cluster standard; its Baseline drains the node first |
 | Lite: "Disk chain" warning | The VM runs on .avhdx files with no checkpoint, usually after a failed backup merge. Check the backup job and merge the chain in a maintenance window |
 
 ## Reference

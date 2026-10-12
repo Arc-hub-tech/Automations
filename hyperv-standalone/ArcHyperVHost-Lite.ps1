@@ -11,6 +11,9 @@
    - it NEVER reboots - anything that needs one is listed for a maintenance window;
    - anything that can interrupt service is asked for on its own, with the risk stated.
 
+ Tested on Windows Server 2025. Older versions (2016-2022) are untested - the
+ one-liner forces TLS 1.2 so the download works on them; run Check first.
+
  Not for failover cluster nodes: use hyperv-cluster\ArcHyperVCluster.ps1 (its
  Baseline drains the node first). For a full on-site build (static IP, domain,
  EDR, new local admin) use ArcHyperVHost-Site.ps1.
@@ -20,7 +23,7 @@
     it is needed) restarts the switch adapters, which drops RDP for a few seconds.
  2. DOWNLOAD-THEN-RUN (single line). Check is read-only:
 
-       $p="$env:SystemDrive\ArcLogs\HyperVHost\ArcHyperVHost-Lite.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-standalone/ArcHyperVHost-Lite.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Check
+       [Net.ServicePointManager]::SecurityProtocol='Tls12'; $p="$env:SystemDrive\ArcLogs\HyperVHost\ArcHyperVHost-Lite.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-standalone/ArcHyperVHost-Lite.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Check
 
     OR from a USB stick:
 
@@ -909,8 +912,12 @@ function Get-ArcVssWriters {
 # ---------------------------------------------------------------------------
 
 function Assert-LiteHost {
-    $clus = Get-Service ClusSvc -ErrorAction SilentlyContinue
-    if ($clus -and $clus.Status -eq 'Running') { throw 'This host is a failover cluster node. Use hyperv-cluster\ArcHyperVCluster.ps1 instead - its Baseline drains the node before changing anything.' }
+    # The feature, not just a running ClusSvc: a node down for maintenance still needs the cluster
+    # firewall rules and the drain. A standalone host has no reason to have it.
+    $fc = Get-WindowsFeature Failover-Clustering -ErrorAction SilentlyContinue
+    if ($fc -and $fc.Installed) { throw 'Failover Clustering is installed - this is (or was) a cluster node. Use hyperv-cluster\ArcHyperVCluster.ps1 instead - its Baseline drains the node before changing anything.' }
+    $os = Get-CimInstance Win32_OperatingSystem
+    if ([int]$os.BuildNumber -lt 26100) { Write-Warning "Tested on Windows Server 2025 only - this is $($os.Caption). Run Check first and read the plan carefully." }
     $hv = Get-WindowsFeature Hyper-V -ErrorAction SilentlyContinue
     if (-not $hv -or -not $hv.Installed) { throw 'The Hyper-V role is not installed. This script is for hosts that are already built - use ArcHyperVHost-Workshop.ps1 for a new build.' }
     if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) { throw 'The Hyper-V PowerShell module is missing (Install-WindowsFeature Hyper-V-PowerShell).' }
@@ -928,7 +935,9 @@ function Assert-LiteHost {
 # Listed in the order they are asked; VMQ is also applied last.
 $LiteRiskGroups = @(
     @{ Key = 'Firewall'; Match = '^Sec\.Firewall\.'; Title = 'Turn the Windows Firewall on'
-       Risk = 'The Hyper-V, WinRM, file sharing, WMI and Remote Desktop rules are enabled first, but any other inbound traffic is blocked from then on: Veeam data movers, the UPS agent, SNMP, monitoring, agents on custom ports. Check what connects to this host first.' }
+       Risk = 'The Hyper-V, WinRM, file sharing, WMI and Remote Desktop rules are enabled first, but any other inbound traffic is blocked from then on: Hyper-V Replica listeners (their own rule groups), Veeam data movers, the UPS agent, SNMP, monitoring, agents on custom ports. Check what connects to this host first.' }
+    @{ Key = 'Uac'; Match = '^Sec\.UAC\.EnableLUA$'; Title = 'UAC turned back on'
+       Risk = 'UAC is off on this host today. From the next reboot, remote UAC filtering applies again: on a workgroup host without LocalAccountTokenFilterPolicy = 1, Veeam and remote Hyper-V Manager using a local admin account get access denied (ArcHyperVHost-Site.ps1 -Phase Identity sets it). Tools that expect to run elevated without a prompt may also break.' }
     @{ Key = 'Ntlm'; Match = '^Sec\.LmCompatibilityLevel$'; Title = 'NTLMv2 only'
        Risk = 'Devices or old software that authenticate with LM or NTLMv1 (old NAS boxes, scanners, legacy agents) are refused.' }
     @{ Key = 'Tls'; Match = '^Sec\.Tls\.'; Title = 'SSL 3.0, TLS 1.0 and TLS 1.1 off'
@@ -940,7 +949,7 @@ $LiteRiskGroups = @(
     @{ Key = 'Bios'; Match = '^HPE\.'; Title = 'BIOS workload profile'
        Risk = 'Changes the BIOS power and processor settings at the next reboot (through an iLO session).' }
     @{ Key = 'Vmq'; Match = '^Opt\.VMQ$'; Title = 'VMQ on the switch adapters'
-       Risk = 'Each switch adapter restarts: VM and management networking drop for a few seconds, and an RDP or remote PowerShell session may drop. Applied last. Prefer the console or the iLO remote console.' }
+       Risk = 'Each switch adapter restarts: VM and management networking drop for a few seconds, and an RDP or remote PowerShell session may drop. Applied last. Prefer the console or the iLO remote console. If VMQ was turned off deliberately (e.g. the known problems with some Broadcom 1GbE NICs), say no.' }
 )
 
 # Defender's role auto-exclusions and the VM folders (Set-ArcDefenderHyperVExclusions), as a plan item.
@@ -1263,7 +1272,8 @@ function Invoke-LiteReport {
     if ($builtin -and $builtin.Enabled) { Add-Result WARN 'Built-in Administrator' 'Enabled - the standard disables it (ArcHyperVHost-Site.ps1 -Phase Admin creates a named local admin first)' } else { Add-Result PASS 'Built-in Administrator' 'Disabled' }
     if (-not $cs.PartOfDomain) {
         $filter = (Get-ItemProperty $Sys -Name LocalAccountTokenFilterPolicy -ErrorAction SilentlyContinue).LocalAccountTokenFilterPolicy
-        Add-Result INFO 'Remote UAC (workgroup)' $(if ($filter -eq 1) { 'Off for local accounts - the local admin password must be unique to this host' } else { 'On - Veeam and remote Hyper-V Manager with a local account are refused (ArcHyperVHost-Site.ps1 -Phase Identity sets the Arc standard)' })
+        if ($filter -eq 1) { Add-Result INFO 'Remote UAC (workgroup)' 'Off for local accounts - the local admin password must be unique to this host' }
+        else { Add-Result WARN 'Remote UAC (workgroup)' 'On (or will be once UAC is on) - Veeam and remote Hyper-V Manager with a local account are refused. ArcHyperVHost-Site.ps1 -Phase Identity sets the Arc standard.' }
     }
     $secRows = [ordered]@{
         'EDR'                    = $(if ($edr) { $edr.Product } else { 'None' })
@@ -1286,6 +1296,14 @@ function Invoke-LiteReport {
         $r = @(Get-NetFirewallRule -DisplayGroup $g -Direction Inbound -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq 'True' })
         if ($r) { Add-Result PASS "Firewall: $g" 'Inbound rules enabled (backup proxy access)' } else { Add-Result WARN "Firewall: $g" 'Inbound rules not enabled - Veeam needs them to deploy its components' }
     }
+    # Hyper-V Replica listeners have their own rule groups (not in the baseline's set). Resource names: language independent.
+    $rs = Get-VMReplicationServer -ErrorAction SilentlyContinue
+    $repl = @(Get-VMReplication -ErrorAction SilentlyContinue)
+    if ($rs.ReplicationEnabled) {
+        $open = @('@%systemroot%\system32\vmms.exe,-251', '@%systemroot%\system32\vmms.exe,-253' | ForEach-Object { Get-NetFirewallRule -Group $_ -ErrorAction SilentlyContinue } | Where-Object Enabled -eq 'True')
+        if ($open) { Add-Result PASS 'Hyper-V Replica' "Replica server, listener rules enabled ($(($open.DisplayName) -join ', '))" }
+        else { Add-Result WARN 'Hyper-V Replica' 'This host is a Replica server, but the Hyper-V Replica HTTP/HTTPS listener firewall rules are off - inbound replication fails while the firewall is on' }
+    } elseif ($repl) { Add-Result INFO 'Hyper-V Replica' "$($repl.Count) replicated VM(s): $(($repl | ForEach-Object { "$($_.VMName) ($($_.Mode), $($_.Health))" }) -join ', ')" }
     $veeam = @(Get-Service -ErrorAction SilentlyContinue | Where-Object DisplayName -like 'Veeam*')
     Add-Result INFO 'Veeam components' $(if ($veeam) { ($veeam.DisplayName -join ', ') } else { 'None found' })
     $ups = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'PowerChute|APC |Eaton|Intelligent Power|UPS|Network Shutdown|Vertiv|CyberPower' })

@@ -25,7 +25,7 @@ $p="$env:SystemDrive\ArcLogs\HyperVHost\ArcHyperVHost-Site.ps1"; md (Split-Path 
 ```
 
 ```powershell
-$p="$env:SystemDrive\ArcLogs\HyperVHost\ArcHyperVHost-Lite.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-standalone/ArcHyperVHost-Lite.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Check
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; $p="$env:SystemDrive\ArcLogs\HyperVHost\ArcHyperVHost-Lite.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/hyperv-standalone/ArcHyperVHost-Lite.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p -Phase Check
 ```
 
 **The pen drive (recommended):** one stick carries both scripts and the HPE media for every ProLiant generation. Format it **NTFS or exFAT**, because SPP ISOs are bigger than FAT32's 4 GB limit.
@@ -133,7 +133,9 @@ The HTML is self-contained, so it opens offline. It's **deliberately unbranded**
 
 ## Lite: `ArcHyperVHost-Lite.ps1`
 
-For a host that is **already built and in service** (Hyper-V role in, SPP done, network and VMs running) that only needs the security and Hyper-V optimisation standard. It applies the same standard as `Baseline`, from the same shared code, and adds Defender's Hyper-V exclusions and the VM start/stop settings. It never touches the network, domain membership, EDR or accounts, and **it never reboots**. It stops on a failover cluster node (use `hyperv-cluster/`, whose Baseline drains the node first) and on a host without the Hyper-V role.
+For a host that is **already built and in service** (Hyper-V role in, SPP done, network and VMs running) that only needs the security and Hyper-V optimisation standard. It applies the same standard as `Baseline`, from the same shared code, and adds Defender's Hyper-V exclusions and the VM start/stop settings. It never touches the network, domain membership, EDR or accounts, and **it never reboots**. It stops when Failover Clustering is installed (use `hyperv-cluster/`, whose Baseline drains the node first) and on a host without the Hyper-V role.
+
+**Tested on WS2025 only.** Existing customer hosts may run 2016-2022; those are untested, and the script warns. Its one-liner forces TLS 1.2 so the download works on older builds. Run `Check` first there and read the plan.
 
 | Phase | What it does |
 |---|---|
@@ -144,13 +146,14 @@ The changes that are asked for separately:
 
 | Change | Risk on a live host |
 |---|---|
-| Firewall profile on | Inbound traffic outside the Hyper-V, WinRM, file sharing, WMI and RDP rules is blocked: Veeam data movers, UPS agent, SNMP, monitoring |
+| Firewall profile on | Inbound traffic outside the Hyper-V, WinRM, file sharing, WMI and RDP rules is blocked: Hyper-V Replica listeners (their own rule groups), Veeam data movers, UPS agent, SNMP, monitoring |
+| UAC turned back on | From the reboot, remote UAC filtering applies again. On a workgroup host without `LocalAccountTokenFilterPolicy = 1`, Veeam and remote Hyper-V Manager with a local admin get access denied |
 | NTLMv2 only | Devices that authenticate with LM or NTLMv1 are refused |
 | SSL 3.0, TLS 1.0 and 1.1 off | Software that only speaks the old protocols stops connecting (from the next reboot) |
 | SMB signing required | SMB connections that can't sign are refused, in both directions; check older NAS backup repositories |
 | SMBv1 and PowerShell 2.0 removed | Anything still using them stops working (finishes at the reboot) |
 | BIOS workload profile | Power and processor settings change at the next reboot (only checked when ilorest is installed) |
-| VMQ on | The switch NICs restart: VMs and RDP lose network for a few seconds. Applied last; use the iLO remote console |
+| VMQ on | The switch NICs restart: VMs and RDP lose network for a few seconds. Applied last; use the iLO remote console. Say no if VMQ was turned off deliberately (some Broadcom 1GbE NICs) |
 
 **VM start and stop on a live host:** only VMs that differ are changed. An automatic start action of `Nothing` becomes `StartIfRunning`. A start delay the customer already set (a staggered DC-first order, for example) is kept; only VMs with no delay get the default (prompted, 120 s). A running VM's stop action can't be changed, so it's reported to set at its next shutdown.
 
@@ -159,6 +162,8 @@ The changes that are asked for separately:
 - VMs running on differencing disks (`.avhdx`) with no checkpoint, which usually means a backup merge failed.
 - VM files on the system drive.
 - An LBFO team or a single NIC under the switch.
+- A Hyper-V Replica server whose listener firewall rules are off.
+- Remote UAC still on for local accounts on a workgroup host (WARN).
 - Windows updates more than 45 days old.
 - A reboot these scripts asked for that hasn't happened yet.
 

@@ -135,6 +135,8 @@ The HTML is self-contained, so it opens offline. It's **deliberately unbranded**
 
 For a host that is **already built and in service** (Hyper-V role in, SPP done, network and VMs running) that only needs the security and Hyper-V optimisation standard. It applies the same standard as `Baseline`, from the same shared code, and adds an endpoint protection step, Defender's Hyper-V exclusions and the VM start/stop settings. It never touches the network, domain membership or accounts, never installs an EDR, and **it never reboots**. It stops when Failover Clustering is installed (use `hyperv-cluster/`, whose Baseline drains the node first) and on a host without the Hyper-V role.
 
+**It needs only its own script file.** There's no pen drive, SPP, iLOrest or other HPE media to bring, and it doesn't update firmware or drivers (bring an out-of-date host's SPP up separately). Run the one-liner, or with no internet access, copy `ArcHyperVHost-Lite.ps1` to the host (USB stick, RDP clipboard, a file share) and run it from there. If ilorest is already installed, the BIOS workload profile is checked; if not, that check is skipped and nothing is installed.
+
 **Tested on WS2025 only.** Existing customer hosts may run 2016-2022; those are untested, and the script warns. Its one-liner forces TLS 1.2 so the download works on older builds. Run `Check` first there and read the plan.
 
 | Phase | What it does |

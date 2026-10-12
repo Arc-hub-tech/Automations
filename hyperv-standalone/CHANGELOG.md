@@ -6,6 +6,13 @@ All notable changes to `ArcHyperVHost-Workshop.ps1`, `ArcHyperVHost-Site.ps1` an
 
 _Nothing yet. Work in progress goes on the `develop` branch (`-dev` versions, `/develop/` one-liners)._
 
+## [v0.2.1] - 2026-10-12
+
+Documentation-only release: no change to what the scripts do.
+
+### Changed
+- **Docs: the Lite script needs only its own file.** The guide, the README and the script header now say so. No pen drive, SPP, iLOrest or HPE media is needed, and Lite doesn't update firmware or drivers. Without internet access, the one file can be copied to the host and run from there. iLOrest is used only if it's already installed. The guide's pen drive section says the stick is for the Workshop and Site builds.
+
 ## [v0.2.0] - 2026-10-12
 
 First release of the standalone Hyper-V host scripts to `main`: Workshop, Site and Lite. The download one-liners now point at `/main/`.

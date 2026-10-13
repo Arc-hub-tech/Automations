@@ -255,7 +255,8 @@ $Bloat = @(
     "Microsoft.Getstarted"
     "Microsoft.WindowsFeedbackHub"
     "Microsoft.WindowsMaps"
-    "Microsoft.MicrosoftOfficeHub"     # "Get Office" promo tile - not real Office
+    "Microsoft.MicrosoftOfficeHub"     # "Get Office"/"Microsoft 365 Copilot" hub app - not real Office
+    "Microsoft.Copilot"                # Copilot app
     "Microsoft.Todos"
     "Microsoft.PowerAutomateDesktop"
     "Microsoft.SkypeApp"
@@ -368,8 +369,15 @@ if ($NewOutlook -eq 'Block') {
 # ---------------------------------------------------------------
 Write-Host "== Removing common OEM trialware (best effort) ==" -ForegroundColor Cyan
 
+# McAfee and Norton are named consumer products only, not "McAfee*"/"Norton*":
+# a blanket match would also hit a corporate McAfee/Trellix agent or endpoint
+# product on a machine already in service. Trademark symbols are stripped
+# from DisplayName before matching ("McAfee® Total Protection").
 $TrialwarePatterns = @(
-    "McAfee*", "Norton*", "WildTangent*",
+    "McAfee LiveSafe*", "McAfee Total Protection*", "McAfee+*", "McAfee Internet Security*",
+    "McAfee AntiVirus Plus*", "McAfee Security Scan*", "McAfee WebAdvisor*", "McAfee Safe Connect*",
+    "Norton 360*", "Norton Security*", "Norton AntiVirus*", "Norton Internet Security*", "Norton Online Backup*",
+    "WildTangent*",
     "Dell SupportAssist*", "Dell Optimizer*", "Dell Digital Delivery*", "Dell Customer Connect*", "MyDell*",
     "HP Support Assistant*", "HP Documentation*", "HP JumpStart*", "myHP*"
 )
@@ -377,7 +385,7 @@ $TrialwarePatterns = @(
 $uninstallPaths = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
                   'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
 $found = Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue | Where-Object {
-    $name = $_.DisplayName
+    $name = $_.DisplayName -replace '[®™]', ''
     $name -and ($TrialwarePatterns | Where-Object { $name -like $_ })
 }
 

@@ -12,17 +12,17 @@
     Option A - run this local copy of the script:
 
        Set-ExecutionPolicy Bypass -Scope Process -Force
-       .\Debloat-Windows.ps1                        # asks what to do about new Outlook
-       .\Debloat-Windows.ps1 -NewOutlook Block      # or answer up front
+       .\Debloat-Windows.ps1                        # asks about new Outlook, Copilot and Norton
+       .\Debloat-Windows.ps1 -NewOutlook Block -Copilot Keep -Norton Remove   # or answer up front
 
     Option B - pull and run the current develop-branch version directly
     (no clone needed; review the script on GitHub first if unsure):
 
        irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/windows-debloat/Debloat-Windows.ps1 | iex
 
-    To pass -NewOutlook with Option B (irm | iex can't take parameters):
+    To pass the choices with Option B (irm | iex can't take parameters):
 
-       & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/windows-debloat/Debloat-Windows.ps1))) -NewOutlook Block
+       & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/windows-debloat/Debloat-Windows.ps1))) -NewOutlook Block -Copilot Keep
 ================================================================
 
 .SYNOPSIS
@@ -35,11 +35,12 @@
        present on the running OS version is just silently skipped
     2. New Outlook (the Outlook for Windows app - not classic Outlook from
        Microsoft 365 Apps): remove it, remove it and stop it coming back,
-       or keep it - see -NewOutlook
-    3. Best-effort removal of common OEM trialware (McAfee, Norton,
-       WildTangent, Dell/HP promo utilities) via each product's own
-       uninstaller - only relevant on physical OEM hardware, harmlessly
-       finds nothing on a clean VM/enterprise image
+       or keep it - see -NewOutlook. The Copilot apps are removed or kept
+       the same way - see -Copilot
+    3. Best-effort removal of common OEM trialware (McAfee, WildTangent,
+       Dell/HP promo utilities, and Norton only if asked - see -Norton) via
+       each product's own uninstaller - only relevant on physical OEM
+       hardware, harmlessly finds nothing on a clean VM/enterprise image
     4. Disables Start menu/lock screen ads, suggested apps, and other
        consumer content-delivery features (machine-wide policy plus every
        user profile on the machine and the default profile for new users)
@@ -59,6 +60,25 @@
     If omitted on an interactive run, the script asks. Keep does not undo
     an earlier Block - the block settings stay until removed by hand.
 
+.PARAMETER Copilot
+    What to do about the Copilot app (Microsoft.Copilot) and the Microsoft
+    365 Copilot app (Microsoft.MicrosoftOfficeHub, formerly "Office"):
+      Remove - uninstall both for all users and new users (default when
+               the script runs unattended)
+      Keep   - leave both installed, e.g. where the user has a Microsoft
+               365 Copilot licence
+    If omitted on an interactive run, the script asks.
+
+.PARAMETER Norton
+    Norton consumer products (Norton 360, Security, AntiVirus, Internet
+    Security, Online Backup) - usually an OEM trial, but sometimes a
+    subscription the customer pays for, and the two look the same:
+      Remove - uninstall them
+      Keep   - leave them installed (default when the script runs
+               unattended)
+    If omitted on an interactive run, the script asks only when Norton is
+    actually installed.
+
 .NOTES
     Run in an elevated PowerShell session:  Set-ExecutionPolicy Bypass -Scope Process -Force; .\Debloat-Windows.ps1
     Full run is logged to C:\ArcLogs\WindowsDebloat\ (transcript, timestamped per run).
@@ -67,7 +87,7 @@
 #Requires -RunAsAdministrator
 # No [ValidateSet] here: under irm | iex the parameter is never bound, and
 # PowerShell then rejects the empty value against the set and aborts the run.
-param([string]$NewOutlook)
+param([string]$NewOutlook, [string]$Copilot, [string]$Norton)
 
 $ScriptVersion = '1.0.0-dev'
 $ErrorActionPreference = 'Stop'
@@ -80,13 +100,17 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     throw "Debloat-Windows must run in an elevated PowerShell session (Run as Administrator)."
 }
 
-$NewOutlookChoices = 'Remove', 'Block', 'Keep'
-if ($NewOutlook) {
-    if ($NewOutlook -notin $NewOutlookChoices) {
-        throw "-NewOutlook must be one of: $($NewOutlookChoices -join ', ') (got '$NewOutlook')."
-    }
-    $NewOutlook = $NewOutlookChoices | Where-Object { $_ -eq $NewOutlook }   # normalise case for the log
+# Checks a choice parameter and returns it in canonical case for the log
+# ($null if not passed, so the script asks or takes the default later).
+function Resolve-Choice {
+    param([string]$Name, [string]$Value, [string[]]$Choices)
+    if (-not $Value) { return $null }
+    if ($Value -notin $Choices) { throw "-$Name must be one of: $($Choices -join ', ') (got '$Value')." }
+    return $Choices | Where-Object { $_ -eq $Value }
 }
+$NewOutlook = Resolve-Choice -Name NewOutlook -Value $NewOutlook -Choices 'Remove', 'Block', 'Keep'
+$Copilot    = Resolve-Choice -Name Copilot    -Value $Copilot    -Choices 'Remove', 'Keep'
+$Norton     = Resolve-Choice -Name Norton     -Value $Norton     -Choices 'Remove', 'Keep'
 
 # Shared helper - some HKLM keys (especially under \Policies) can have ACLs
 # tightened past what -ErrorAction SilentlyContinue on Set-ItemProperty catches
@@ -200,30 +224,87 @@ trap { try { Stop-Transcript | Out-Null } catch {}; break }
 Write-Host "Debloat-Windows v$ScriptVersion - logging this run to $LogFile" -ForegroundColor DarkGray
 
 # ---------------------------------------------------------------
-# New Outlook choice - settled up front so nobody is asked mid-run.
-# Unattended runs (RMM, SYSTEM, redirected input) never prompt; they
-# take Remove, which is what the script always did before the option.
+# Choices - settled up front so nobody is asked mid-run. A parameter
+# wins; otherwise interactive runs ask and unattended runs (RMM, SYSTEM,
+# redirected input) never prompt and take the default: Remove for new
+# Outlook and Copilot (what the script did before these were options),
+# Keep for Norton (it may be a subscription the customer pays for).
 # ---------------------------------------------------------------
-if (-not $NewOutlook) {
-    $NewOutlook = 'Remove'
-    if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
-        Write-Host ""
-        Write-Host "New Outlook (the Outlook for Windows app - not classic Outlook from Microsoft 365):" -ForegroundColor Cyan
-        Write-Host "  [1] Remove - uninstall it (default)"
-        Write-Host "  [2] Block  - uninstall it and stop it coming back"
-        Write-Host "  [3] Keep   - leave it installed"
-        try {
-            do {
-                $answer = (Read-Host "Choose 1-3 [1]").Trim()
-            } until ($answer -in '', '1', '2', '3')
-            if ($answer) { $NewOutlook = $NewOutlookChoices[[int]$answer - 1] }
-        } catch {
-            Write-Warning "Could not read a choice - using the default (Remove)."
-        }
+$Interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+
+# Numbered menu; the first option is the default (Enter). Returns the
+# option's name, or the default if input can't be read.
+function Read-Choice {
+    param([string]$Title, [string[]]$Options, [string[]]$Descriptions)
+    Write-Host ""
+    Write-Host $Title -ForegroundColor Cyan
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        Write-Host ("  [{0}] {1,-7}- {2}{3}" -f ($i + 1), $Options[$i], $Descriptions[$i], $(if ($i -eq 0) { ' (default)' }))
+    }
+    $valid = @('') + (1..$Options.Count | ForEach-Object { "$_" })
+    try {
+        do { $answer = (Read-Host "Choose 1-$($Options.Count) [1]").Trim() } until ($answer -in $valid)
+    } catch {
+        Write-Warning "Could not read a choice - using the default ($($Options[0]))."
+        $answer = ''
+    }
+    if ($answer) { return $Options[[int]$answer - 1] }
+    return $Options[0]
+}
+
+# Uninstall-registry entries whose name matches any of the patterns.
+# Trademark signs are stripped first (registered and TM - built from char
+# codes to keep this file ASCII, which Windows PowerShell 5.1 needs).
+$uninstallPaths = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                  'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+$TrademarkSigns = "[$([char]0x00AE)$([char]0x2122)]"
+function Get-TrialwareEntry {
+    param([string[]]$Patterns)
+    Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue | Where-Object {
+        $name = $_.DisplayName -replace $TrademarkSigns, ''
+        $name -and ($Patterns | Where-Object { $name -like $_ })
     }
 }
-Write-Host "New Outlook: $NewOutlook" -ForegroundColor DarkGray
 
+# OEM trialware removed in step 3. McAfee is named consumer products only,
+# not "McAfee*": a blanket match would also hit a corporate McAfee/Trellix
+# agent or endpoint product on a machine already in service. Norton is kept
+# separate because it's only removed when asked (-Norton).
+$TrialwarePatterns = @(
+    "McAfee LiveSafe*", "McAfee Total Protection*", "McAfee+*", "McAfee Internet Security*",
+    "McAfee AntiVirus Plus*", "McAfee Security Scan*", "McAfee WebAdvisor*", "McAfee Safe Connect*",
+    "WildTangent*",
+    "Dell SupportAssist*", "Dell Optimizer*", "Dell Digital Delivery*", "Dell Customer Connect*", "MyDell*",
+    "HP Support Assistant*", "HP Documentation*", "HP JumpStart*", "myHP*"
+)
+$NortonPatterns = @("Norton 360*", "Norton Security*", "Norton AntiVirus*", "Norton Internet Security*", "Norton Online Backup*")
+$NortonFound = @(Get-TrialwareEntry -Patterns $NortonPatterns)
+
+if (-not $NewOutlook) {
+    $NewOutlook = 'Remove'
+    if ($Interactive) {
+        $NewOutlook = Read-Choice -Title "New Outlook (the Outlook for Windows app - not classic Outlook from Microsoft 365):" `
+            -Options 'Remove', 'Block', 'Keep' `
+            -Descriptions 'uninstall it', 'uninstall it and stop it coming back', 'leave it installed'
+    }
+}
+if (-not $Copilot) {
+    $Copilot = 'Remove'
+    if ($Interactive) {
+        $Copilot = Read-Choice -Title "Copilot apps (Copilot and Microsoft 365 Copilot) - keep them if the user has a Copilot licence:" `
+            -Options 'Remove', 'Keep' `
+            -Descriptions 'uninstall them', 'leave them installed'
+    }
+}
+if (-not $Norton) {
+    $Norton = 'Keep'
+    if ($NortonFound -and $Interactive) {
+        $Norton = Read-Choice -Title "Norton is installed: $(@($NortonFound.DisplayName) -join ', '). Arc doesn't usually supply it - check it isn't a subscription the customer pays for:" `
+            -Options 'Keep', 'Remove' `
+            -Descriptions 'leave it installed', 'uninstall it'
+    }
+}
+Write-Host "Choices: New Outlook = $NewOutlook, Copilot = $Copilot, Norton = $Norton$(if (-not $NortonFound) { ' (not installed)' })" -ForegroundColor DarkGray
 # ---------------------------------------------------------------
 # 1. Remove bloatware appx packages - both provisioned (so future new
 #    users on this machine don't get them either) and installed for the
@@ -255,8 +336,6 @@ $Bloat = @(
     "Microsoft.Getstarted"
     "Microsoft.WindowsFeedbackHub"
     "Microsoft.WindowsMaps"
-    "Microsoft.MicrosoftOfficeHub"     # "Get Office"/"Microsoft 365 Copilot" hub app - not real Office
-    "Microsoft.Copilot"                # Copilot app
     "Microsoft.Todos"
     "Microsoft.PowerAutomateDesktop"
     "Microsoft.SkypeApp"
@@ -285,6 +364,10 @@ $Bloat = @(
     "2414FC7A.Viber"
 )
 if ($NewOutlook -ne 'Keep') { $Bloat += "Microsoft.OutlookForWindows" }   # New Outlook - see step 2
+if ($Copilot -eq 'Remove') {
+    $Bloat += "Microsoft.Copilot"               # Copilot app
+    $Bloat += "Microsoft.MicrosoftOfficeHub"    # Microsoft 365 Copilot app (formerly "Office"/"Get Office") - not Office itself
+}
 
 # One provisioned-package query for the whole list: it's slow (several
 # seconds a call), and the old per-app query ran it ~50 times.
@@ -369,26 +452,13 @@ if ($NewOutlook -eq 'Block') {
 # ---------------------------------------------------------------
 Write-Host "== Removing common OEM trialware (best effort) ==" -ForegroundColor Cyan
 
-# McAfee and Norton are named consumer products only, not "McAfee*"/"Norton*":
-# a blanket match would also hit a corporate McAfee/Trellix agent or endpoint
-# product on a machine already in service. Trademark symbols are stripped
-# from DisplayName before matching ("McAfee® Total Protection").
-$TrialwarePatterns = @(
-    "McAfee LiveSafe*", "McAfee Total Protection*", "McAfee+*", "McAfee Internet Security*",
-    "McAfee AntiVirus Plus*", "McAfee Security Scan*", "McAfee WebAdvisor*", "McAfee Safe Connect*",
-    "Norton 360*", "Norton Security*", "Norton AntiVirus*", "Norton Internet Security*", "Norton Online Backup*",
-    "WildTangent*",
-    "Dell SupportAssist*", "Dell Optimizer*", "Dell Digital Delivery*", "Dell Customer Connect*", "MyDell*",
-    "HP Support Assistant*", "HP Documentation*", "HP JumpStart*", "myHP*"
-)
-
-$uninstallPaths = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-                  'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-$found = Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue | Where-Object {
-    $name = $_.DisplayName -replace '[®™]', ''
-    $name -and ($TrialwarePatterns | Where-Object { $name -like $_ })
+$patterns = $TrialwarePatterns
+if ($Norton -eq 'Remove') {
+    $patterns += $NortonPatterns
+} elseif ($NortonFound) {
+    Write-Host "  leaving Norton installed (-Norton Keep): $(@($NortonFound.DisplayName) -join ', ')" -ForegroundColor Yellow
 }
-
+$found = @(Get-TrialwareEntry -Patterns $patterns)
 if (-not $found) {
     Write-Host "  no known OEM trialware detected." -ForegroundColor Green
 } else {

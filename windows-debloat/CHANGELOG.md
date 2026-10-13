@@ -20,6 +20,7 @@ All notable changes to `Debloat-Windows.ps1`.
 - Also turns off News and Interests on the Windows 10 taskbar (`Windows Feeds\EnableFeeds = 0`) alongside the existing Windows 11 Widgets policy; the old comment wrongly said that policy covered Chat.
 - Appx removal queries provisioned packages once instead of once per app (each query takes several seconds), logs deprovisioning, and reports a failed removal as a warning instead of printing "removed" regardless.
 - OEM trialware matching for McAfee and Norton narrowed from `McAfee*`/`Norton*` to named consumer products: McAfee LiveSafe, Total Protection, McAfee+, Internet Security, AntiVirus Plus, Security Scan, WebAdvisor and Safe Connect; Norton 360, Security, AntiVirus, Internet Security and Online Backup (Norton only when `-Norton Remove` is chosen). A corporate McAfee/Trellix agent or endpoint product on an in-service machine is no longer matched. ® and ™ are stripped from product names before matching.
+- Quick Assist (`MicrosoftCorporationII.QuickAssist`, used for remote support) and Media Player (`Microsoft.ZuneMusic`, the Windows 11 default music/video player, not a promo) are no longer removed.
 - Temp/WU cache cleanup removes the top level of each folder recursively instead of listing every nested file first.
 - Option B one-liner in the header points at `develop` while this is in development (back to `main` at release).
 

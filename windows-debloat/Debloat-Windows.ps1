@@ -313,6 +313,9 @@ Write-Host "Choices: New Outlook = $NewOutlook, Copilot = $Copilot, Norton = $No
 # ---------------------------------------------------------------
 Write-Host "== Removing bloatware apps ==" -ForegroundColor Cyan
 
+# Deliberately NOT listed: Microsoft.ZuneMusic (the Windows 11 Media Player -
+# the default music/video player, not a promo) and
+# MicrosoftCorporationII.QuickAssist (used for remote support).
 $Bloat = @(
     # --- Microsoft first-party consumer/promo apps ---
     "Microsoft.549981C3F5F10"          # Cortana
@@ -327,7 +330,6 @@ $Bloat = @(
     "Microsoft.XboxIdentityProvider"
     "Microsoft.XboxSpeechToTextOverlay"
     "Microsoft.YourPhone"              # Phone Link
-    "Microsoft.ZuneMusic"              # Media Player promo
     "Microsoft.ZuneVideo"              # Movies & TV
     "Microsoft.MicrosoftSolitaireCollection"
     "Microsoft.MixedReality.Portal"
@@ -341,7 +343,6 @@ $Bloat = @(
     "Microsoft.SkypeApp"
     "MicrosoftTeams"                   # Old personal/consumer Teams
     "Clipchamp.Clipchamp"
-    "MicrosoftCorporationII.QuickAssist"
     "MicrosoftCorporationII.MicrosoftFamily"
     "Microsoft.WindowsCommunicationsApps"  # Old Mail & Calendar - retired by Microsoft; also a route to new Outlook
     "Microsoft.MicrosoftJournal"

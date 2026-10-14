@@ -248,9 +248,10 @@ function Install-WebRtcRedirector {
     # Remote Desktop WebRTC Redirector Service - enables Teams media optimisation
     # for sessions connected via AVD/W365. Harmless but inert on plain RDS; remove
     # the stage-2 call if these hosts will never be AVD session hosts. Runs in
-    # stage 2 because its service can't start until the RDSH role's reboot is
-    # done. Optional, so a failure warns instead of stopping before the sysprep
-    # prompt.
+    # stage 2 because on a fresh build its service can't start until stage 1's
+    # reboot has happened: the MSI fails with error 1920 and rolls back (seen on
+    # both W11 25H2 and WS2025 RDSH). Optional, so a failure warns instead of
+    # stopping before the sysprep prompt.
     Write-Host "== Installing Remote Desktop WebRTC Redirector ==" -ForegroundColor Cyan
     if (Test-InstalledProduct -NameLike "Remote Desktop WebRTC Redirector Service*") {
         Write-Host "  WebRTC Redirector Service already installed - skipping." -ForegroundColor Green
@@ -286,7 +287,7 @@ Write-Host ("Prep-WS2025-RDSH-Template.ps1  v{0}" -f $ScriptVersion) -Foreground
 # ---------------------------------------------------------------
 # STAGE 2 (-Resume): runs after the stage-1 reboot, relaunched by the one-time
 # scheduled task. Tears down the stage-1->2 handoff, installs the WebRTC
-# redirector (it needs the RDSH role's reboot first), re-sweeps appx, checks
+# redirector (it needs the stage-1 reboot first), re-sweeps appx, checks
 # BitLocker, reminds about Sentinel enrolment, then prompts before generalising.
 # Returns before the stage-1 body below, so install/config steps don't rerun.
 # ---------------------------------------------------------------
@@ -598,8 +599,8 @@ if (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq 'MSTeams')
 
 # Remote Desktop WebRTC Redirector Service: installed in STAGE 2, after the
 # reboot (see Install-WebRtcRedirector). Its MSI starts the RDWebRTCSvc service,
-# which fails here (error 1920, install rolled back) while the RD Session Host
-# role is still waiting for that reboot.
+# which fails here on a fresh build (error 1920, install rolled back) until the
+# stage-1 reboot has happened.
 
 # ---------------------------------------------------------------
 # 7. Common third-party apps via winget - no hardcoded download URLs

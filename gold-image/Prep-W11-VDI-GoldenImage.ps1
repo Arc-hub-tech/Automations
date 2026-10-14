@@ -245,6 +245,30 @@ function Clear-TemplateAutoLogon {
     Remove-ItemProperty -Path $WinlogonKey -Name AutoLogonCount  -ErrorAction SilentlyContinue
 }
 
+function Install-WebRtcRedirector {
+    # Remote Desktop WebRTC Redirector Service - enables Teams media optimisation
+    # for sessions connected via AVD/W365. Harmless but inert on plain RDS; remove
+    # the stage-2 call if these hosts will never be AVD session hosts. Runs in
+    # stage 2 because on a fresh build its service can't start until stage 1's
+    # reboot has happened: the MSI fails with error 1920 and rolls back (seen on
+    # both W11 25H2 and WS2025 RDSH). Optional, so a failure warns instead of
+    # stopping before the sysprep prompt.
+    Write-Host "== Installing Remote Desktop WebRTC Redirector ==" -ForegroundColor Cyan
+    if (Test-InstalledProduct -NameLike "Remote Desktop WebRTC Redirector Service*") {
+        Write-Host "  WebRTC Redirector Service already installed - skipping." -ForegroundColor Green
+        return
+    }
+    try {
+        $rtc = "$Work\webrtc.msi"
+        Invoke-WebRequest -Uri "https://aka.ms/msrdcwebrtcsvc/msi" -OutFile $rtc
+        $code = Start-ProcessWithHeartbeat -FilePath msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Label "WebRTC Redirector install"
+        Write-InstallResult -ExitCode $code -Label "WebRTC Redirector install"
+        Remove-Item $rtc -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Warning "WebRTC Redirector install failed - $($_.Exception.Message). Install it manually before sysprep if these hosts need Teams media optimisation."
+    }
+}
+
 # ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
 # failed image builds. trap closes the transcript and then stops the run
@@ -263,7 +287,8 @@ Write-Host ("Prep-W11-VDI-GoldenImage.ps1  v{0}" -f $ScriptVersion) -ForegroundC
 
 # ---------------------------------------------------------------
 # STAGE 2 (-Resume): runs after the stage-1 reboot, relaunched by the
-# one-time scheduled task. Re-sweep appx (the reboot may have let the
+# one-time scheduled task. Install the WebRTC redirector (it needs the
+# stage-1 reboot first), re-sweep appx (the reboot may have let the
 # Store re-provision packages the stage-1 sweep removed), verify BitLocker
 # is decrypted, then prompt before generalising. Returns before the
 # stage-1 body below, so none of the install/config steps run again.
@@ -277,6 +302,7 @@ if ($Resume) {
     Clear-TemplateAutoLogon
     Write-Host "== Resuming (stage 2) after reboot ==" -ForegroundColor Cyan
 
+    Install-WebRtcRedirector
     Invoke-AppxSweep
 
     $blv = Get-BitLockerVolume -MountPoint C: -ErrorAction SilentlyContinue
@@ -550,17 +576,10 @@ if (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq 'MSTeams')
     Write-InstallResult -ExitCode $code -Label "Teams provisioning"
 }
 
-# Remote Desktop WebRTC Redirector Service - enables Teams media optimisation
-# for sessions connected via AVD/W365. Harmless but inert on plain RDS; remove
-# this block if these hosts will never be AVD session hosts.
-if (Test-InstalledProduct -NameLike "Remote Desktop WebRTC Redirector Service*") {
-    Write-Host "  WebRTC Redirector Service already installed - skipping." -ForegroundColor Green
-} else {
-    $rtc = "$Work\webrtc.msi"
-    Invoke-WebRequest -Uri "https://aka.ms/msrdcwebrtcsvc/msi" -OutFile $rtc
-    $code = Start-ProcessWithHeartbeat -FilePath msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Label "WebRTC Redirector install"
-    Write-InstallResult -ExitCode $code -Label "WebRTC Redirector install"
-}
+# Remote Desktop WebRTC Redirector Service: installed in STAGE 2, after the
+# reboot (see Install-WebRtcRedirector). Its MSI starts the RDWebRTCSvc service,
+# which fails here on a fresh build (error 1920, install rolled back) until the
+# stage-1 reboot has happened.
 
 # ---------------------------------------------------------------
 # 5. Common third-party apps via winget - no hardcoded download URLs
@@ -1193,7 +1212,7 @@ if ($resumeReady) {
     } else {
         Write-Warning "No standing admin, so no auto-logon: after the reboot, log in manually to trigger stage 2."
     }
-    Write-Host "Stage 2 re-sweeps appx, checks BitLocker, then prompts you before syspreping." -ForegroundColor Green
+    Write-Host "Stage 2 installs the WebRTC redirector, re-sweeps appx, checks BitLocker, then prompts you before syspreping." -ForegroundColor Green
     Write-Host "If stage 2 doesn't auto-start, run:  & '$PSCommandPath' -Resume" -ForegroundColor DarkGray
     Write-Host "`nRebooting in 15 seconds to flush pending operations (VMware Tools/locale). Press Ctrl+C to cancel..." -ForegroundColor Yellow
     Stop-Transcript | Out-Null

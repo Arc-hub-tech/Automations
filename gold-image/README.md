@@ -10,7 +10,7 @@ Prep scripts that turn a freshly-installed VM into a sysprep-ready golden image 
 
 Each script is run **once**, in an elevated PowerShell session, on the template VM. It installs the standard app set, debloats, hardens a baseline, prompts for optional domain-join / computer-naming details, and finally writes a sysprep answer file to `C:\Windows\Panther\unattend.xml`. You then sysprep + generalize, and clone.
 
-See `CHANGELOG.md` for version history.
+See `CHANGELOG.md` for version history. The engineer guide (Confluence source, "Gold image template build" in the Data Center space) is `docs/GoldImage-Confluence-Guide.md`.
 
 ## Branching & releases
 

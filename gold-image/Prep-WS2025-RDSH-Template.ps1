@@ -68,7 +68,7 @@ param([switch]$Resume)   # -Resume = stage 2 (post-reboot): re-sweep appx, then 
 # the CHANGELOG (all three gold-image scripts share one version); use a '-dev'
 # suffix (e.g. 1.7.0-dev) while work accumulates under [Unreleased], and drop it
 # when that work is cut to a released version.
-$ScriptVersion = '1.6'
+$ScriptVersion = '1.7'
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
@@ -117,12 +117,22 @@ function Set-RegistryValue {
 function Start-ProcessWithHeartbeat {
     param([string]$FilePath, $ArgumentList, [string]$Label, [int]$HeartbeatSec = 30)
     $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -NoNewWindow -WorkingDirectory $Work
+    $null = $proc.Handle   # cache the handle now, or PS 5.1 returns a null ExitCode
     $elapsed = 0
     while (-not $proc.WaitForExit($HeartbeatSec * 1000)) {
         $elapsed += $HeartbeatSec
         Write-Host "  still running $Label... (${elapsed}s elapsed)"
     }
     return $proc.ExitCode
+}
+
+# Shared helper - report an installer's exit code rather than discarding it, so
+# a failed install shows in the log instead of passing silently. 0 and 3010
+# (success, reboot required) count as success.
+function Write-InstallResult {
+    param($ExitCode, [string]$Label)
+    if ($ExitCode -in 0, 3010) { Write-Host "  $Label succeeded (exit code $ExitCode)." -ForegroundColor Green }
+    else { Write-Warning "$Label failed (exit code $ExitCode) - check it and install manually if needed." }
 }
 
 # Shared helpers for the VDI-optimisation step. Both GUARD against the target
@@ -234,22 +244,50 @@ function Clear-TemplateAutoLogon {
     Remove-ItemProperty -Path $WinlogonKey -Name AutoLogonCount  -ErrorAction SilentlyContinue
 }
 
+function Install-WebRtcRedirector {
+    # Remote Desktop WebRTC Redirector Service - enables Teams media optimisation
+    # for sessions connected via AVD/W365. Harmless but inert on plain RDS; remove
+    # the stage-2 call if these hosts will never be AVD session hosts. Runs in
+    # stage 2 because on a fresh build its service can't start until stage 1's
+    # reboot has happened: the MSI fails with error 1920 and rolls back (seen on
+    # both W11 25H2 and WS2025 RDSH). Optional, so a failure warns instead of
+    # stopping before the sysprep prompt.
+    Write-Host "== Installing Remote Desktop WebRTC Redirector ==" -ForegroundColor Cyan
+    if (Test-InstalledProduct -NameLike "Remote Desktop WebRTC Redirector Service*") {
+        Write-Host "  WebRTC Redirector Service already installed - skipping." -ForegroundColor Green
+        return
+    }
+    try {
+        $rtc = "$Work\webrtc.msi"
+        Invoke-WebRequest -Uri "https://aka.ms/msrdcwebrtcsvc/msi" -OutFile $rtc
+        $code = Start-ProcessWithHeartbeat -FilePath msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Label "WebRTC Redirector install"
+        Write-InstallResult -ExitCode $code -Label "WebRTC Redirector install"
+        Remove-Item $rtc -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Warning "WebRTC Redirector install failed - $($_.Exception.Message). Install it manually before sysprep if these hosts need Teams media optimisation."
+    }
+}
+
 # ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
-# failed image builds. trap ensures the transcript is closed even if
-# a later step throws (ErrorActionPreference is 'Stop' above).
+# failed image builds. trap closes the transcript and then stops the run
+# if a later step throws (ErrorActionPreference is 'Stop' above). The
+# break matters: without it PowerShell carries on after the error with
+# logging off. Steps that are allowed to fail have their own try/catch.
 # ---------------------------------------------------------------
 $LogDir  = "$env:SystemDrive\ArcLogs\GoldImagePrep"
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 $LogFile = Join-Path $LogDir ("Prep-WS2025-RDSH-Template_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 Start-Transcript -Path $LogFile -Append | Out-Null
-trap { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null }
+# (try/catch, not -ErrorAction: "not transcribing" throws regardless of it.)
+trap { try { Stop-Transcript | Out-Null } catch {}; break }
 Write-Host "Logging this run to $LogFile" -ForegroundColor DarkGray
 Write-Host ("Prep-WS2025-RDSH-Template.ps1  v{0}" -f $ScriptVersion) -ForegroundColor Cyan
 
 # ---------------------------------------------------------------
 # STAGE 2 (-Resume): runs after the stage-1 reboot, relaunched by the one-time
-# scheduled task. Tears down the stage-1->2 handoff, re-sweeps appx, checks
+# scheduled task. Tears down the stage-1->2 handoff, installs the WebRTC
+# redirector (it needs the stage-1 reboot first), re-sweeps appx, checks
 # BitLocker, reminds about Sentinel enrolment, then prompts before generalising.
 # Returns before the stage-1 body below, so install/config steps don't rerun.
 # ---------------------------------------------------------------
@@ -258,6 +296,7 @@ if ($Resume) {
     Clear-TemplateAutoLogon
     Write-Host "== Resuming (stage 2) after reboot ==" -ForegroundColor Cyan
 
+    Install-WebRtcRedirector
     Invoke-AppxSweep
 
     if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
@@ -439,7 +478,9 @@ if ($biosMfr -match 'VMware') {
     $toolboxCmd   = "$env:ProgramFiles\VMware\VMware Tools\VMwareToolboxCmd.exe"
     $installedVer = $null
     if (Test-Path $toolboxCmd) {
-        $toolsVer = (& $toolboxCmd -v 2>&1) -join ' '
+        # try/catch: under 'Stop', a native exe's stderr with 2>&1 throws. A failed
+        # version read just leaves $installedVer null, so the install runs.
+        try { $toolsVer = (& $toolboxCmd -v 2>&1) -join ' ' } catch { $toolsVer = "unknown ($($_.Exception.Message))" }
         Write-Host "  VMware Tools currently installed: $toolsVer"
         if ($toolsVer -match '(\d+\.\d+\.\d+)') { $installedVer = [version]$Matches[1] }
     } else {
@@ -467,8 +508,8 @@ if ($biosMfr -match 'VMware') {
             $toolsExe = "$Work\$exeName"
             Invoke-WebRequest -Uri "$toolsIndexUrl$exeName" -OutFile $toolsExe
             Write-Host "  installing $exeName silently (upgrades in place if already installed; reboot before sysprep once this completes)..."
-            Start-ProcessWithHeartbeat -FilePath $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Label "VMware Tools install" | Out-Null
-            Write-Host "  VMware Tools install/upgrade complete." -ForegroundColor Green
+            $code = Start-ProcessWithHeartbeat -FilePath $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Label "VMware Tools install"
+            Write-InstallResult -ExitCode $code -Label "VMware Tools install/upgrade"
         }
     }
 } else {
@@ -522,16 +563,19 @@ if ($existing -and $existing.ProductReleaseIds -match 'O365ProPlusRetail') {
     $odt = "$Work\odt.exe"
     Invoke-WebRequest -Uri "https://officecdn.microsoft.com/pr/wsus/setup.exe" -OutFile $odt
     # ODT's setup.exe doesn't reliably exit - launch it and poll Click-to-Run's
-    # registry instead: VersionToReport is written when the install completes.
+    # registry instead. ProductReleaseIds is the completion signal; VersionToReport
+    # is NOT - it appears partway through the install, and treating it as done let
+    # the stage-1 reboot cut Office off mid-install.
     Start-Process $odt -ArgumentList "/configure `"$Work\office.xml`"" -NoNewWindow -WorkingDirectory $Work
     $deadline = (Get-Date).AddMinutes(40)
     do {
         Start-Sleep -Seconds 20
-        $ver = (Get-ItemProperty -Path $cfg -Name VersionToReport -ErrorAction SilentlyContinue).VersionToReport
+        $c2r = Get-ItemProperty -Path $cfg -ErrorAction SilentlyContinue
         Write-Host "  waiting for Office install to complete..."
-    } until ($ver -or (Get-Date) -gt $deadline)
+    } until ($c2r.ProductReleaseIds -match 'O365ProPlusRetail' -or (Get-Date) -gt $deadline)
+    $ver = if ($c2r.ProductReleaseIds -match 'O365ProPlusRetail') { $c2r.VersionToReport }
     if ($ver) { Write-Host "  Office $ver installed." -ForegroundColor Green }
-    else      { Write-Warning "Timed out after 40 min waiting for Office - verify manually; continuing anyway." }
+    else      { Write-Warning "Timed out after 40 min waiting for Office to finish - the stage-1 reboot may cut it off. Check the Click-to-Run log in C:\Windows\Temp and verify Office before sysprep; continuing anyway." }
     Get-Process -Name odt, setup -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -like "$Work*" } |
         Stop-Process -Force -ErrorAction SilentlyContinue
@@ -549,19 +593,14 @@ if (Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq 'MSTeams')
 } else {
     $boot = "$Work\teamsbootstrapper.exe"
     Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2243204" -OutFile $boot
-    Start-ProcessWithHeartbeat -FilePath $boot -ArgumentList "-p" -Label "Teams bootstrapper" | Out-Null
+    $code = Start-ProcessWithHeartbeat -FilePath $boot -ArgumentList "-p" -Label "Teams bootstrapper"
+    Write-InstallResult -ExitCode $code -Label "Teams provisioning"
 }
 
-# Remote Desktop WebRTC Redirector Service - enables Teams media optimisation
-# for sessions connected via AVD/W365. Harmless but inert on plain RDS; remove
-# this block if these hosts will never be AVD session hosts.
-if (Test-InstalledProduct -NameLike "Remote Desktop WebRTC Redirector Service*") {
-    Write-Host "  WebRTC Redirector Service already installed - skipping." -ForegroundColor Green
-} else {
-    $rtc = "$Work\webrtc.msi"
-    Invoke-WebRequest -Uri "https://aka.ms/msrdcwebrtcsvc/msi" -OutFile $rtc
-    Start-ProcessWithHeartbeat -FilePath msiexec -ArgumentList "/i `"$rtc`" /qn /norestart" -Label "WebRTC Redirector install" | Out-Null
-}
+# Remote Desktop WebRTC Redirector Service: installed in STAGE 2, after the
+# reboot (see Install-WebRtcRedirector). Its MSI starts the RDWebRTCSvc service,
+# which fails here on a fresh build (error 1920, install rolled back) until the
+# stage-1 reboot has happened.
 
 # ---------------------------------------------------------------
 # 7. Common third-party apps via winget - no hardcoded download URLs
@@ -573,7 +612,9 @@ Write-Host "== Installing common apps (7-Zip, SumatraPDF) ==" -ForegroundColor C
 
 function Test-WingetInstalled {
     param([string]$Id)
-    $result = winget list --id $Id -e --accept-source-agreements 2>$null
+    # try/catch: under 'Stop', winget's stderr throws despite 2>$null. Treat
+    # that as "not installed" and let Install-WingetApp attempt the install.
+    try { $result = winget list --id $Id -e --accept-source-agreements 2>$null } catch { return $false }
     return ($LASTEXITCODE -eq 0) -and ($result -match [regex]::Escape($Id))
 }
 
@@ -588,6 +629,7 @@ function Install-WingetApp {
         "install", "--id", $Id, "-e", "--silent",
         "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"
     ) -PassThru -WindowStyle Hidden -WorkingDirectory $Work
+    $null = $proc.Handle   # cache the handle now, or PS 5.1 returns a null ExitCode
 
     $elapsed = 0
     while (-not $proc.HasExited -and $elapsed -lt $TimeoutSec) {
@@ -633,7 +675,8 @@ if (Test-InstalledProduct -NameLike "Microsoft FSLogix Apps*") {
     Expand-Archive $fsl -DestinationPath "$Work\fslogix" -Force
     $fslSetup = Get-ChildItem "$Work\fslogix" -Recurse -Filter "FSLogixAppsSetup.exe" |
         Where-Object FullName -like "*x64*" | Select-Object -First 1
-    Start-ProcessWithHeartbeat -FilePath $fslSetup.FullName -ArgumentList "/install /quiet /norestart" -Label "FSLogix agent install" | Out-Null
+    $code = Start-ProcessWithHeartbeat -FilePath $fslSetup.FullName -ArgumentList "/install /quiet /norestart" -Label "FSLogix agent install"
+    Write-InstallResult -ExitCode $code -Label "FSLogix agent install"
 }
 
 # --- FSLogix profile container config (EDIT ME, then uncomment) ---
@@ -790,8 +833,9 @@ Set-RegistryValue -Path $rdp -Name "MinEncryptionLevel" -Value 3
 # Local account lockout policy (matters until domain GPO applies)
 net accounts /lockoutthreshold:10 /lockoutduration:15 /lockoutwindow:15 | Out-Null
 
-# Guest account disabled
-net user Guest /active:no 2>$null | Out-Null
+# Guest account disabled. try/catch: under 'Stop', net.exe's stderr (Guest
+# renamed or missing) throws despite 2>$null - note it and carry on.
+try { net user Guest /active:no 2>$null | Out-Null } catch { Write-Host "  no account named Guest - skipping." }
 
 # ---------------------------------------------------------------
 # VDI/RDSH performance optimisations - the OS-level tuning the vendor optimisers
@@ -1145,7 +1189,7 @@ if ($resumeReady) {
     } else {
         Write-Warning "No standing admin, so no auto-logon: after the reboot, log in manually to trigger stage 2."
     }
-    Write-Host "Stage 2 re-sweeps appx, checks BitLocker, reminds you to enrol Sentinel + verify Office/Teams, then prompts before syspreping." -ForegroundColor Green
+    Write-Host "Stage 2 installs the WebRTC redirector, re-sweeps appx, checks BitLocker, reminds you to enrol Sentinel + verify Office/Teams, then prompts before syspreping." -ForegroundColor Green
     Write-Host "If stage 2 doesn't auto-start, run:  & '$PSCommandPath' -Resume" -ForegroundColor DarkGray
     Write-Host "`nRebooting in 15 seconds (required for the RDSH role + Defender removal). Press Ctrl+C to cancel..." -ForegroundColor Yellow
     Stop-Transcript | Out-Null

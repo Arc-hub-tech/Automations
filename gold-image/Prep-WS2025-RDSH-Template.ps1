@@ -1,11 +1,14 @@
 <#
+.DESCRIPTION
 ================================================================
  BEFORE YOU RUN THIS SCRIPT
 ================================================================
- 1. Log in to this image as the persistent/standing local admin
+ 1. Start from a fresh Windows Server install (Desktop Experience) on
+    the template VM and log in as the persistent/standing local admin
     account you want the image to keep (e.g. XXXAdmin) - NOT the
-    built-in Administrator. This is the account the script adopts
-    as the standing admin and bakes into the image.
+    built-in Administrator, and not a domain account. This is the
+    account the script adopts as the standing admin and bakes into the
+    image.
  2. Open an elevated PowerShell prompt (Run as Administrator) on the
     image and DOWNLOAD-THEN-RUN the script. Paste this as a SINGLE line
     (multi-line paste breaks in the console) - it saves the script next
@@ -13,60 +16,76 @@
 
        $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-WS2025-RDSH-Template.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/gold-image/Prep-WS2025-RDSH-Template.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p
 
-    Why download-then-run (not `irm | iex`): this is a two-stage build -
-    stage 1 installs/configures then REBOOTS (required for the RDSH role +
-    Defender removal); stage 2 resumes automatically at your next logon,
-    re-sweeps appx, reminds you to enrol Sentinel + verify Office/Teams, and
-    prompts before syspreping. The reboot/resume needs a real script file on
-    disk to relaunch, which a piped `irm | iex` run does not have.
+    Why download-then-run (not `irm | iex`): this is a two-stage build.
+    Stage 1 installs/configures, sets a one-shot auto-logon, then REBOOTS
+    by itself (also required for the RDSH role + Defender removal). The VM
+    logs back in automatically and stage 2 starts on its own: it installs
+    the Remote Desktop WebRTC redirector (which can't install before that
+    reboot), re-sweeps appx, reminds you to enrol Sentinel + verify
+    Office/Teams, and prompts before syspreping. The reboot/resume needs a
+    real script file on disk to relaunch, which a piped `irm | iex` run
+    does not have.
     (A local copy works too: just run `.\Prep-WS2025-RDSH-Template.ps1`.)
     A piped `irm | iex` run still works but cannot auto-reboot/resume - it
     falls back to telling you to reboot and re-run with -Resume.
 
- 3. Early on, the script will prompt you to set a password for the
-    standing admin account - note it down, you'll need it for console
-    access until LAPS rotates it away post-deploy.
+ 3. Early on, the script prompts for a password for the standing admin
+    account - note it down, you'll need it for console access until LAPS
+    rotates it away post-deploy. It then asks whether clones should join a
+    domain (domain, OU - checked against AD - and join account) and for a
+    computer-name prefix (up to 8 characters).
 ================================================================
 
 .SYNOPSIS
-    Windows Server 2025 multi-session (RD Session Host) template prep.
-    Run once as Administrator, reboot, verify, then sysprep/clone.
-    1. Prompts for (optional) domain join details and a computer-name prefix, applied
+    Windows Server 2025 multi-session (RD Session Host) template prep - run once on
+    the template VM; it reboots itself between the two stages and prompts before sysprep.
+    Stage 1:
+    1. Adopts the logged-in local admin as the standing admin; disables the
+       built-in Administrator
+    2. Prompts for (optional) domain join details and a computer-name prefix, applied
        on each clone's own first boot rather than baked as one static value
-    2. Installs the RD Session Host role
-    3. Detects VMware platform (via BIOS/SMBIOS) and installs/upgrades VMware Tools if out of date
-    4. Removes Windows Defender (Sentinel EDR is the AV/EDR on these hosts)
-    5. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing - mandatory on RDSH)
-    6. Installs new Teams machine-wide (VDI-optimised)
-    7. Installs common apps (7-Zip, SumatraPDF) via winget
-    8. Installs FSLogix agent (profile container config left as placeholders)
-    9. Sweeps unprovisioned appx packages (sysprep blockers)
-    10. Ensures BitLocker is off and stays off on clones
-    11. Sets UK regional/time settings
-    12. Applies CE+/ISO 27001 baseline hardening
-    13. Session-host QoL: no Server Manager at logon, temp/WU cache cleared
-    14. Writes the sysprep unattend.xml
+    3. Installs the RD Session Host role
+    4. Detects VMware platform (via BIOS/SMBIOS) and installs/upgrades VMware Tools if out of date
+    5. Removes Windows Defender (Sentinel EDR is the AV/EDR on these hosts)
+    6. Installs Microsoft 365 Apps (64-bit, Monthly Enterprise, Shared Computer Licensing - mandatory on RDSH)
+    7. Installs new Teams machine-wide (VDI-optimised)
+    8. Installs common apps (7-Zip, SumatraPDF) via winget
+    9. Installs FSLogix agent (profile container config left as placeholders)
+    10. Sweeps unprovisioned appx packages (sysprep blockers)
+    11. Ensures BitLocker is off and stays off on clones
+    12. Sets UK regional/time settings
+    13. Applies CE+/ISO 27001 baseline hardening
+    14. Applies VDI/RDSH performance optimisations (incl. default-profile UI settings)
+    15. Session-host QoL: no Server Manager at logon, temp/WU cache cleared
+    16. Writes the sysprep unattend.xml, then reboots into stage 2
+    Stage 2 (-Resume, started automatically after the reboot):
+    17. Installs the Remote Desktop WebRTC redirector
+    18. Re-sweeps appx, checks BitLocker, reminds you to enrol Sentinel + verify
+        Office/Teams, then prompts before sysprep /generalize
 
 .NOTES
     Run elevated:  Set-ExecutionPolicy Bypass -Scope Process -Force; .\Prep-WS2025-RDSH-Template.ps1
-    A REBOOT IS REQUIRED after this script (RDSH role + Defender removal) before validating and sysprepping.
     Windows Defender is fully removed, not just disabled - there is NO AV on the box until
     Sentinel is installed and enrolled. Deploy/enrol Sentinel immediately after sysprep/clone,
     before the host goes into service.
-    Full run is logged to C:\ArcLogs\GoldImagePrep\ (transcript, timestamped per run).
-    App installs use winget so they always pull the current published version - no
-    hardcoded download URLs to go stale.
+    Each stage is logged to C:\ArcLogs\GoldImagePrep\ (transcript, timestamped per run).
+    If a step fails, the script stops, closes the log and shows the error. Fix the
+    cause and run it again - work already done is skipped.
+    7-Zip and SumatraPDF install via winget so they always pull the current published
+    version; Office, Teams, WebRTC and FSLogix come from Microsoft's evergreen links.
     RDS licensing mode/server is intentionally NOT set here - do it via GPO on the clones,
-    or uncomment the registry block at the bottom.
+    or uncomment the registry block in the session-host tweaks section.
+    Engineer guide: gold-image/docs/GoldImage-Confluence-Guide.md (Confluence:
+    "Gold image template build").
 #>
 
 #Requires -RunAsAdministrator
-param([switch]$Resume)   # -Resume = stage 2 (post-reboot): re-sweep appx, then prompt + sysprep
+param([switch]$Resume)   # -Resume = stage 2 (post-reboot): WebRTC redirector, re-sweep appx, then prompt + sysprep
 
 # Version of this script, surfaced in the run banner/transcript so a build log
 # unambiguously records which revision produced an image. Bump in lockstep with
 # the CHANGELOG (all three gold-image scripts share one version); use a '-dev'
-# suffix (e.g. 1.7.0-dev) while work accumulates under [Unreleased], and drop it
+# suffix (e.g. 1.8.0-dev) while work accumulates under [Unreleased], and drop it
 # when that work is cut to a released version.
 $ScriptVersion = '1.8.0-dev'
 

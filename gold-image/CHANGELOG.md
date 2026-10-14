@@ -6,6 +6,16 @@ All notable changes to `Prep-W11-VDI-GoldenImage.ps1`, `Prep-WS2025-RDSH-Templat
 
 _Work in progress on the `develop` branch. `$ScriptVersion` is `1.8.0-dev` here; the download one-liners point at `/develop/`. On the v1.8 release cut these revert to `/main/` and `$ScriptVersion` drops to `1.8`._
 
+### Changed
+- **Script header help brought up to date with v1.7 (all three scripts).** The comment-based headers still described the pre-v1.4 flow ("reboot, verify, then sysprep", "a reboot is required after this script", stage 2 resuming "at your next logon"). The step lists also covered only part of what each script does: W11 listed 7 of its steps and left out FSLogix, BitLocker, hardening, tuning and the answer file. The headers now give:
+  - the full stage-1 step list in run order, plus stage 2 (WebRTC redirector on W11 and RDSH, appx re-sweep, BitLocker check, Sentinel reminder, sysprep prompt);
+  - the automatic reboot and auto-logon into stage 2;
+  - the domain-join and prefix questions;
+  - the stop-on-error behaviour, and that only 7-Zip and SumatraPDF come from winget;
+  - the correct location of the RDS licensing block, and a pointer to the engineer guide.
+
+  `Get-Help` now works on the scripts. It never did before: free text (the "BEFORE YOU RUN" banner) came before the first help keyword, so PowerShell ignored the whole block. Each block now starts with `.DESCRIPTION`. Comments only, no behaviour change.
+
 ## [v1.7] - 2026-10-14
 
 **Tested** on Hyper-V lab VMs (Gen2, Default Switch) built fresh from the Windows 11 Enterprise 25H2 and Server 2025 Standard (Desktop Experience) ISOs. For each template the test ran stage 1, then the hands-free reboot and auto-logon into stage 2, then sysprep. The generalised template was then exported and imported as a new VM. Each clone booted with no input, renamed itself (`TST-VDI-*`, `TST-RDS-*`, `TST-SRV-*`) and landed at the sign-in screen. On every clone `unattend.xml`, `ArcDomainJoin.ps1`, the resume task and the template auto-logon were all gone, and the baseline settings held. A forced-failure run also confirmed that the new trap stops the run and closes the log. **Not covered by this test:** the VMware Tools step (Hyper-V, not VMware), the domain-join path (only rename was exercised), and the winget apps (the test harness drives the scripts over PowerShell Direct, where winget isn't available).

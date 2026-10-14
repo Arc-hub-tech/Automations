@@ -134,9 +134,11 @@ If stage 2 hasn't started within two minutes of the automatic sign-in, run it by
 
 → **Remote Desktop WebRTC redirector:** gives Teams media optimisation in Azure Virtual Desktop and Windows 365 sessions. It does nothing on plain Remote Desktop Services, but does no harm.
 
-→ **7-Zip and SumatraPDF:** installed through winget, so they're always the current version. If winget isn't on the image, which is common on Server 2025, the script warns and skips them; install them by hand. An install that hangs is stopped after 5 minutes.
+→ **7-Zip and SumatraPDF:** installed through winget, so they're always the current version. If winget isn't on the image, which is common on Server 2025, the script warns and skips them; install them by hand. An install that hangs is stopped after 5 minutes. Office, Teams, the WebRTC redirector and FSLogix also install the current version, downloaded from Microsoft's own links.
 
 → **FSLogix:** the agent is installed but stays off until profile containers are turned on for the environment, by GPO or registry. That configuration doesn't belong in the image.
+
+→ **RDS licensing (RDSH):** the script doesn't set the Remote Desktop licensing mode or licence server. Set them by GPO on the clones. The alternative is the commented-out registry block in the script's session-host tweaks section.
 
 ### Consumer apps removed (W11)
 

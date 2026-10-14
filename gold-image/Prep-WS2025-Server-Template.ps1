@@ -100,12 +100,22 @@ function Set-RegistryValue {
 function Start-ProcessWithHeartbeat {
     param([string]$FilePath, $ArgumentList, [string]$Label, [int]$HeartbeatSec = 30)
     $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -NoNewWindow -WorkingDirectory $Work
+    $null = $proc.Handle   # cache the handle now, or PS 5.1 returns a null ExitCode
     $elapsed = 0
     while (-not $proc.WaitForExit($HeartbeatSec * 1000)) {
         $elapsed += $HeartbeatSec
         Write-Host "  still running $Label... (${elapsed}s elapsed)"
     }
     return $proc.ExitCode
+}
+
+# Shared helper - report an installer's exit code rather than discarding it, so
+# a failed install shows in the log instead of passing silently. 0 and 3010
+# (success, reboot required) count as success.
+function Write-InstallResult {
+    param($ExitCode, [string]$Label)
+    if ($ExitCode -in 0, 3010) { Write-Host "  $Label succeeded (exit code $ExitCode)." -ForegroundColor Green }
+    else { Write-Warning "$Label failed (exit code $ExitCode) - check it and install manually if needed." }
 }
 
 # Shared helpers for the VDI-optimisation step. Both GUARD against the target
@@ -443,8 +453,8 @@ if ($biosMfr -match 'VMware') {
             $toolsExe = "$Work\$exeName"
             Invoke-WebRequest -Uri "$toolsIndexUrl$exeName" -OutFile $toolsExe
             Write-Host "  installing $exeName silently (upgrades in place if already installed; reboot before sysprep once this completes)..."
-            Start-ProcessWithHeartbeat -FilePath $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Label "VMware Tools install" | Out-Null
-            Write-Host "  VMware Tools install/upgrade complete." -ForegroundColor Green
+            $code = Start-ProcessWithHeartbeat -FilePath $toolsExe -ArgumentList '/S /v"/qn REBOOT=ReallySuppress"' -Label "VMware Tools install"
+            Write-InstallResult -ExitCode $code -Label "VMware Tools install/upgrade"
         }
     }
 } else {

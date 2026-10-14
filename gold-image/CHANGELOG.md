@@ -14,7 +14,13 @@ _Work in progress on the `develop` branch. `$ScriptVersion` is `1.8.0-dev` here;
   - the stop-on-error behaviour, and that only 7-Zip and SumatraPDF come from winget;
   - the correct location of the RDS licensing block, and a pointer to the engineer guide.
 
-  `Get-Help` now works on the scripts. It never did before: free text (the "BEFORE YOU RUN" banner) came before the first help keyword, so PowerShell ignored the whole block. Each block now starts with `.DESCRIPTION`. Comments only, no behaviour change.
+  `Get-Help` now works on the scripts. It never did before: free text (the "BEFORE YOU RUN" banner) came before the first help keyword, so PowerShell ignored the whole block. Each block now starts with `.DESCRIPTION`. Comments only, no behaviour change. `README.md` now matches as well:
+  - the intro describes the two-stage, self-rebooting flow instead of "run once, then sysprep";
+  - a "Before you start" note (fresh install, sign in as the named local admin);
+  - the questions, the stop-on-error behaviour and the RDS licensing note;
+  - a pointer to `Get-Help`;
+  - version examples updated to 1.8;
+  - a stale "see CHANGELOG `[Unreleased]`" reference now points to `[v1.4]`.
 
 ## [v1.7] - 2026-10-14
 

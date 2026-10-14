@@ -8,7 +8,9 @@ Prep scripts that turn a freshly-installed VM into a sysprep-ready golden image 
 | `Prep-WS2025-RDSH-Template.ps1` | Windows Server 2025 RDSH (session hosts) |
 | `Prep-WS2025-Server-Template.ps1` | Windows Server 2025 general server template |
 
-Each script is run **once**, in an elevated PowerShell session, on the template VM. It installs the standard app set, debloats, hardens a baseline, prompts for optional domain-join / computer-naming details, and finally writes a sysprep answer file to `C:\Windows\Panther\unattend.xml`. You then sysprep + generalize, and clone.
+Each script runs on a fresh template VM, in an elevated PowerShell session, in **two stages**. **Stage 1** prompts for the standing-admin password and optional domain-join / computer-naming details, installs the standard app set, debloats, hardens a baseline, tunes performance and writes a sysprep answer file to `C:\Windows\Panther\unattend.xml`, then **reboots itself**. **Stage 2** starts on its own after an automatic sign-in, finishes off and **prompts before running sysprep /generalize**. You then clone the generalised VM. 7-Zip and SumatraPDF come from winget (skipped with a warning if winget isn't on the image); Office, Teams, the WebRTC redirector and FSLogix come from Microsoft's evergreen links.
+
+Each script's full step list, in run order, is in its header: `Get-Help .\Prep-W11-VDI-GoldenImage.ps1 -Full` (from 1.8.0-dev; earlier versions' help block wasn't picked up by `Get-Help`, so read the top of the file instead).
 
 See `CHANGELOG.md` for version history. The engineer guide (Confluence source, "Gold image template build" in the Data Center space) is `docs/GoldImage-Confluence-Guide.md`.
 
@@ -17,13 +19,15 @@ See `CHANGELOG.md` for version history. The engineer guide (Confluence source, "
 The download one-liners below are **live**: whatever sits on the branch they point at is what runs on a template. So the repo uses two branches:
 
 - **`main` — production.** The one-liners here and in each script header fetch from `.../main/...`; `main` is what operators build from. Only validated releases land here, and it is **branch-protected** — changes arrive by pull request, not direct push.
-- **`develop` — work in progress.** On `develop` the same one-liners point at `.../develop/...` and `$ScriptVersion` carries a `-dev` suffix (e.g. `1.7.0-dev`), so a dev build's start-up banner is obviously not production. Do all WIP here (or on short-lived feature branches off it).
+- **`develop` — work in progress.** On `develop` the same one-liners point at `.../develop/...` and `$ScriptVersion` carries a `-dev` suffix (e.g. `1.8.0-dev`), so a dev build's start-up banner is obviously not production. Do all WIP here (or on short-lived feature branches off it).
 
-**Cutting a release:** merge `develop` → `main` via PR, then as part of the cut revert the one-liner URLs to `/main/`, drop the `-dev` suffix from `$ScriptVersion` (e.g. `1.7.0-dev` → `1.7`), move `CHANGELOG` `[Unreleased]` → `[vX.Y] - <date>`, and tag `vX.Y`. All three scripts share one version — bump in lockstep.
+**Cutting a release:** merge `develop` → `main` via PR, then as part of the cut revert the one-liner URLs to `/main/`, drop the `-dev` suffix from `$ScriptVersion` (e.g. `1.8.0-dev` → `1.8`), move `CHANGELOG` `[Unreleased]` → `[vX.Y] - <date>`, and tag `vX.Y`. All three scripts share one version — bump in lockstep.
 
 ## Run order
 
 All three scripts use the same **two-stage, download-then-run** flow.
+
+**Before you start:** begin from a fresh Windows install on the template VM (Server templates: Desktop Experience, not Server Core) and sign in as the local admin account the image should keep (e.g. XXXAdmin), **not** the built-in Administrator and not a domain account. The script adopts that account as the standing admin and disables the built-in Administrator; run as anyone else, it skips the account step. Snapshot/checkpoint the VM first so a failed step is cheap to retry.
 
 1. **Download then run** the prep script on the template VM (elevated) — do *not* pipe it with `irm | iex`, because the auto-reboot needs a script file on disk to resume from. Paste as a **single line** (multi-line paste breaks in the console); it saves the script next to the logs and runs it. Swap the filename for the template you're building:
 
@@ -36,9 +40,9 @@ All three scripts use the same **two-stage, download-then-run** flow.
    ```powershell
    $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p
    ```
-   Note the standing-admin password when prompted. **Stage 1** installs/configures/writes the answer file, sets a temporary one-shot auto-logon, then reboots automatically. The VM **auto-logs-in** and **stage 2** resumes by itself (via a one-time elevated scheduled task): installs the Remote Desktop WebRTC redirector (W11/RDSH - it can't install until after the reboot), re-sweeps appx, checks BitLocker, and **prompts yes/no before syspreping**. Logged to `C:\ArcLogs\GoldImagePrep\`.
+   At the start it asks for the **standing-admin password** (note it down: LAPS rotates it after deployment, but you need it for console access until then), whether clones should **join a domain** (domain, OU and join account; the OU is checked against AD before it's baked in), and a **computer-name prefix** (up to 8 characters; each clone gets a random 6-character suffix at its own first boot). **Stage 1** installs/configures/writes the answer file, sets a temporary one-shot auto-logon, then reboots automatically. The VM **auto-logs-in** and **stage 2** resumes by itself (via a one-time elevated scheduled task): installs the Remote Desktop WebRTC redirector (W11/RDSH - it can't install until after the reboot), re-sweeps appx, checks BitLocker, and **prompts yes/no before syspreping**. Each stage is logged to `C:\ArcLogs\GoldImagePrep\`. If a step fails, the script stops, closes the log and shows the error; fix the cause and run it again (work already done is skipped). Optional steps such as the winget apps and the WebRTC redirector warn and carry on instead.
 
-2. **On RDSH/Server**, stage 2 pauses at a reminder to **install/enrol Sentinel** (Defender is removed on those templates) and — on RDSH — verify Office/Teams, before you answer yes. The prompt waits, so do those in another window first.
+2. **On RDSH/Server**, stage 2 pauses at a reminder to **install/enrol Sentinel** (Defender is removed on those templates) and — on RDSH — verify Office/Teams, before you answer yes. The prompt waits, so do those in another window first. RDS licensing mode/server is **not** set by the RDSH script: set it by GPO on the clones, or uncomment the registry block in the script's session-host tweaks section.
 
 3. **Validate the answer file in WSIM** (below) any time before the stage-2 sysprep prompt.
 
@@ -53,7 +57,7 @@ All three scripts use the same **two-stage, download-then-run** flow.
 
 > Windows could not parse or process unattend answer file [C:\WINDOWS\Panther\unattend.xml] for pass [oobeSystem]. A component or setting specified in the answer file does not exist.
 
-The parser reports **only the first** offending element, so fixing one and re-syspreping can just surface the next. Windows System Image Manager (WSIM) validates the *whole* file against a catalog built from the actual image, listing every problem at once — a 30-second desk-check instead of a multi-cycle guessing game. (This is how the deprecated `SkipUserOOBE`/`SkipMachineOOBE` and `EnableFirstLogonAnimation` elements were found and removed — see CHANGELOG `[Unreleased]`.)
+The parser reports **only the first** offending element, so fixing one and re-syspreping can just surface the next. Windows System Image Manager (WSIM) validates the *whole* file against a catalog built from the actual image, listing every problem at once — a 30-second desk-check instead of a multi-cycle guessing game. (This is how the deprecated `SkipUserOOBE`/`SkipMachineOOBE` and `EnableFirstLogonAnimation` elements were found and removed — see CHANGELOG `[v1.4]`.)
 
 ### One-time setup
 

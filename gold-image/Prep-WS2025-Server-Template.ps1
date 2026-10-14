@@ -219,14 +219,17 @@ function Clear-TemplateAutoLogon {
 
 # ---------------------------------------------------------------
 # Transcript logging - full run output captured for troubleshooting
-# failed image builds. trap ensures the transcript is closed even if
-# a later step throws (ErrorActionPreference is 'Stop' above).
+# failed image builds. trap closes the transcript and then stops the run
+# if a later step throws (ErrorActionPreference is 'Stop' above). The
+# break matters: without it PowerShell carries on after the error with
+# logging off. Steps that are allowed to fail have their own try/catch.
 # ---------------------------------------------------------------
 $LogDir  = "$env:SystemDrive\ArcLogs\GoldImagePrep"
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 $LogFile = Join-Path $LogDir ("Prep-WS2025-Server-Template_{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 Start-Transcript -Path $LogFile -Append | Out-Null
-trap { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null }
+# (try/catch, not -ErrorAction: "not transcribing" throws regardless of it.)
+trap { try { Stop-Transcript | Out-Null } catch {}; break }
 Write-Host "Logging this run to $LogFile" -ForegroundColor DarkGray
 Write-Host ("Prep-WS2025-Server-Template.ps1  v{0}" -f $ScriptVersion) -ForegroundColor Cyan
 
@@ -410,7 +413,9 @@ if ($biosMfr -match 'VMware') {
     $toolboxCmd   = "$env:ProgramFiles\VMware\VMware Tools\VMwareToolboxCmd.exe"
     $installedVer = $null
     if (Test-Path $toolboxCmd) {
-        $toolsVer = (& $toolboxCmd -v 2>&1) -join ' '
+        # try/catch: under 'Stop', a native exe's stderr with 2>&1 throws. A failed
+        # version read just leaves $installedVer null, so the install runs.
+        try { $toolsVer = (& $toolboxCmd -v 2>&1) -join ' ' } catch { $toolsVer = "unknown ($($_.Exception.Message))" }
         Write-Host "  VMware Tools currently installed: $toolsVer"
         if ($toolsVer -match '(\d+\.\d+\.\d+)') { $installedVer = [version]$Matches[1] }
     } else {
@@ -605,8 +610,9 @@ Set-RegistryValue -Path $rdp -Name "MinEncryptionLevel" -Value 3
 # Local account lockout policy (matters until domain GPO applies)
 net accounts /lockoutthreshold:10 /lockoutduration:15 /lockoutwindow:15 | Out-Null
 
-# Guest account disabled
-net user Guest /active:no 2>$null | Out-Null
+# Guest account disabled. try/catch: under 'Stop', net.exe's stderr (Guest
+# renamed or missing) throws despite 2>$null - note it and carry on.
+try { net user Guest /active:no 2>$null | Out-Null } catch { Write-Host "  no account named Guest - skipping." }
 
 # ---------------------------------------------------------------
 # Server VM performance tuning - the infrastructure-level subset of what the VDI

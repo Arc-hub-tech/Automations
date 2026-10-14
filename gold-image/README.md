@@ -36,7 +36,7 @@ All three scripts use the same **two-stage, download-then-run** flow.
    ```powershell
    $p="$env:SystemDrive\ArcLogs\GoldImagePrep\Prep-W11-VDI-GoldenImage.ps1"; md (Split-Path $p) -Force|Out-Null; irm https://raw.githubusercontent.com/Arc-hub-tech/Automations/develop/gold-image/Prep-W11-VDI-GoldenImage.ps1 -OutFile $p; Set-ExecutionPolicy Bypass -Scope Process -Force; & $p
    ```
-   Note the standing-admin password when prompted. **Stage 1** installs/configures/writes the answer file, sets a temporary one-shot auto-logon, then reboots automatically. The VM **auto-logs-in** and **stage 2** resumes by itself (via a one-time elevated scheduled task): re-sweeps appx, checks BitLocker, and **prompts yes/no before syspreping**. Logged to `C:\ArcLogs\GoldImagePrep\`.
+   Note the standing-admin password when prompted. **Stage 1** installs/configures/writes the answer file, sets a temporary one-shot auto-logon, then reboots automatically. The VM **auto-logs-in** and **stage 2** resumes by itself (via a one-time elevated scheduled task): installs the Remote Desktop WebRTC redirector (W11/RDSH - it can't install until after the reboot), re-sweeps appx, checks BitLocker, and **prompts yes/no before syspreping**. Logged to `C:\ArcLogs\GoldImagePrep\`.
 
 2. **On RDSH/Server**, stage 2 pauses at a reminder to **install/enrol Sentinel** (Defender is removed on those templates) and — on RDSH — verify Office/Teams, before you answer yes. The prompt waits, so do those in another window first.
 

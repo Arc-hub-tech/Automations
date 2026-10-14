@@ -68,7 +68,7 @@ param([switch]$Resume)   # -Resume = stage 2 (post-reboot): re-sweep appx, then 
 # the CHANGELOG (all three gold-image scripts share one version); use a '-dev'
 # suffix (e.g. 1.7.0-dev) while work accumulates under [Unreleased], and drop it
 # when that work is cut to a released version.
-$ScriptVersion = '1.7.0-dev'
+$ScriptVersion = '1.8.0-dev'
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'

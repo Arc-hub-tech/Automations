@@ -9,6 +9,18 @@ script versions independently — see its own header comment for its current ver
 _Work in progress on the `develop` branch._
 
 ### Fixed
+- **A server with the Session Host role installed but no sessions was sized as a session host**
+  (`Read-ArcCapacityBuffer.ps1` v1.19).
+  - **The pilot case:** an all-in-one RDS broker (broker, gateway, licensing, web access) has
+    `RDS-RD-Server` installed, but every session lands on separate session hosts. It was given
+    the session-host floors of 8GB / 4 vCPU.
+  - **The fix:** the RDSH role now also needs real use, a p95 of at least 2 active sessions over
+    the window, from the session count the sampler already records every 15 minutes. Admin
+    logons alone stay under the bar.
+  - **What an idle role gets:** the flag `RDSH-IDLE`, and sizing on the host's other roles.
+  - **No session data:** the installed role is trusted as before.
+  - **Screen unchanged:** it has no history to measure use from, so it still reads the installed
+    role.
 - **The Windows Internal Database was counted as SQL Server** (`Read-ArcCapacityBuffer.ps1` v1.18,
   `Get-ArcCapacityScreen.ps1` v1.15).
   - **What WID is:** the cut-down engine Windows installs for the RD Connection Broker and WSUS.

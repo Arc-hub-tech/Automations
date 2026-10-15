@@ -80,6 +80,13 @@
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
 
+    Version : 1.19 -  15/10/2026  (the RDSH role now needs real use: p95 of at least 2
+              active sessions over the window, from the counter the sampler already records.
+              An all-in-one RDS broker with the Session Host role installed but every session
+              on separate hosts read as a session host and got its 8GB / 4 vCPU floors;
+              an installed-but-idle role is now flagged RDSH-IDLE and the host sized on its
+              other roles)
+
     Version : 1.18 -  15/10/2026  (the Windows Internal Database - the RD Connection
               Broker's and WSUS's built-in engine - is no longer counted as SQL Server. It
               put nearly every RD gateway and broker on a 507-device estate into SQL-MINOR
@@ -625,7 +632,7 @@ function Get-SqlEngineFootprint {
 #   deliberate difference is the SQL footprint, which here can draw on 14 days
 #   of sampled Total Server Memory where the Screen only has a live reading.
 function Get-ServerRole {
-    param([double]$AllocatedGB = 0, [double]$SqlSampledGB = 0)
+    param([double]$AllocatedGB = 0, [double]$SqlSampledGB = 0, [double]$SessionP95 = -1)
 
     $flags = New-Object System.Collections.Generic.List[string]
     $role  = 'Generic'
@@ -765,7 +772,23 @@ function Get-ServerRole {
             if ($ts.PSObject.Properties.Name -contains 'TSServerDrainMode') { $isRdsh = $true }
         } catch { }
     }
-    if ($isRdsh) { if ($role -eq 'Generic') { $role = 'RDSH' }; $flags.Add('RDSH') }
+    # Installed isn't the same as used. An all-in-one RDS server (broker,
+    # gateway, licensing, web access) often has the Session Host role
+    # installed with every session landing on separate hosts - the pilot
+    # broker did, and got session-host floors (8GB / 4 vCPU) it doesn't need.
+    # The sampler counts active sessions every 15 minutes, so require real
+    # use: p95 of at least 2 active sessions. An idle role is flagged
+    # RDSH-IDLE (it could be removed) and the host is sized on its other
+    # roles. Admin logons alone stay under the bar; with no session data
+    # (-1), the installed role is trusted as before.
+    if ($isRdsh) {
+        if ($SessionP95 -ge 0 -and $SessionP95 -lt 2) {
+            $flags.Add('RDSH-IDLE')
+        } else {
+            if ($role -eq 'Generic') { $role = 'RDSH' }
+            $flags.Add('RDSH')
+        }
+    }
 
     # File server
     try {
@@ -869,7 +892,10 @@ try {
     $sampledIsWid = ($sampledInst -eq 'MICROSOFT##WID')
     if ($sampledIsWid) { $sqlTotalVals = [double[]]@() }
     $sqlSampledGB = if ($sqlTotalVals.Count) { [math]::Round((Get-Percentile -Values $sqlTotalVals -P 0.95), 2) } else { 0 }
-    $roleInfo   = Get-ServerRole -AllocatedGB $allocatedGB -SqlSampledGB $sqlSampledGB
+    # Active sessions over the window, for the RDSH use test in role detection
+    $sessVals   = Get-NumericColumn -Rows $rows -Column 'ActiveSessions'
+    $sessionP95 = if ($sessVals.Count) { [math]::Round((Get-Percentile -Values $sessVals -P 0.95), 1) } else { -1 }
+    $roleInfo   = Get-ServerRole -AllocatedGB $allocatedGB -SqlSampledGB $sqlSampledGB -SessionP95 $sessionP95
     $role       = $roleInfo.Role
     $flags      = $roleInfo.Flags
     $mysql      = $roleInfo.MySql

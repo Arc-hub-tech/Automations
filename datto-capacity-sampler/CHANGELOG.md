@@ -8,6 +8,47 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Fixed
+- **The Windows Internal Database was counted as SQL Server** (`Read-ArcCapacityBuffer.ps1` v1.18,
+  `Get-ArcCapacityScreen.ps1` v1.15).
+  - **What WID is:** the cut-down engine Windows installs for the RD Connection Broker and WSUS.
+    It runs as `MSSQL$MICROSOFT##WID`, which matched every SQL service and process pattern.
+  - **The effect on a 507-device run:**
+    - nearly every RD gateway and broker was in `SQL-MINOR`, and many carried `SQL-MEM` findings
+      from WID's moving counters, findings nobody could act on;
+    - two gateways were classed as **SQL Server** and excluded from RAM sizing. That's right only
+      if they run a real instance; if it's WID, they were skipped wrongly.
+  - **How WID is handled now:**
+    - It's split out by binary path (`%windir%\WID\Binn`), falling back to which services exist
+      when the path can't be read.
+    - It gets its own `WID` flag, never makes a host `SQL-MINOR` or a SQL role, and produces no
+      SQL findings.
+    - **`WID-LARGE`** at 2GB+ and 25%+ of RAM adds "WID XGB - cap it if WSUS" to `Cap: RAM
+      Detail`, since on a WSUS server WID can grow unchecked and capping it is the known fix.
+    - A real instance on the same host (such as SQL Express for broker HA) is detected exactly as
+      before.
+    - Where the sampler's counters turn out to be WID's, they're set aside rather than analysed as
+      a real instance.
+  - **Tests:** five scenarios through both scripts (WID-only broker, large WSUS WID, Express for
+    HA, real SQL plus WID with WID's counters sampled, unreadable process path). The shared
+    process-split helper is identical in both scripts.
+  - **Still open:** the sampler reads the first SQL counter set it finds, so on a host with both
+    WID and a real instance it can pick WID. Making it prefer the real instance is a separate
+    sampler change; it doesn't touch the buffer format, so nothing resets.
+- **A SQL "squeeze" was reported on hosts with plenty of free memory** (`Read-ArcCapacityBuffer.ps1`
+  v1.17). A 12GB RDS session host with a minor, uncapped SQL instance read `SQL-MEM: target fell to
+  4.4GB from 5.8GB - OS pressure or a lowered cap`, yet never dropped below 37% free. The target
+  movement was real, but an uncapped instance's Target follows free memory, so on a shared host
+  it moves as other workloads come and go, with nothing squeezed. (A mid-window resize was ruled
+  out: the host's buffer held 12GB throughout.) The squeeze finding now needs minimum available
+  memory under 20% of RAM, the same bar as `MEM-PRESSURE`'s fault gate. The real squeeze on the
+  pilot two-instance host (6% minimum free) still fires.
+- **The `FAULTS-IO` reclaim hold implied a reclaim was blocked when none was on offer**
+  (`Read-ArcCapacityBuffer.ps1` v1.17). On that same host the surplus was about 1.3GB, under the 4GB
+  minimum, yet it read "NO RECLAIM - high fault rate … reclaim would shrink the file cache". The
+  hold now applies only once a reclaim would actually be offered, and names it ("NO RECLAIM - 10GB
+  held: …"). A smaller surplus reads the usual `NO CHANGE - under 4GB reclaim`.
+
 ### Changed
 - **URGENT growth is sized to max(p95 × 1.25, peak) rather than peak × 1.25**
   (`Read-ArcCapacityBuffer.ps1` v1.16). Measured on a 507-device run of v1.15. Once the

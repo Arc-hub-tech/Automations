@@ -80,6 +80,22 @@
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
 
+    Version : 1.18 -  15/10/2026  (the Windows Internal Database - the RD Connection
+              Broker's and WSUS's built-in engine - is no longer counted as SQL Server. It
+              put nearly every RD gateway and broker on a 507-device estate into SQL-MINOR
+              with SQL findings attached, and could class a gateway as a SQL server. WID is
+              split out by binary path (%windir%\WID\Binn), gets its own WID flag, and
+              WID-LARGE at 2GB+ and 25%+ of RAM, pointing at the known WSUS fix of capping
+              it. Where the sampler's SQL counters turn out to be WID's, they're set aside
+              rather than analysed as a real instance)
+
+    Version : 1.17 -  15/10/2026  (SQL "target fell" (squeeze) only counts while min
+              available is under 20% of RAM - an uncapped instance's Target follows free
+              memory, so on a shared host it moves with other workloads; a session host
+              that never dropped below 37% free read "OS pressure". The FAULTS-IO reclaim
+              hold now applies only to a reclaim that would actually be offered (past the
+              4GB minimum) and names the GB held; a small surplus reads NO CHANGE)
+
     Version : 1.16 -  09/10/2026  (URGENT growth sized to max(p95 x1.25, peak commit)
               rather than peak x1.25 - the peak always fits, without 25% added on top of
               the worst moment. On a 224-host URGENT run: 1,532GB -> 1,016GB, session hosts
@@ -570,6 +586,37 @@ function Get-MySqlInfo {
     }
 }
 
+# --- SQL engine footprint (kept identical in both scripts) -------------------
+# Splits running sqlservr processes into real SQL Server and the Windows
+# Internal Database (WID). WID is the cut-down engine Windows installs for the
+# RD Connection Broker and WSUS (service MSSQL$MICROSOFT##WID, binary under
+# %windir%\WID\Binn). It matches every SQL service and process pattern, but it
+# isn't a SQL workload anyone sizes or tunes like one: counting it put nearly
+# every RD gateway and broker on a 507-device estate into SQL-MINOR with SQL
+# findings attached, and could class a gateway as a SQL server. Classified by
+# binary path; where the path can't be read, by which services exist.
+# Footprint per process is the larger of working set and private bytes;
+# working set is also returned for the Screen, which measures on it.
+function Get-SqlEngineFootprint {
+    param([bool]$WidService, [bool]$RealSqlService)
+    $r = [ordered]@{ SqlGB = 0.0; SqlWsGB = 0.0; SqlCount = 0; WidGB = 0.0; WidCount = 0 }
+    try {
+        foreach ($p in @(Get-Process -Name 'sqlservr' -ErrorAction SilentlyContinue)) {
+            $path = $null
+            try { $path = $p.Path } catch { }
+            $isWid = if ($path) { $path -like '*\WID\Binn\*' } elseif (-not $RealSqlService) { $WidService } else { $false }
+            $foot  = [math]::Max([double]$p.WorkingSet64, [double]$p.PrivateMemorySize64) / 1GB
+            if ($isWid) {
+                $r.WidGB += $foot; $r.WidCount++
+            } else {
+                $r.SqlGB += $foot; $r.SqlWsGB += [double]$p.WorkingSet64 / 1GB; $r.SqlCount++
+            }
+        }
+    } catch { }
+    foreach ($k in 'SqlGB', 'SqlWsGB', 'WidGB') { $r[$k] = [math]::Round($r[$k], 2) }
+    [PSCustomObject]$r
+}
+
 # ---------------------------------------------------------------------------
 # Role detection
 # ---------------------------------------------------------------------------
@@ -619,21 +666,32 @@ function Get-ServerRole {
     # never missed because the sampler happened to read a small one.
     # Below the bar: SQL-MINOR, sized normally. The SQL attention checks run
     # either way, so an Express database near its limit still surfaces.
-    $isSql = ($svc.ContainsKey('MSSQLSERVER')) -or (& $hasSvc 'MSSQL$*')
+    #
+    # The Windows Internal Database (WID, the RD Connection Broker's and
+    # WSUS's built-in engine) is NOT SQL here - see Get-SqlEngineFootprint. It
+    # gets its own WID flag, plus WID-LARGE when it holds 2GB+ and 25%+ of
+    # RAM: on a WSUS server WID can grow unchecked, and capping it is the
+    # known fix.
+    $widSvc     = $svc.ContainsKey('MSSQL$MICROSOFT##WID')
+    $realSqlSvc = $svc.ContainsKey('MSSQLSERVER') -or
+                  (@($svc.Keys | Where-Object { $_ -like 'MSSQL$*' -and $_ -ne 'MSSQL$MICROSOFT##WID' }).Count -gt 0)
+    $engine     = Get-SqlEngineFootprint -WidService $widSvc -RealSqlService $realSqlSvc
+    $widGB      = $null
+    if ($widSvc -or $engine.WidCount -gt 0) {
+        $widGB = $engine.WidGB
+        $flags.Add('WID')
+        if ($widGB -ge 2 -and ($AllocatedGB -le 0 -or $widGB -ge ($AllocatedGB * 0.25))) { $flags.Add('WID-LARGE') }
+    }
+    $isSql     = $realSqlSvc
+    $liveGB    = 0.0
+    $procCount = 0
     if ($isSql) {
         # Per process, the larger of private bytes and working set: working
         # set alone understates a host that's paging (the pool is partly on
         # disk), private bytes alone understates one using locked pages.
-        $liveGB    = 0.0
-        $procCount = 0
-        try {
-            $sqlProcs = @(Get-Process -Name 'sqlservr' -ErrorAction SilentlyContinue)
-            $procCount = $sqlProcs.Count
-            if ($procCount -gt 0) {
-                $bytes  = ($sqlProcs | ForEach-Object { [math]::Max([double]$_.WorkingSet64, [double]$_.PrivateMemorySize64) } | Measure-Object -Sum).Sum
-                $liveGB = [math]::Round($bytes / 1GB, 2)
-            }
-        } catch { }
+        # WID's processes are already excluded by the helper.
+        $liveGB    = $engine.SqlGB
+        $procCount = $engine.SqlCount
         $sqlGB = [math]::Max($liveGB, $SqlSampledGB)
 
         $sqlIsMaterial = ($sqlGB -ge 2) -and
@@ -731,7 +789,7 @@ function Get-ServerRole {
 
     [PSCustomObject]@{
         Role = $role; Flags = $flags; MySql = $mysql
-        SqlPresent = $isSql; SqlGB = $sqlGB; SqlLiveGB = $liveGB; SqlRunning = $procCount
+        SqlPresent = $isSql; SqlGB = $sqlGB; SqlLiveGB = $liveGB; SqlRunning = $procCount; WidGB = $widGB
     }
 }
 
@@ -803,12 +861,24 @@ try {
     # SQL/MySQL materiality tests, so it runs here rather than before the
     # no-data exit above (which doesn't use it).
     $sqlTotalVals = Get-NumericColumn -Rows $rows -Column 'SqlTotalGB'
+    # The sampler reads the first SQL counter set it resolves, which can be
+    # WID's. Those figures describe WID, not a real instance, so they're set
+    # aside before anything uses them - for materiality here and for every
+    # counter-based SQL finding below.
+    $sampledInst  = Get-SampledSqlInstance
+    $sampledIsWid = ($sampledInst -eq 'MICROSOFT##WID')
+    if ($sampledIsWid) { $sqlTotalVals = [double[]]@() }
     $sqlSampledGB = if ($sqlTotalVals.Count) { [math]::Round((Get-Percentile -Values $sqlTotalVals -P 0.95), 2) } else { 0 }
     $roleInfo   = Get-ServerRole -AllocatedGB $allocatedGB -SqlSampledGB $sqlSampledGB
     $role       = $roleInfo.Role
     $flags      = $roleInfo.Flags
     $mysql      = $roleInfo.MySql
     $sqlPresent = $roleInfo.SqlPresent
+
+    # WID only earns a place in the RAM Detail UDF when it's large enough to
+    # act on (WID-LARGE); otherwise the WID flag and the job output carry it
+    $widGB = $roleInfo.WidGB
+    $widDetailSuffix = if ($flags -contains 'WID-LARGE') { " | WID ${widGB}GB - cap it if WSUS" } else { '' }
 
     $mysqlDetailSuffix = ''
     if ($mysql) {
@@ -850,7 +920,7 @@ try {
     # =======================================================================
     $sqlNote       = ''
     $sqlSizing     = $null   # cap-or-RAM decision, used only under MEM-PRESSURE
-    $sampledInst   = if ($sqlPresent) { Get-SampledSqlInstance } else { $null }
+    if (-not $sqlPresent) { $sampledInst = $null }   # resolved above; only meaningful with real SQL
     $sqlFindings   = New-Object System.Collections.Generic.List[string]
     $sqlTargetVals = Get-NumericColumn -Rows $rows -Column 'SqlTargetGB'
     $pleVals       = Get-NumericColumn -Rows $rows -Column 'SqlPLE'
@@ -859,7 +929,7 @@ try {
     # approaching Express's 10GB limit. @() around the whole if: an if
     # statement unrolls its output, so a single instance would otherwise
     # arrive as a bare object with no usable .Count.
-    $sqlInstances  = @(if ($sqlPresent) { Get-SqlInstanceInfo })
+    $sqlInstances  = @(if ($sqlPresent) { Get-SqlInstanceInfo | Where-Object { $_.Name -ne 'MICROSOFT##WID' } })
     $allExpress    = ($sqlInstances.Count -gt 0) -and (@($sqlInstances | Where-Object { -not $_.IsExpress }).Count -eq 0)
     # Multi-instance means more than one engine actually RUNNING - installed
     # but stopped instances don't compete for memory
@@ -1036,7 +1106,14 @@ try {
             # On a multi-instance host the likeliest squeezer is the other
             # instance, so say so - "OS pressure" alone sent the reader the
             # wrong way on the first real two-instance host.
-            if ($null -ne $targetMax -and $targetP05 -lt ($targetMax * 0.8) -and ($targetMax - $targetP05) -ge 1) {
+            # Only while memory actually got tight (min available under 20% of
+            # RAM, the same bar as MEM-PRESSURE's fault gate): an UNCAPPED
+            # instance's Target follows free memory, so on a shared host it
+            # moves all day as other workloads come and go. A session host
+            # that never dropped below 37% free read "target fell 5.8 -> 4.4GB
+            # - OS pressure" when nothing was squeezing anything.
+            $sqlTight = ($availMin -lt ($allocatedGB * 0.20))
+            if ($sqlTight -and $null -ne $targetMax -and $targetP05 -lt ($targetMax * 0.8) -and ($targetMax - $targetP05) -ge 1) {
                 $suspects = if ($multiSql) { 'another SQL instance, OS pressure or a lowered cap' } else { 'OS pressure or a lowered cap' }
                 $sqlFindings.Add("target fell to ${targetP05}GB from ${targetMax}GB - $suspects")
                 if (-not ($flags -contains 'SQL-MEM')) { $flags.Add('SQL-MEM') }
@@ -1044,7 +1121,10 @@ try {
         }
     }
     elseif ($flags -contains 'SQL') {
-        $sqlNote = 'SQL counters not sampled'
+        # Either no counters at all, or the sampler read WID's counter set
+        # rather than the real instance's - say which, since the second is
+        # a sampler-side issue rather than an absence of data
+        $sqlNote = if ($sampledIsWid) { 'SQL counters sampled are WID''s, not this instance''s - not analysed' } else { 'SQL counters not sampled' }
         if ($multiSql) { $sqlNote += " | $sqlRunning instances hold ${sqlLiveGB}GB" }
     }
 
@@ -1219,7 +1299,7 @@ try {
             $growthVerdict = 'NO CHANGE - SQL counters show no memory concern'
         }
         else {
-            $growthVerdict = 'EXCLUDED (SQLServer) - no SQL counters sampled, size from SQL metrics'
+            $growthVerdict = if ($sampledIsWid) { 'EXCLUDED (SQLServer) - sampled counters are WID''s, size from SQL metrics' } else { 'EXCLUDED (SQLServer) - no SQL counters sampled, size from SQL metrics' }
         }
     }
     elseif ($RamExcludedRoles -contains $role) {
@@ -1300,15 +1380,6 @@ try {
             $ramVerdict = "NO RECLAIM - memory pressure (min avail ${availMin}GB, p95 faults ${faultP95}/s)"
             if ($raw -lt 0) { $ramVerdict += ' - see growth verdict' }
         }
-        elseif ($flags -contains 'FAULTS-IO' -and $raw -gt 0) {
-            # Faults discounted as pressure (memory never got tight), but they
-            # are still real disk reads - typically a file or web server
-            # serving from its file cache. Reclaiming shrinks that cache and
-            # turns cached reads into disk reads, so hold rather than swing
-            # from "URGENT, add RAM" straight to "remove RAM". Suppress rather
-            # than degrade, as with every other guardrail here.
-            $ramVerdict = "NO RECLAIM - high fault rate (p95 ${faultP95}/s) with memory to spare, likely file I/O; reclaim would shrink the file cache"
-        }
         elseif ($raw -gt 0) {
             $reclaimGB = Get-Floor2 -Value $raw
 
@@ -1327,6 +1398,20 @@ try {
                 } else {
                     $ramVerdict = 'NO CHANGE - under 4GB reclaim, not worth a change window'
                 }
+            }
+            elseif ($flags -contains 'FAULTS-IO') {
+                # A reclaim that would actually be offered, on a host whose
+                # faults were discounted as pressure (memory never got tight)
+                # but are still real disk reads - typically a file or web
+                # server serving from its file cache. Reclaiming shrinks that
+                # cache and turns cached reads into disk reads, so hold rather
+                # than swing from "URGENT, add RAM" straight to "remove RAM".
+                # Checked after the minimum-reclaim test, so a host with only a
+                # small, un-actionable surplus reads a plain NO CHANGE instead
+                # of implying a reclaim was blocked.
+                $heldGB     = $reclaimGB
+                $reclaimGB  = 0
+                $ramVerdict = "NO RECLAIM - ${heldGB}GB held: high fault rate (p95 ${faultP95}/s) with memory to spare, likely file I/O; reclaim would shrink the file cache"
             } else {
                 $newAlloc   = [int]($allocatedGB - $reclaimGB)
                 $ramVerdict = "${tag}RECLAIM ${reclaimGB}GB -> ${newAlloc}GB (${basisLabel} ${basisGB}GB x${multiplier})"
@@ -1546,7 +1631,7 @@ try {
     # UDF write-back
     # =======================================================================
     $ramDetail = ('Alloc {0}GB | Commit p50 {1} p95 {2} max {3}GB | MinAvail {4}GB | Faults p95 {5}/s' -f `
-                 $allocatedGB, $commitP50, $commitP95, $commitMax, $availMin, $faultP95) + $dcDetailSuffix + $mysqlDetailSuffix
+                 $allocatedGB, $commitP50, $commitP95, $commitMax, $availMin, $faultP95) + $dcDetailSuffix + $mysqlDetailSuffix + $widDetailSuffix
 
     $cpuDetail = '{0} vCPU | Total p50 {1}% p95 {2}% max {3}% | MaxCore p95 {4}% | Queue p95 {5} max {6}' -f `
                  $vCPU, $cpuTotalP50, $cpuTotalP95, $cpuTotalMax, $maxCoreP95, $queueP95, $queueMax
@@ -1607,6 +1692,7 @@ try {
                 VcpuGrowth      = $vcpuGrowth
                 CpuGrowthVerdict = $cpuGrowthVerdict
                 SqlFootprintGB  = $roleInfo.SqlGB
+                WidGB           = $widGB
                 SqlSampled      = $sampledInst
                 SqlSizing       = $(if ($sqlSizing) { $sqlSizing.Text } else { $null })
                 SqlRunning      = $sqlRunning
@@ -1634,6 +1720,7 @@ try {
     Write-Output "Memory          : $ramDetail"
     Write-Output "Memory verdict  : $ramVerdict"
     Write-Output "Memory growth   : $growthVerdict"
+    if ($null -ne $widGB) { Write-Output "WID             : ${widGB}GB - Windows Internal Database (RD Connection Broker / WSUS), not counted as SQL" }
     if ($sqlNote) { Write-Output "SQL             : $sqlNote" }
     foreach ($inst in $sqlInstances) {
         $mdfText = if ($null -ne $inst.LargestMdfGB) { ", largest data file $($inst.LargestMdfGB)GB" } else { '' }

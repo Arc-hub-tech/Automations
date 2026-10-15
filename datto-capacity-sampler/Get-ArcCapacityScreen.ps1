@@ -48,6 +48,11 @@
               usrMinUptimeHrs  Integer  default 24    Below this, no recommendation
               usrExportPath    String   default ''    Optional UNC for per-device CSV
 
+    Version : 1.15 -  15/10/2026  (the Windows Internal Database - RD Connection Broker /
+              WSUS - is no longer counted as SQL Server: its own WID flag, WID-LARGE when it
+              holds 2GB+ and 25%+ of RAM, and never SQL-MINOR or a SQL role. Kept in step
+              with Component 2)
+
     Version : 1.14 -  09/10/2026  (MySQL buffer pool sanity check, kept identical to
               Component 2: a pool that can't explain mysqld's footprint is reported
               unresolved rather than asserted; also reads the option group named after the
@@ -348,6 +353,37 @@ function Get-MySqlInfo {
 $RamFloor         = @{ DomainController = 4; RDSH = 8; FileServer = 8; SQLServer = 8; MySQL = 8; Exchange = 16; BackupInfra = 8; Generic = 4 }
 $RamExcludedRoles = @('SQLServer', 'MySQL', 'Exchange', 'BackupInfra')
 
+# --- SQL engine footprint (kept identical in both scripts) -------------------
+# Splits running sqlservr processes into real SQL Server and the Windows
+# Internal Database (WID). WID is the cut-down engine Windows installs for the
+# RD Connection Broker and WSUS (service MSSQL$MICROSOFT##WID, binary under
+# %windir%\WID\Binn). It matches every SQL service and process pattern, but it
+# isn't a SQL workload anyone sizes or tunes like one: counting it put nearly
+# every RD gateway and broker on a 507-device estate into SQL-MINOR with SQL
+# findings attached, and could class a gateway as a SQL server. Classified by
+# binary path; where the path can't be read, by which services exist.
+# Footprint per process is the larger of working set and private bytes;
+# working set is also returned for the Screen, which measures on it.
+function Get-SqlEngineFootprint {
+    param([bool]$WidService, [bool]$RealSqlService)
+    $r = [ordered]@{ SqlGB = 0.0; SqlWsGB = 0.0; SqlCount = 0; WidGB = 0.0; WidCount = 0 }
+    try {
+        foreach ($p in @(Get-Process -Name 'sqlservr' -ErrorAction SilentlyContinue)) {
+            $path = $null
+            try { $path = $p.Path } catch { }
+            $isWid = if ($path) { $path -like '*\WID\Binn\*' } elseif (-not $RealSqlService) { $WidService } else { $false }
+            $foot  = [math]::Max([double]$p.WorkingSet64, [double]$p.PrivateMemorySize64) / 1GB
+            if ($isWid) {
+                $r.WidGB += $foot; $r.WidCount++
+            } else {
+                $r.SqlGB += $foot; $r.SqlWsGB += [double]$p.WorkingSet64 / 1GB; $r.SqlCount++
+            }
+        }
+    } catch { }
+    foreach ($k in 'SqlGB', 'SqlWsGB', 'WidGB') { $r[$k] = [math]::Round($r[$k], 2) }
+    [PSCustomObject]$r
+}
+
 function Get-ServerRole {
     param([double]$AllocatedGB = 0)
 
@@ -392,14 +428,22 @@ function Get-ServerRole {
     # whose buffer pool caps at ~1.4GB), and the absolute alone under-fires on
     # large ones. Below the bar the host is flagged SQL-MINOR and screened
     # normally, so the SQL is still visible without silently suppressing sizing.
-    if (($svc.ContainsKey('MSSQLSERVER')) -or (& $hasSvc 'MSSQL$*')) {
-        $sqlWsGB = 0.0
-        try {
-            $sqlProcs = @(Get-Process -Name 'sqlservr' -ErrorAction SilentlyContinue)
-            if ($sqlProcs.Count -gt 0) {
-                $sqlWsGB = [math]::Round((($sqlProcs | Measure-Object -Property WorkingSet64 -Sum).Sum) / 1GB, 2)
-            }
-        } catch { }
+    #
+    # The Windows Internal Database (WID - RD Connection Broker / WSUS) is not
+    # SQL here; it gets its own WID / WID-LARGE flags, as in Component 2. See
+    # Get-SqlEngineFootprint.
+    $widSvc     = $svc.ContainsKey('MSSQL$MICROSOFT##WID')
+    $realSqlSvc = $svc.ContainsKey('MSSQLSERVER') -or
+                  (@($svc.Keys | Where-Object { $_ -like 'MSSQL$*' -and $_ -ne 'MSSQL$MICROSOFT##WID' }).Count -gt 0)
+    $engine     = Get-SqlEngineFootprint -WidService $widSvc -RealSqlService $realSqlSvc
+    $widGB      = $null
+    if ($widSvc -or $engine.WidCount -gt 0) {
+        $widGB = $engine.WidGB
+        $flags.Add('WID')
+        if ($widGB -ge 2 -and ($AllocatedGB -le 0 -or $widGB -ge ($AllocatedGB * 0.25))) { $flags.Add('WID-LARGE') }
+    }
+    if ($realSqlSvc) {
+        $sqlWsGB = $engine.SqlWsGB
 
         # $AllocatedGB is passed in by the caller, which has already read
         # Win32_OperatingSystem - no second CIM query. A 0 (caller could not
@@ -510,7 +554,7 @@ function Get-ServerRole {
     # a Datto device filter.
     if ($svc.ContainsKey('vmms')) { $role = 'Hypervisor'; $flags.Add('HYPER-V') }
 
-    [PSCustomObject]@{ Role = $role; Flags = $flags; SqlWsGB = $sqlWsGB; MySql = $mysql }
+    [PSCustomObject]@{ Role = $role; Flags = $flags; SqlWsGB = $sqlWsGB; MySql = $mysql; WidGB = $widGB }
 }
 
 # ---------------------------------------------------------------------------
@@ -1241,6 +1285,7 @@ try {
                 ScreenReclaim = $reclaimGB
                 OverCommitted = $(if ($overCommitted) { 1 } else { 0 })
                 SqlWsGB       = $sqlWsGB
+                WidGB         = $roleInfo.WidGB
                 MySqlPrivateGB = $(if ($mysql) { $mysql.PrivateGB } else { $null })
                 InnoDbPoolGB  = $(if ($mysql) { $mysql.BufferPoolGB } else { $null })
                 Verdict       = $verdict

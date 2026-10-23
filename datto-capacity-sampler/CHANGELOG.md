@@ -8,6 +8,35 @@ script versions independently — see its own header comment for its current ver
 
 _Work in progress on the `develop` branch._
 
+### Added
+- **`Cap: Reduce vCPU` (`usrReduceUdf`, default Custom74) — the vCPU reduction as a filterable
+  delta** (`Read-ArcCapacityBuffer.ps1` v1.20). `Cap: Rec vCPU` is an **absolute count** where every
+  other numeric field is a delta, so "no reduction" reads as the current core count rather than
+  `00`. On a 12 vCPU host that shows `12` next to a `Cap: Growth vCPU` of `06`, which reads as a
+  contradiction while the actual recommendation (18) appears in neither field.
+  - **The real cost was that it couldn't be filtered.** Every other worklist is `field != 000`;
+    this one needs `Rec vCPU < current vCPU`, a comparison between two fields that Datto's filter
+    builder can't express — and the current count only exists inside the `Cap: CPU Detail` text.
+    A 517-device export carried **336 reducible cores across 95 devices** reachable only by
+    exporting the grid and scripting against it.
+  - Derived strictly from the final `$recVcpu` and computed **after** the reduce-loses-to-growth
+    guard, so it restates an existing decision rather than making a new one. Every suppression is
+    inherited for free: replaying it over the full estate put 95 devices on the worklist with
+    **zero** violations across seven assertions — no `CPU-PRESSURE`, `SINGLE-THREAD`, `HYPER-V`,
+    pending vCPU growth, queue-driven `REVIEW`, sub-60% coverage, or p95 queue at or above the
+    core count.
+  - Sits **outside** the ten-field consecutive block deliberately: that block is full and the next
+    index is the Screen's own base. Follows the `usrEnrollUdf` pattern — independently
+    configurable, `0` disables, out-of-range only warns rather than failing the job, since the
+    capacity analysis must not be lost over an auxiliary field. It also refuses to write if the
+    index falls inside the main block, which a moved `usrUdfBase` of 70 would cause.
+  - Writes `00` rather than blanking on the `NO_DATA` path, unlike the neighbouring numeric
+    fields: a blank satisfies `!= 00` and would put a device with no data onto the reduction
+    worklist. The same blank-on-`NO_DATA` quirk affects the existing `Cap: Reclaim GB` and growth
+    fields and is left for a separate change. Until a device's next Analyse run Custom74 is blank
+    everywhere, so filter on `!= 00` **and** not blank, or wait one cycle.
+  - CSV export gains `ReduceVcpu`.
+
 ### Fixed
 - **A server with the Session Host role installed but no sessions was sized as a session host**
   (`Read-ArcCapacityBuffer.ps1` v1.19).

@@ -74,11 +74,22 @@
 
     Component input variables (all optional):
               usrUdfBase       Integer  default 60    First UDF index, uses 10 consecutive fields (1-291)
+              usrReduceUdf     Integer  default 74    Single UDF holding the vCPU reduction as a
+                                                      DELTA, so "not equal to 00" is a valid
+                                                      worklist filter. Sits outside the block
+                                                      above, which is full. 0 disables
               usrWindowDays    Integer  default 14    Analysis window
               usrInterval      Integer  default 15    Must match the sampler
               usrExportPath    String   default ''    Optional UNC for per-device CSV row
               usrConservative  Boolean  default false Short-window mode: max x1.4, gross only
                                                       Forced on when usrWindowDays < 7
+
+    Version : 1.20 -  23/10/2026  (new usrReduceUdf field, default Custom74, holding the vCPU
+              reduction as a DELTA. Cap: Rec vCPU is an absolute count, so "no reduction" reads
+              as the current core count rather than 00 and the only filter that would find
+              candidates compares two fields, which Datto cannot do - 336 reducible cores across
+              95 devices were unreachable as a worklist. Derived from the final recVcpu, so every
+              existing suppression is inherited rather than re-decided)
 
     Version : 1.19 -  15/10/2026  (the RDSH role now needs real use: p95 of at least 2
               active sessions over the window, from the counter the sampler already records.
@@ -211,6 +222,25 @@ $WindowDays = Get-DattoInt -Name 'usrWindowDays' -Default 14
 $Interval   = Get-DattoInt -Name 'usrInterval'   -Default 15
 $ExportPath = [Environment]::GetEnvironmentVariable('usrExportPath')
 
+# Reduce-vCPU worklist field. Sits OUTSIDE the consecutive block on purpose:
+# that block is full at ten fields (60-69 by default) and the next index is the
+# Screen's own base (70), so there is nowhere to extend into. Same pattern as
+# the Deploy component's usrEnrollUdf - independently configurable, 0 disables.
+#
+# It exists because Cap: Rec vCPU is an ABSOLUTE count while every other numeric
+# field is a delta. "No reduction" therefore reads as the current core count
+# rather than 00, so the only filter that would find reduction candidates is
+# "Rec vCPU < current vCPU" - a comparison between two fields, which Datto's
+# filter builder cannot express, and the current count only exists inside the
+# Cap: CPU Detail text. The result was 336 reducible cores across 95 devices
+# that could not be turned into a worklist without exporting and scripting it.
+#
+# Get-DattoInt treats a literal "0" the same as blank, so an explicit 0 needs
+# handling before that helper to actually mean "disabled".
+$ReduceUdfRaw = [Environment]::GetEnvironmentVariable('usrReduceUdf')
+$ReduceUdf    = if (-not [string]::IsNullOrWhiteSpace($ReduceUdfRaw) -and $ReduceUdfRaw.Trim() -eq '0') { 0 } `
+                else { Get-DattoInt -Name 'usrReduceUdf' -Default 74 }
+
 # Conservative mode - for windows too short for a meaningful p95.
 # Swaps p95 x 1.25 for max x 1.4, requires reclaim to clear half of allocation,
 # and drops the CPU headroom target from 65% to 50%. Output is labelled
@@ -243,6 +273,26 @@ if ($UdfBase -lt 1 -or $UdfBase -gt ($UdfMax - $UdfCount + 1)) {
 }
 if ($UdfBase -eq 1) {
     Write-Output 'WARNING: UDF 1 is reserved by Datto Ransomware Detection for isolation notices and will be overwritten.'
+}
+
+# Reduce-vCPU field validation. Unlike usrUdfBase this never fails the job - the
+# capacity analysis is the point of this component and must not be lost over an
+# auxiliary worklist field. Out of range or colliding just disables the field.
+$ReduceUdfValid = $false
+if ($ReduceUdf -gt 0) {
+    if ($ReduceUdf -gt $UdfMax) {
+        Write-Output "usrReduceUdf of $ReduceUdf is invalid (must be 1-$UdfMax) - skipping the reduce-vCPU field this run."
+    }
+    elseif ($ReduceUdf -ge $UdfBase -and $ReduceUdf -lt ($UdfBase + $UdfCount)) {
+        # Default 74 is clear of the default block (60-69), but a moved
+        # usrUdfBase can swallow it - e.g. base 70 occupies 70-79. Writing both
+        # would silently clobber one of the primary fields with a 2-digit
+        # number, so refuse rather than corrupt the main output.
+        Write-Output "usrReduceUdf of $ReduceUdf falls inside the main UDF block ($UdfBase-$($UdfBase + $UdfCount - 1)) - skipping the reduce-vCPU field to avoid overwriting it."
+    }
+    else {
+        $ReduceUdfValid = $true
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -857,6 +907,11 @@ try {
         for ($i = 1; $i -le 5; $i++) { Set-Udf -Index ($UdfBase + $i) -Value '' }
         Set-Udf -Index ($UdfBase + 6) -Value ('NO DATA IN WINDOW | ' + (Get-Date -Format 'dd/MM/yyyy HH:mm'))
         for ($i = 7; $i -le 9; $i++) { Set-Udf -Index ($UdfBase + $i) -Value '' }
+        # Written as 00, not blanked like the numeric fields above, because the
+        # reduce worklist filters on "not equal to 00" - and a blank satisfies
+        # that, which would put a device with no data onto the reduction list.
+        # 00 is also simply true here: no reduction is being recommended.
+        if ($ReduceUdfValid) { Set-Udf -Index $ReduceUdf -Value '00' }
         Write-Output "No samples inside the $WindowDays day window. Buffer holds $($allRows.Count) row(s) in total."
         Write-Output ''
         Write-Output '<-Start Result->'
@@ -1653,6 +1708,16 @@ try {
         $cpuVerdict = 'NO CHANGE - reduce/growth conflict resolved in favour of growth, see growth verdict'
     }
 
+    # Derived strictly from the final $recVcpu, and computed AFTER the guard
+    # above, so a host whose reduction lost to growth correctly reads 00. It is
+    # a restatement of Cap: Rec vCPU as a delta, never an independent decision -
+    # every suppression that holds a reduction back (CPU-PRESSURE,
+    # SINGLE-THREAD, queue REVIEW, insufficient coverage, role floors) already
+    # did its work on $recVcpu and is inherited here for free. Replaying this
+    # over a 517-device estate put 95 devices on the worklist with none of those
+    # suppressions violated.
+    $reduceVcpu = [math]::Max(0, $vCPU - $recVcpu)
+
     # =======================================================================
     # UDF write-back
     # =======================================================================
@@ -1675,6 +1740,9 @@ try {
     Set-Udf -Index ($UdfBase + 7) -Value ('{0:D3}' -f $growthGB)    # zero-padded, same reason
     Set-Udf -Index ($UdfBase + 8) -Value ('{0:D2}' -f $vcpuGrowth)  # zero-padded, same reason
     Set-Udf -Index ($UdfBase + 9) -Value (Format-VerdictUdf -Ram $growthVerdict -Cpu $cpuGrowthVerdict)
+    if ($ReduceUdfValid) {
+        Set-Udf -Index $ReduceUdf -Value ('{0:D2}' -f $reduceVcpu)  # zero-padded, same reason
+    }
 
     # =======================================================================
     # Optional per-device CSV row for estate-wide aggregation
@@ -1714,6 +1782,7 @@ try {
                 QueueP95        = $queueP95
                 EffectiveCores  = $effectiveCores
                 RecommendedVcpu = $recVcpu
+                ReduceVcpu      = $reduceVcpu
                 CpuVerdict      = $cpuVerdict
                 VcpuGrowth      = $vcpuGrowth
                 CpuGrowthVerdict = $cpuGrowthVerdict

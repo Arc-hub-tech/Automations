@@ -392,12 +392,19 @@ index from 1–300 (registry values `Custom1`–`Custom300`); the ranges actuall
 | Custom61 | `Cap: RAM Detail` | Memory detail | `Alloc 32GB \| Commit p50 8.9 p95 9.9 max 11.2GB \| MinAvail 18.4GB \| Faults p95 0.4/s` |
 | Custom62 | `Cap: Reclaim GB` | **Reclaimable GB — zero-padded** | `020` |
 | Custom63 | `Cap: CPU Detail` | CPU detail | `8 vCPU \| Total p50 12% p95 19% max 44% \| MaxCore p95 43% \| Queue p95 1 max 4` |
-| Custom64 | `Cap: Rec vCPU` | **Recommended vCPU — zero-padded** | `04` |
+| Custom64 | `Cap: Rec vCPU` | **Recommended vCPU — an absolute count, zero-padded.** Equals the current count when no reduction applies — see below | `04` |
 | Custom65 | `Cap: Role/Flags` | Role and flags | `Generic \| SINGLE-THREAD` |
 | Custom66 | `Cap: Verdict` | Reclaim/reduce verdict summary and timestamp | `RAM: RECLAIM 20GB -> 12GB … \|\| 14/08/2026 22:15` |
 | Custom67 | `Cap: Growth GB` | **RAM growth recommendation — zero-padded** | `004` |
 | Custom68 | `Cap: Growth vCPU` | **vCPU growth recommendation — zero-padded** | `02` |
 | Custom69 | `Cap: Growth Verdict` | Growth verdict summary and timestamp | `RAM: URGENT +4GB -> 20GB … \|\| 14/08/2026 22:15` |
+
+Plus one companion field **outside** that consecutive block, because the block is full at ten and
+the next index is the Screen's own base:
+
+| UDF | Suggested label | Content | Example |
+|---|---|---|---|
+| Custom74 | `Cap: Reduce vCPU` | **vCPU reduction as a DELTA — zero-padded.** `usrReduceUdf`, set to `0` to disable | `04` = cut 4 cores |
 
 On a domain controller, `Cap: RAM Detail` gets an extra suffix — either
 `| DIT 12.4GB -> floor 16GB` when the DIT size resolved, or `| DIT size unknown -> flat floor`
@@ -409,6 +416,35 @@ silent number.
 candidate at once (they come from the same target calculation, on opposite sides of it), but
 keeping them apart preserves the existing `Cap: Reclaim GB` **not equal to `000`** worklist filter
 exactly as it already works, rather than changing what that field means.
+
+### Why `Cap: Reduce vCPU` exists alongside `Cap: Rec vCPU`
+
+`Cap: Rec vCPU` is the odd one out: an **absolute count** where every other numeric field is a
+**delta**. "Nothing to do" therefore reads as `000` on the three deltas but as *the current core
+count* on this one — so a 12 vCPU host needing no reduction shows `12`, which looks like a
+contradiction next to `Cap: Growth vCPU` of `06`, and the real recommendation (18) appears in
+neither field.
+
+That is also unfilterable. Every other worklist is `field != 000`; this one would need
+`Rec vCPU < current vCPU`, a comparison between two fields that Datto's filter builder can't
+express — and the current count only exists inside the `Cap: CPU Detail` text string. On a
+517-device estate that left **336 reducible cores across 95 devices** reachable only by exporting
+and scripting it.
+
+`Cap: Reduce vCPU` restates the same decision as a delta, so the worklist is a plain
+**not equal to `00`** filter. It is derived strictly from the final `Cap: Rec vCPU` and never makes
+an independent judgement, so every suppression that holds a reduction back — `CPU-PRESSURE`,
+`SINGLE-THREAD`, queue-driven `REVIEW`, insufficient coverage, role floors, and the
+reduce-loses-to-growth guard — is inherited automatically. `Cap: Rec vCPU` is unchanged, so any
+view already built on it keeps working.
+
+> **Check Custom74 is free before the first run**, the same as any other field here — `usrReduceUdf`
+> overwrites without warning. The script refuses to write if the index falls inside the main block
+> (a moved `usrUdfBase` of 70 would swallow 74), but it **cannot** see the Screen's
+> `usrScreenUdfBase` block or the Deploy component's `usrEnrollUdf`, so keep clear of 70–73 and 79
+> by hand. Note also that until a device's next Analyse run the field is blank, and a blank
+> satisfies `!= 00` — so filter on **not equal to `00` *and* not blank**, or wait one cycle before
+> building the view.
 
 ### `Arc — Capacity Screen` (default base 70, 4 consecutive fields, valid 1–297)
 
@@ -548,6 +584,7 @@ once. Then run `Arc — Capacity Screen` against the same set for an immediate s
   |---|---|---|---|
   | `usrBranch` | String | `main` | Branch to fetch `Read-ArcCapacityBuffer.ps1` from |
   | `usrUdfBase` | Integer | 60 | First UDF index — consumes 10 consecutive fields, valid 1–291 |
+  | `usrReduceUdf` | Integer | 74 | Single UDF holding the vCPU reduction as a delta, outside the block above — see **Why `Cap: Reduce vCPU` exists**. Set to `0` to disable |
   | `usrWindowDays` | Integer | 14 | Analysis window |
   | `usrInterval` | Integer | 15 | Must match Component 1 |
   | `usrExportPath` | String | *(blank)* | Optional UNC for a per-device CSV row |
@@ -711,9 +748,13 @@ $rows = Get-ChildItem '\\<fileserver>\CapacityReports' -Filter '*.csv' |
 # Total reclaimable RAM across the estate
 ($rows | Measure-Object -Property ReclaimGB -Sum).Sum
 
-# vCPU reduction available
-($rows | Measure-Object -Property vCPU -Sum).Sum -
-($rows | Measure-Object -Property RecommendedVcpu -Sum).Sum
+# vCPU reduction available (ReduceVcpu is the same figure Custom74 carries)
+($rows | Measure-Object -Property ReduceVcpu -Sum).Sum
+
+# ...and the hosts it comes from, which is the Custom74 worklist in CSV form
+$rows | Where-Object { [int]$_.ReduceVcpu -gt 0 } |
+        Sort-Object { [int]$_.ReduceVcpu } -Descending |
+        Select-Object Hostname,Role,vCPU,RecommendedVcpu,ReduceVcpu
 
 # Total RAM growth needed across the estate (under-provisioned hosts)
 ($rows | Measure-Object -Property GrowthGB -Sum).Sum
